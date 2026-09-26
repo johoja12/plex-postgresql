@@ -442,7 +442,7 @@ fn find_top_level_keyword_from(stmt: &str, start: usize, keyword: &str) -> Optio
             }
             _ if depth == 0 => {
                 if i + kw.len() <= bytes.len()
-                    && stmt[i..i + kw.len()].eq_ignore_ascii_case(keyword)
+                    && bytes[i..i + kw.len()].eq_ignore_ascii_case(kw)
                     && (i == 0 || !is_ident_char(bytes[i - 1]))
                     && (i + kw.len() == bytes.len() || !is_ident_char(bytes[i + kw.len()]))
                 {
@@ -535,7 +535,7 @@ fn rewrite_regexp_operator(sql: &str) -> String {
             out.push('\'');
             i += 1;
             while i < bytes.len() {
-                out.push(bytes[i] as char);
+                push_sql_char_at(&mut out, sql, i);
                 if bytes[i] == b'\'' {
                     i += 1;
                     if i < bytes.len() && bytes[i] == b'\'' {
@@ -570,7 +570,7 @@ fn rewrite_regexp_operator(sql: &str) -> String {
             }
         }
 
-        out.push(bytes[i] as char);
+        push_sql_char_at(&mut out, sql, i);
         i += 1;
     }
     out
@@ -587,7 +587,7 @@ fn rewrite_raise_function_calls(sql: &str) -> String {
             out.push('\'');
             i += 1;
             while i < bytes.len() {
-                out.push(bytes[i] as char);
+                push_sql_char_at(&mut out, sql, i);
                 if bytes[i] == b'\'' {
                     i += 1;
                     if i < bytes.len() && bytes[i] == b'\'' {
@@ -637,7 +637,7 @@ fn rewrite_raise_function_calls(sql: &str) -> String {
             continue;
         }
 
-        out.push(bytes[i] as char);
+        push_sql_char_at(&mut out, sql, i);
         i += 1;
     }
     out
@@ -674,7 +674,7 @@ fn strip_create_table_on_conflict_clauses(stmt: &str) -> String {
             out.push('\'');
             i += 1;
             while i < bytes.len() {
-                out.push(bytes[i] as char);
+                push_sql_char_at(&mut out, stmt, i);
                 if bytes[i] == b'\'' {
                     i += 1;
                     if i < bytes.len() && bytes[i] == b'\'' {
@@ -716,7 +716,7 @@ fn strip_create_table_on_conflict_clauses(stmt: &str) -> String {
             }
         }
 
-        out.push(bytes[i] as char);
+        push_sql_char_at(&mut out, stmt, i);
         i += 1;
     }
     out
@@ -1556,7 +1556,7 @@ fn consume_keyword_ci(stmt: &str, i: usize, keyword: &str) -> Option<usize> {
     let bytes = stmt.as_bytes();
     let start = skip_ascii_ws(bytes, i);
     let end = start + keyword.len();
-    if end > bytes.len() || !stmt[start..end].eq_ignore_ascii_case(keyword) {
+    if end > bytes.len() || !bytes[start..end].eq_ignore_ascii_case(keyword.as_bytes()) {
         return None;
     }
     if start > 0 && is_ident_char(bytes[start - 1]) {
@@ -1689,7 +1689,7 @@ fn parse_quoted_token(stmt: &str, start: usize) -> Option<(char, String, usize)>
             }
             return Some((quote, out, i));
         }
-        out.push(ch);
+        push_sql_char_at(&mut out, stmt, i);
         i += 1;
     }
 
@@ -1723,7 +1723,7 @@ fn rewrite_identifier_quotes_in_segment(segment: &str) -> String {
             }
         }
 
-        out.push(bytes[i] as char);
+        push_sql_char_at(&mut out, segment, i);
         i += 1;
     }
 
@@ -1976,7 +1976,7 @@ fn extract_ident_token(raw: &str) -> String {
 //   (The COLLATE icu_root / parse-error is handled by rewrite_sqlite_collations
 //   which runs before this function.)
 fn rewrite_metadata_items_self_join(sql: &str) -> String {
-    let lower = sql.to_lowercase();
+    let lower = sql.to_ascii_lowercase();
 
     // ── Shape A detection ──────────────────────────────────────────────────────
     // Plex emits queries like:
@@ -2012,7 +2012,7 @@ fn rewrite_metadata_items_self_join(sql: &str) -> String {
 /// 3. Rewriting the ON clauses of subsequent aliased joins: metadata_items.col → mi.col
 /// 4. Replacing all remaining metadata_items.col references in SELECT/WHERE/etc.
 fn reorder_and_alias_self_join(sql: &str) -> String {
-    let lower = sql.to_lowercase();
+    let lower = sql.to_ascii_lowercase();
 
     // Split into: prefix (everything up to the first JOIN), list of join fragments,
     // and suffix (WHERE + rest after all JOINs).
@@ -2041,7 +2041,7 @@ fn reorder_and_alias_self_join(sql: &str) -> String {
 
     // Split joins_str into individual join fragments by " join "
     let mut join_fragments: Vec<String> = Vec::new();
-    let joins_lower = joins_str.to_lowercase();
+    let joins_lower = joins_str.to_ascii_lowercase();
     let mut pos = 0usize;
     loop {
         match joins_lower[pos..].find(join_needle) {
@@ -2062,7 +2062,7 @@ fn reorder_and_alias_self_join(sql: &str) -> String {
     let mut unaliased_idxs: Vec<usize> = Vec::new();
     let mut aliased_idxs: Vec<usize> = Vec::new();
     for (idx, frag) in join_fragments.iter().enumerate() {
-        let fl = frag.to_lowercase();
+        let fl = frag.to_ascii_lowercase();
         let fl = fl.trim_start();
         if let Some(after) = fl.strip_prefix("metadata_items") {
             let after = after.trim_start();
@@ -2085,11 +2085,11 @@ fn reorder_and_alias_self_join(sql: &str) -> String {
 
     for &idx in &unaliased_idxs {
         let frag = &join_fragments[idx];
-        let fl = frag.to_lowercase();
+        let fl = frag.to_ascii_lowercase();
         let fl_trim = fl.trim_start();
         // Strip leading "metadata_items" and get the rest (ON clause etc.)
-        let rest_of_frag =
-            &frag[frag.to_lowercase().find("metadata_items").unwrap() + "metadata_items".len()..];
+        let rest_of_frag = &frag
+            [frag.to_ascii_lowercase().find("metadata_items").unwrap() + "metadata_items".len()..];
         // Rewrite metadata_items.col → mi.col in the ON clause of this fragment
         let on_fixed = rest_of_frag.replace("metadata_items.", "mi.");
         let _ = fl_trim; // suppress warning
@@ -2146,7 +2146,7 @@ fn find_top_level_clause(s: &str) -> usize {
                     "limit ",
                     "union ",
                 ] {
-                    if s[i..].starts_with(kw) {
+                    if bytes[i..].starts_with(kw.as_bytes()) {
                         return i;
                     }
                 }
@@ -2176,8 +2176,8 @@ fn count_word_occurrences(haystack: &str, needle: &str) -> usize {
 /// touch occurrences inside quoted string literals.
 fn replace_metadata_items_refs(sql: &str, new_alias: &str) -> String {
     let needle = "metadata_items.";
-    let needle_lower = needle.to_lowercase();
-    let sql_lower = sql.to_lowercase();
+    let needle_lower = needle.to_ascii_lowercase();
+    let sql_lower = sql.to_ascii_lowercase();
 
     let mut result = String::with_capacity(sql.len());
     let mut i = 0usize;
@@ -2190,7 +2190,7 @@ fn replace_metadata_items_refs(sql: &str, new_alias: &str) -> String {
             i += 1;
             while i < bytes.len() {
                 let ch = bytes[i];
-                result.push(ch as char);
+                push_sql_char_at(&mut result, sql, i);
                 i += 1;
                 if ch == b'\'' {
                     // escaped '' or end of string
@@ -2206,7 +2206,7 @@ fn replace_metadata_items_refs(sql: &str, new_alias: &str) -> String {
         }
 
         // Check for "metadata_items." at current position
-        if sql_lower[i..].starts_with(&needle_lower) {
+        if sql_lower.as_bytes()[i..].starts_with(needle_lower.as_bytes()) {
             // Emit the alias instead
             result.push_str(new_alias);
             result.push('.');
@@ -2214,7 +2214,7 @@ fn replace_metadata_items_refs(sql: &str, new_alias: &str) -> String {
             continue;
         }
 
-        result.push(bytes[i] as char);
+        push_sql_char_at(&mut result, sql, i);
         i += 1;
     }
 
@@ -2235,7 +2235,7 @@ fn fix_placeholder_spacing(sql: &str) -> String {
     while i < bytes.len() {
         let b = bytes[i];
         if in_string {
-            result.push(b as char);
+            push_sql_char_at(&mut result, sql, i);
             if b == string_char {
                 if i + 1 < bytes.len() && bytes[i + 1] == string_char {
                     result.push(bytes[i + 1] as char);
@@ -2251,7 +2251,7 @@ fn fix_placeholder_spacing(sql: &str) -> String {
         if b == b'\'' || b == b'"' {
             in_string = true;
             string_char = b;
-            result.push(b as char);
+            push_sql_char_at(&mut result, sql, i);
             i += 1;
             continue;
         }
@@ -2272,7 +2272,7 @@ fn fix_placeholder_spacing(sql: &str) -> String {
             }
             let word = std::str::from_utf8(&bytes[word_start..word_end])
                 .unwrap_or("")
-                .to_uppercase();
+                .to_ascii_uppercase();
             // SQL clause/operator keywords that can legally follow a placeholder value
             // but are never valid SQLite named-parameter suffixes.
             // Excludes things like LEFT/RIGHT/JOIN/FROM which Plex uses as param names.
@@ -2308,7 +2308,7 @@ fn fix_placeholder_spacing(sql: &str) -> String {
             continue;
         }
 
-        result.push(b as char);
+        push_sql_char_at(&mut result, sql, i);
         i += 1;
     }
     result
@@ -2319,7 +2319,7 @@ fn fix_placeholder_spacing(sql: &str) -> String {
 fn rewrite_glob(sql: &str) -> String {
     // We do a case-insensitive scan for the word GLOB followed by a quoted string.
     // Strategy: tokenise by single-quoted strings to avoid false positives inside literals.
-    let upper = sql.to_uppercase();
+    let upper = sql.to_ascii_uppercase();
     // Fast path – nothing to do
     if !upper.contains("GLOB") {
         return sql.to_string();
@@ -2342,10 +2342,11 @@ fn rewrite_glob(sql: &str) -> String {
                     if i < bytes.len() && bytes[i] == b'\'' {
                         result.push('\'');
                         i += 1;
+                        continue;
                     }
                     break;
                 }
-                result.push(bytes[i] as char);
+                push_sql_char_at(&mut result, sql, i);
                 i += 1;
             }
             continue;
@@ -2380,7 +2381,7 @@ fn rewrite_glob(sql: &str) -> String {
                                 break;
                             }
                         } else {
-                            pattern.push(bytes[i] as char);
+                            push_sql_char_at(&mut pattern, sql, i);
                             i += 1;
                         }
                     }
@@ -2413,7 +2414,7 @@ fn rewrite_glob(sql: &str) -> String {
 /// - `INDEXED BY <identifier>`
 /// - `NOT INDEXED`
 fn rewrite_indexed_by(sql: &str) -> String {
-    let upper = sql.to_uppercase();
+    let upper = sql.to_ascii_uppercase();
     if !upper.contains("INDEXED") {
         return sql.to_string();
     }
@@ -2435,17 +2436,18 @@ fn rewrite_indexed_by(sql: &str) -> String {
                     if i < bytes.len() && bytes[i] == b'\'' {
                         result.push('\'');
                         i += 1;
+                        continue;
                     }
                     break;
                 }
-                result.push(bytes[i] as char);
+                push_sql_char_at(&mut result, sql, i);
                 i += 1;
             }
             continue;
         }
 
-        let rest_upper = &upper[i..];
-        if rest_upper.starts_with("NOT INDEXED") {
+        let rest_upper = &upper.as_bytes()[i..];
+        if rest_upper.starts_with(b"NOT INDEXED") {
             let after = i + "NOT INDEXED".len();
             let boundary = after >= sql.len()
                 || !sql[after..].starts_with(|c: char| c.is_alphanumeric() || c == '_');
@@ -2454,7 +2456,7 @@ fn rewrite_indexed_by(sql: &str) -> String {
                 continue;
             }
         }
-        if rest_upper.starts_with("INDEXED") {
+        if rest_upper.starts_with(b"INDEXED") {
             let after = i + 7;
             let boundary = after >= sql.len()
                 || !sql[after..].starts_with(|c: char| c.is_alphanumeric() || c == '_');
@@ -2466,7 +2468,7 @@ fn rewrite_indexed_by(sql: &str) -> String {
                     j += 1;
                 }
                 // Check for BY
-                if sql[j..].to_uppercase().starts_with("BY") {
+                if sql[j..].to_ascii_uppercase().starts_with("BY") {
                     j += 2;
                     // Skip whitespace
                     while j < bytes.len() && bytes[j].is_ascii_whitespace() {
@@ -2483,7 +2485,7 @@ fn rewrite_indexed_by(sql: &str) -> String {
             }
         }
 
-        result.push(bytes[i] as char);
+        push_sql_char_at(&mut result, sql, i);
         i += 1;
     }
 
@@ -2503,7 +2505,7 @@ fn rewrite_indexed_by(sql: &str) -> String {
 /// `NOCASE` is intentionally left intact; the AST-level transform in query.rs
 /// converts it to LOWER(…) which is the correct PostgreSQL semantic.
 fn rewrite_sqlite_collations(sql: &str) -> String {
-    let upper = sql.to_uppercase();
+    let upper = sql.to_ascii_uppercase();
     // Fast path — nothing to do
     if !upper.contains("COLLATE") {
         return sql.to_string();
@@ -2526,10 +2528,11 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
                     if i < bytes.len() && bytes[i] == b'\'' {
                         result.push('\'');
                         i += 1;
+                        continue;
                     }
                     break;
                 }
-                result.push(bytes[i] as char);
+                push_sql_char_at(&mut result, sql, i);
                 i += 1;
             }
             continue;
@@ -2547,10 +2550,11 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
                     if i < bytes.len() && bytes[i] == b'"' {
                         result.push('"');
                         i += 1;
+                        continue;
                     }
                     break;
                 }
-                result.push(bytes[i] as char);
+                push_sql_char_at(&mut result, sql, i);
                 i += 1;
             }
             continue;
@@ -2562,7 +2566,7 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
             i += 1;
             while i < bytes.len() {
                 let ch = bytes[i] as char;
-                result.push(ch);
+                push_sql_char_at(&mut result, sql, i);
                 i += 1;
                 if ch == '`' {
                     break;
@@ -2572,8 +2576,8 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
         }
 
         // Check for COLLATE keyword (case-insensitive, word boundary)
-        let rest_upper = &upper[i..];
-        if rest_upper.starts_with("COLLATE") {
+        let rest_upper = &upper.as_bytes()[i..];
+        if rest_upper.starts_with(b"COLLATE") {
             let after = i + 7;
             let boundary = after >= sql.len()
                 || !sql[after..].starts_with(|c: char| c.is_alphanumeric() || c == '_');
@@ -2590,7 +2594,7 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
                 {
                     j += 1;
                 }
-                let collation_name = sql[name_start..j].to_uppercase();
+                let collation_name = sql[name_start..j].to_ascii_uppercase();
 
                 // Strip SQLite-only collations that have no direct PostgreSQL equivalent.
                 //
@@ -2620,9 +2624,82 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
             }
         }
 
-        result.push(bytes[i] as char);
+        push_sql_char_at(&mut result, sql, i);
         i += 1;
     }
 
     result
+}
+
+/// Byte scanners must not turn UTF-8 bytes into Latin-1 characters. Emit each
+/// scalar once; continuation bytes are visited by the scanner but emit nothing.
+#[inline]
+fn push_sql_char_at(out: &mut String, sql: &str, offset: usize) {
+    let byte = sql.as_bytes()[offset];
+    if byte.is_ascii() {
+        out.push(byte as char);
+    } else if sql.is_char_boundary(offset) {
+        out.push(sql[offset..].chars().next().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod unicode_tests {
+    use super::*;
+
+    proptest::proptest! {
+        #[test]
+        fn unicode_literal_round_trip(text in ".{0,80}") {
+            let escaped = text.replace('\'', "''");
+            let sql = format!("SELECT '{escaped}' AS title FROM metadata_items");
+            proptest::prop_assert_eq!(preprocess_sql(&sql), sql);
+        }
+    }
+
+    #[test]
+    fn keyword_scans_do_not_slice_inside_unicode() {
+        for text in ["é", "Ã", "日本語", "🎞", "İ", "Straße"] {
+            let sql = format!("SELECT {text} FROM metadata_items LIMIT 5");
+            assert_eq!(find_top_level_keyword(&sql, "limit"), sql.find("LIMIT"));
+            assert_eq!(
+                find_top_level_clause(&format!("{text} where x")),
+                text.len() + 1
+            );
+            assert_eq!(consume_keyword_ci(text, 0, "x"), None);
+        }
+    }
+
+    #[test]
+    fn preprocessing_preserves_unicode_literals_and_identifiers() {
+        for text in ["é", "Ã", "日本語", "🎞", "İ", "Straße", "O''Brien 日本語"] {
+            let sql = format!("SELECT '{text}' AS title FROM metadata_items");
+            assert_eq!(preprocess_sql(&sql), sql);
+            let translated = crate::translate(&sql).unwrap();
+            assert!(translated.sql.contains(text), "{}", translated.sql);
+            let sql = format!("SELECT {text} FROM metadata_items");
+            assert_eq!(preprocess_sql(&sql), sql);
+            let sql = format!("SELECT '{text}' COLLATE icu_root FROM metadata_items");
+            assert_eq!(
+                preprocess_sql(&sql),
+                format!("SELECT '{text}' FROM metadata_items")
+            );
+            assert_eq!(
+                fix_placeholder_spacing(&format!("SELECT '{text}', ?group by title")),
+                format!("SELECT '{text}', ? group by title")
+            );
+        }
+        assert_eq!(
+            rewrite_glob("SELECT 'İ' WHERE title GLOB '日本*'"),
+            "SELECT 'İ' WHERE title ILIKE '日本%'"
+        );
+        assert_eq!(
+            rewrite_indexed_by("SELECT é FROM t NOT INDEXED"),
+            "SELECT é FROM t "
+        );
+        assert_eq!(
+            replace_metadata_items_refs("SELECT metadata_items.title, '日本語'", "mi"),
+            "SELECT mi.title, '日本語'"
+        );
+        assert_eq!(parse_quoted_token("'日本語'", 0).unwrap().1, "日本語");
+    }
 }
