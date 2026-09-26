@@ -18,7 +18,9 @@ fn is_aggregate_expression_name(col: &str) -> bool {
     matches!(
         lower.as_str(),
         "count" | "cnt" | "sum" | "max" | "min" | "avg"
-    ) || ["count(", "sum(", "max(", "min(", "avg("]
+    ) || lower.rsplit_once('_').is_some_and(|(_, suffix)| {
+        matches!(suffix, "count" | "cnt" | "sum" | "max" | "min" | "avg")
+    }) || ["count(", "sum(", "max(", "min(", "avg("]
         .iter()
         .any(|needle| lower.contains(needle))
 }
@@ -38,17 +40,23 @@ pub fn rust_decltype_special_case(
     table_oid: u32,
 ) -> i32 {
     let col = unsafe { cstr_to_str_or_empty(col_name) };
-    let sql = unsafe { cstr_to_str_or_empty(pg_sql) };
 
     if oid == 20 && !col.is_empty() {
         if col.contains("_at") || col.contains("timestamp") || col.contains("time") {
             return DECLTYPE_CASE_DT_INTEGER_8;
         }
-        if col == "greatest" && sql.contains("metadata_items.changed_at") {
-            return DECLTYPE_CASE_DT_INTEGER_8;
+        if col == "greatest" {
+            let sql = unsafe { cstr_to_str_or_empty(pg_sql) };
+            if sql.contains("metadata_items.changed_at") {
+                return DECLTYPE_CASE_DT_INTEGER_8;
+            }
         }
     }
 
+    // SQLite has no declared type for aggregate expressions, including Plex's
+    // table-prefixed aliases (count(tags.id) AS tags_count). Exposing PostgreSQL
+    // bigint here makes SOCI allocate an int64 holder where Plex requests int,
+    // causing std::bad_cast despite column_type correctly reporting INTEGER.
     // Only classify as aggregate when table_oid==0 (expression column).
     // Real table columns named "count", "max", etc. have table_oid != 0
     // and must keep their normal decltype.
