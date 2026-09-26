@@ -70,3 +70,8 @@ path = "benches/bench_pipeline.rs"
 name = "bench_core"
 harness = false
 path = "benches/bench_core.rs"
+
+[[bench]]
+name = "bench_result_hotpath"
+harness = false
+path = "benches/bench_result_hotpath.rs"
