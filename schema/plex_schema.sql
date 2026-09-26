@@ -1136,7 +1136,9 @@ ALTER TABLE ONLY plex.metadata_items ALTER COLUMN metadata_type SET STATISTICS 2
 CREATE VIEW plex.fts4_metadata_titles AS
  SELECT metadata_items.id AS rowid,
     metadata_items.title,
-    metadata_items.title_fts
+    metadata_items.title_fts,
+    metadata_items.title_sort,
+    metadata_items.original_title
    FROM plex.metadata_items;
 
 
@@ -1147,7 +1149,9 @@ CREATE VIEW plex.fts4_metadata_titles AS
 CREATE VIEW plex.fts4_metadata_titles_icu AS
  SELECT metadata_items.id AS rowid,
     metadata_items.title,
-    metadata_items.title_fts
+    metadata_items.title_fts,
+    metadata_items.title_sort,
+    metadata_items.original_title
    FROM plex.metadata_items;
 
 
@@ -1180,7 +1184,8 @@ CREATE TABLE plex.tags (
 CREATE VIEW plex.fts4_tag_titles AS
  SELECT tags.id AS rowid,
     tags.tag AS title,
-    tags.search_vector AS title_fts
+    tags.search_vector AS title_fts,
+    tags.tag
    FROM plex.tags;
 
 
@@ -1191,7 +1196,8 @@ CREATE VIEW plex.fts4_tag_titles AS
 CREATE VIEW plex.fts4_tag_titles_icu AS
  SELECT tags.id AS rowid,
     tags.tag AS title,
-    tags.search_vector AS title_fts
+    tags.search_vector AS title_fts,
+    tags.tag
    FROM plex.tags;
 
 
