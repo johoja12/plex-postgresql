@@ -478,7 +478,7 @@ if [ -n "$PLEX_PG_HOST" ]; then
     # Run migration if source SQLite DB exists (mounted via -v)
     if [[ -f "$MIGRATE_LIB" ]] && [[ -f "$SQLITE_DB" ]]; then
         echo "Checking for data migration..."
-        check_and_migrate || true
+        check_and_migrate
     fi
 
     ensure_plex_temp_dir
