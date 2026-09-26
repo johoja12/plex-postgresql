@@ -340,14 +340,20 @@ pub fn rust_should_mask_collection_metadata_type(
     col_name: *const c_char,
     raw_val: i64,
 ) -> c_int {
-    if pg_sql.is_null() || col_name.is_null() {
+    // This compatibility rule only applies to collection metadata_type=18.
+    // Large Plex scans use SQL with very long IN lists. Do not strlen/validate
+    // that SQL for every ordinary cell before discovering the rule cannot apply.
+    if raw_val != 18 || pg_sql.is_null() || col_name.is_null() {
         return 0;
     }
-    let pg_sql = match unsafe { CStr::from_ptr(pg_sql) }.to_str() {
+    let col_name = match unsafe { CStr::from_ptr(col_name) }.to_str() {
         Ok(s) => s,
         Err(_) => return 0,
     };
-    let col_name = match unsafe { CStr::from_ptr(col_name) }.to_str() {
+    if !col_name.contains("metadata_type") {
+        return 0;
+    }
+    let pg_sql = match unsafe { CStr::from_ptr(pg_sql) }.to_str() {
         Ok(s) => s,
         Err(_) => return 0,
     };

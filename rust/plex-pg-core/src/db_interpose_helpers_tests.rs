@@ -784,3 +784,19 @@ fn column_text_reformat_aggregate_non_match_returns_zero() {
     );
     assert_eq!(rc, 0);
 }
+
+#[test]
+fn collection_mask_ffi_preserves_predicate_for_long_queries() {
+    let sql = CString::new(format!("select * from taggings as related where id in ({})",
+        std::iter::repeat_n("123456", 100_000).collect::<Vec<_>>().join(","))).unwrap();
+    let metadata = CString::new("metadata_items_metadata_type").unwrap();
+    let ordinary = CString::new("metadata_items_id").unwrap();
+    assert_eq!(rust_should_mask_collection_metadata_type(sql.as_ptr(), metadata.as_ptr(), 18), 1);
+    for value in [0, 1, 4, 17, 19, i64::MAX] {
+        assert_eq!(rust_should_mask_collection_metadata_type(sql.as_ptr(), metadata.as_ptr(), value), 0);
+    }
+    assert_eq!(rust_should_mask_collection_metadata_type(sql.as_ptr(), ordinary.as_ptr(), 18), 0);
+    assert_eq!(rust_should_mask_collection_metadata_type(std::ptr::null(), metadata.as_ptr(), 18), 0);
+    let invalid_utf8 = [255_u8, 0];
+    assert_eq!(rust_should_mask_collection_metadata_type(invalid_utf8.as_ptr().cast(), metadata.as_ptr(), 18), 0);
+}
