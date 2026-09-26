@@ -86,3 +86,28 @@ CREATE OPERATOR public.= (
 );
 
 
+
+-- Older schema snapshots exposed only title/title_fts in the FTS views, while
+-- the translator correctly references SQLite FTS title_sort/original_title/tag.
+-- Append missing source columns without changing existing column positions or
+-- dropping dependent objects. Re-running this upgrade is safe.
+DO $fts_views$
+BEGIN
+    IF to_regclass('plex.metadata_items') IS NOT NULL THEN
+        CREATE OR REPLACE VIEW plex.fts4_metadata_titles AS
+            SELECT id AS rowid, title, title_fts, title_sort, original_title
+            FROM plex.metadata_items;
+        CREATE OR REPLACE VIEW plex.fts4_metadata_titles_icu AS
+            SELECT id AS rowid, title, title_fts, title_sort, original_title
+            FROM plex.metadata_items;
+    END IF;
+    IF to_regclass('plex.tags') IS NOT NULL THEN
+        CREATE OR REPLACE VIEW plex.fts4_tag_titles AS
+            SELECT id AS rowid, tag AS title, search_vector AS title_fts, tag
+            FROM plex.tags;
+        CREATE OR REPLACE VIEW plex.fts4_tag_titles_icu AS
+            SELECT id AS rowid, tag AS title, search_vector AS title_fts, tag
+            FROM plex.tags;
+    END IF;
+END;
+$fts_views$;
