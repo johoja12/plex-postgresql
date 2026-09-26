@@ -171,3 +171,12 @@ arch="$(uname -m)"\
     sed -i 's|"/usr/lib/plexmediaserver/Plex Media Server"|/usr/local/bin/subreaper "/usr/lib/plexmediaserver/Plex Media Server"|g' \
         /etc/s6-overlay/s6-rc.d/svc-plex/run && \
     cat /etc/s6-overlay/s6-rc.d/svc-plex/run
+
+# PMS may launch its scanner with LD_PRELOAD removed even when its own process
+# has the shim. Keep the scanner on PostgreSQL by restoring the preload at its
+# executable boundary. The renamed binary still contains "Plex Media Scanner"
+# in argv[0], which the shim uses to identify the scanner role.
+RUN mv "/usr/lib/plexmediaserver/Plex Media Scanner" \
+       "/usr/lib/plexmediaserver/Plex Media Scanner.real"
+COPY ["scripts/scanner-preload.sh", "/usr/lib/plexmediaserver/Plex Media Scanner"]
+RUN chmod 755 "/usr/lib/plexmediaserver/Plex Media Scanner"
