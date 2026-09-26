@@ -1361,6 +1361,22 @@ fn fix_int_text_mismatch(mut left: Expr, op: BinaryOperator, mut right: Expr) ->
 /// dictionary used by the schema's tsvector triggers, and does not require a
 /// pre-computed tsvector column to exist.
 fn transform_fts_match(left: Expr, right: Expr) -> Expr {
+    // SQLite MATCH binds more tightly than AND/OR. sqlparser can attach the
+    // trailing boolean predicates to MATCH's RHS; translate the search term
+    // separately, then preserve and transform those predicates.
+    if let Expr::BinaryOp {
+        left: term,
+        op: op @ (BinaryOperator::And | BinaryOperator::Or),
+        right: mut predicate,
+    } = right
+    {
+        transform_expr(&mut predicate);
+        return Expr::BinaryOp {
+            left: Box::new(transform_fts_match(left, *term)),
+            op,
+            right: predicate,
+        };
+    }
     // Build: to_tsvector('simple', col)
     let make_fn = |fn_name: &str, col: Expr| -> Expr {
         Expr::Function(Function {
@@ -1497,8 +1513,8 @@ fn convert_fts_term(input: &str) -> String {
                 // Check for OR keyword
                 if chars.peek() == Some(&'O') || chars.peek() == Some(&'o') {
                     let rest: String = chars.clone().take(3).collect();
-                    if rest.to_uppercase().starts_with("OR ")
-                        || (rest.len() >= 2 && rest[..2].to_uppercase() == "OR" && rest.len() == 2)
+                    if rest.to_ascii_uppercase().starts_with("OR ")
+                        || rest.eq_ignore_ascii_case("OR")
                     {
                         chars.next(); // O
                         chars.next(); // R
@@ -1520,6 +1536,15 @@ fn convert_fts_term(input: &str) -> String {
                     result.push_str(" & ");
                     need_and = false;
                 }
+            }
+            // SQLite FTS prefixes use *, PostgreSQL tsquery uses :*.
+            '*' => {
+                chars.next();
+                if !result.ends_with(':') {
+                    result.push(':');
+                }
+                result.push('*');
+                need_and = true;
             }
             // Regular character — part of a term
             _ => {
@@ -1864,5 +1889,31 @@ mod distinct_fix_test {
             "title_sort not in select: {}",
             r.sql
         );
+    }
+}
+
+#[cfg(test)]
+mod fts_boolean_regressions {
+    #[test]
+    fn match_prefix_keeps_following_boolean_filters() {
+        for conjunction in ["AND", "OR"] {
+            let sql = format!("SELECT rowid FROM fts4_metadata_titles_icu WHERE title MATCH '(日本*)' {conjunction} rowid = 42");
+            let result = crate::translate(&sql).unwrap().sql;
+            assert!(
+                result.contains("to_tsquery('simple', E'(日本:*)')"),
+                "{result}"
+            );
+            assert!(
+                result.contains(&format!("{conjunction} rowid = 42")),
+                "{result}"
+            );
+        }
+    }
+
+    #[test]
+    fn fts_prefix_and_unicode_or_detection() {
+        assert_eq!(super::convert_fts_term("(star*)"), "(star:*)");
+        assert_eq!(super::convert_fts_term("é* OR 日本*"), "é:* | 日本:*");
+        assert_eq!(super::convert_fts_term("a O日"), "a & O日");
     }
 }
