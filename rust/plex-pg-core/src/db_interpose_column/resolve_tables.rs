@@ -37,6 +37,7 @@ pub(super) fn resolve_column_tables_impl(
         return 0;
     }
 
+    pg_stmt_ref.column_decltypes.clear();
     let num_cols = pg_stmt_ref.num_cols;
     if num_cols <= 0 {
         pg_stmt_ref.col_tables_resolved = 1;

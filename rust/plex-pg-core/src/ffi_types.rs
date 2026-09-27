@@ -170,6 +170,12 @@ pub struct PgStmt {
     pub cached_row: c_int,
     pub col_table_names: Vec<*mut c_char>,
     pub col_tables_resolved: c_int,
+    // (declared type, expected runtime type); Some(NULL, -1) is a cached
+    // expression decltype, distinct from an unresolved entry.
+    pub column_decltypes: Vec<Option<(*const c_char, c_int)>>,
+    pub column_decltypes_epoch: u64,
+    pub column_decltypes_result: usize,
+    pub column_decltypes_sql: usize,
 }
 
 impl Default for PgStmt {
@@ -225,6 +231,10 @@ impl PgStmt {
             cached_row: -1,
             col_table_names: Vec::new(),
             col_tables_resolved: 0,
+            column_decltypes: Vec::new(),
+            column_decltypes_epoch: 0,
+            column_decltypes_result: 0,
+            column_decltypes_sql: 0,
         }
     }
 

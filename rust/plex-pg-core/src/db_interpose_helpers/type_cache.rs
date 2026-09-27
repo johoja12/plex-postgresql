@@ -21,6 +21,7 @@ impl DecltypeCache {
             // A newly loaded schema entry can resolve a previous miss or provide
             // a longer match. Published CStrings themselves are never replaced.
             self.aliases.clear();
+            crate::libpq_helpers::invalidate_result_metadata();
         }
     }
 
