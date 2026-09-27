@@ -26,10 +26,14 @@ pub(crate) fn note_column_phase(
     }));
     // Full per-cell history is diagnostic-only. Query prefixes and fatal-signal
     // context are still recorded by the existing prepare/execute/step paths.
-    static FULL_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *FULL_TRACE.get_or_init(|| env_utils::env_truthy_str("PLEX_PG_TRACE_COLUMN_PHASES")) {
+    if full_column_trace_enabled() {
         rust_pg_exception_note_phase(phase.as_ptr() as *const c_char, sql, stmt, db);
     }
+}
+
+pub(crate) fn full_column_trace_enabled() -> bool {
+    static FULL_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL_TRACE.get_or_init(|| env_utils::env_truthy_str("PLEX_PG_TRACE_COLUMN_PHASES"))
 }
 
 fn dump_column_breadcrumb() {
