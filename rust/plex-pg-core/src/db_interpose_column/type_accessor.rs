@@ -278,24 +278,9 @@ unsafe fn resolve_live_column_type(
     {
         let c_seq = CRASH_LAST_COLUMN_SEQ.load(Ordering::Relaxed);
         CRASH_LAST_COLUMN_SEQ.store(c_seq.wrapping_add(1), Ordering::Release);
-        let clen = if !state.col_name.is_null() && *state.col_name != 0 {
-            let mut wrote = libc::snprintf(
-                ptr::addr_of_mut!(CRASH_LAST_COLUMN) as *mut c_char,
-                CRASH_LAST_COLUMN_MAX_LEN,
-                b"%.63s\0".as_ptr() as *const c_char,
-                state.col_name,
-            );
-            if wrote < 0 {
-                wrote = 0;
-            }
-            if wrote >= CRASH_LAST_COLUMN_MAX_LEN as c_int {
-                wrote = CRASH_LAST_COLUMN_MAX_LEN as c_int - 1;
-            }
-            wrote
-        } else {
-            CRASH_LAST_COLUMN[0] = 0;
-            0
-        };
+        let clen = crate::db_interpose_common::copy_context(
+            ptr::addr_of_mut!(CRASH_LAST_COLUMN) as *mut c_char,
+            CRASH_LAST_COLUMN_MAX_LEN, state.col_name);
         CRASH_LAST_COLUMN_LEN.store(clen, Ordering::SeqCst);
         CRASH_LAST_COLUMN_SEQ.store(c_seq.wrapping_add(2), Ordering::Release);
     }
@@ -326,11 +311,12 @@ pub(super) fn column_type_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int {
         .map(|f| unsafe { f(p_stmt) })
         .unwrap_or(ptr::null_mut());
     unsafe {
-        pg_exception_note_phase(
-            b"column_type\0".as_ptr() as *const c_char,
+        crate::db_interpose_common::note_column_phase(
+            b"column_type\0",
             dbg_sql,
-            p_stmt,
-            dbg_db,
+            p_stmt as *const c_void,
+            dbg_db as *const c_void,
+            idx,
         );
     }
 

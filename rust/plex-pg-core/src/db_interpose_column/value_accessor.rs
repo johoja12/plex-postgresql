@@ -25,11 +25,12 @@ pub(super) fn column_value_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *mut s
         .map(|f| unsafe { f(p_stmt) })
         .unwrap_or(ptr::null_mut());
     unsafe {
-        pg_exception_note_phase(
-            b"column_value\0".as_ptr() as *const c_char,
+        crate::db_interpose_common::note_column_phase(
+            b"column_value\0",
             dbg_sql,
-            p_stmt,
-            dbg_db,
+            p_stmt as *const c_void,
+            dbg_db as *const c_void,
+            idx,
         );
     }
 
