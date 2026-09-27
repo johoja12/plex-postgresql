@@ -6,7 +6,7 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 
 use super::{
-    cstr_to_str, format_epoch_to_datetime_utc_impl, is_aggregate_alias, pg_sql_has_timestamp_hint,
+    cstr_to_str, is_aggregate_alias,
     rewrite_server_library_uri_bytes, rust_decode_hex_bytes, write_i32_to_buf, write_i64_to_buf,
     PGresult, SQLITE_NULL_CONST,
 };
@@ -25,7 +25,7 @@ extern "C" {
 pub fn rust_column_text_reformat_aggregate(
     col_name: *const c_char,
     oid: c_uint,
-    pg_sql: *const c_char,
+    _pg_sql: *const c_char,
     source_value: *const c_char,
     out: *mut c_char,
     out_len: usize,
@@ -49,14 +49,9 @@ pub fn rust_column_text_reformat_aggregate(
 
     if oid == 20 {
         let val = pg_text_to_int64_impl(source_value);
-        let pg_sql = cstr_to_str(pg_sql).unwrap_or("");
-        if (col.eq_ignore_ascii_case("max") || col.eq_ignore_ascii_case("min"))
-            && !pg_sql.is_empty()
-            && pg_sql_has_timestamp_hint(pg_sql)
-            && format_epoch_to_datetime_utc_impl(val, out, out_len) != 0
-        {
-            return 1;
-        }
+        // SQLite returns decimal epoch text for max/min on integer timestamps.
+        // Date formatting here made Plex persist only the year as its last-added
+        // cursor and repeatedly announce existing library items as new.
         return c_int::from(write_i64_to_buf(out, out_len, val));
     }
 

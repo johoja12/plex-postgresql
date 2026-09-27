@@ -768,6 +768,22 @@ fn column_text_reformat_aggregate_alias_expression_int8() {
 }
 
 #[test]
+fn column_text_max_added_at_preserves_integer_epoch() {
+    let col = c("max");
+    let sql = c("SELECT max(added_at) FROM metadata_items WHERE library_section_id = 2");
+    let src = c("1790506488");
+    let mut out = [0 as c_char; 32];
+
+    assert_eq!(
+        rust_column_text_reformat_aggregate(
+            col.as_ptr(), 20, sql.as_ptr(), src.as_ptr(), out.as_mut_ptr(), out.len(),
+        ),
+        1
+    );
+    assert_eq!(unsafe { CStr::from_ptr(out.as_ptr()) }.to_bytes(), src.as_bytes());
+}
+
+#[test]
 fn column_text_reformat_aggregate_non_match_returns_zero() {
     let col = c("id");
     let sql = c("select id from t");
