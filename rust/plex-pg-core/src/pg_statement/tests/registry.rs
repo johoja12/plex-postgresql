@@ -109,9 +109,57 @@ fn ffi_find_null_returns_zero() {
 #[test]
 fn ffi_find_any_checks_registry_first() {
     let s = 0x30000_usize;
-    let p = 0x40000_usize;
+    let stmt = Box::into_raw(Box::new(crate::ffi_types::PgStmt::new()));
+    unsafe { (*stmt).ref_count.store(1, std::sync::atomic::Ordering::Release); }
+    let p = stmt as usize;
 
     rust_stmt_register(s, p);
     assert_eq!(rust_stmt_find_any(s), p);
     rust_stmt_unregister(s);
+    rust_stmt_unref(stmt);
+}
+
+#[test]
+fn fast_lookup_rejects_reused_sqlite_address_and_holds_a_reference() {
+    let key = 0x7f000123usize;
+    let first = Box::into_raw(Box::new(crate::ffi_types::PgStmt::new()));
+    let second = Box::into_raw(Box::new(crate::ffi_types::PgStmt::new()));
+    unsafe {
+        (*first).ref_count.store(1, std::sync::atomic::Ordering::Release);
+        (*second).ref_count.store(1, std::sync::atomic::Ordering::Release);
+    }
+    rust_stmt_register(key, first as usize);
+    assert_eq!(rust_stmt_find_any(key), first as usize);
+    assert_eq!(rust_stmt_find_any(key), first as usize);
+    assert_eq!(unsafe { (*first).ref_count.load(std::sync::atomic::Ordering::Acquire) }, 2);
+    rust_stmt_unregister(key);
+    assert_eq!(rust_stmt_find_any(key), 0);
+    rust_stmt_register(key, second as usize);
+    assert_eq!(rust_stmt_find_any(key), second as usize);
+    rust_stmt_unregister(key);
+    rust_stmt_unref(first);
+    rust_stmt_unref(second);
+}
+
+#[test]
+fn other_thread_unregister_invalidates_cached_lookup_without_freeing_it_early() {
+    let key = 0x7f000456usize;
+    let p = Box::into_raw(Box::new(crate::ffi_types::PgStmt::new()));
+    unsafe { (*p).ref_count.store(1, std::sync::atomic::Ordering::Release); }
+    rust_stmt_register(key, p as usize);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let other = barrier.clone();
+    let address = p as usize;
+    let t = std::thread::spawn(move || {
+        assert_eq!(rust_stmt_find_any(key), address);
+        other.wait();
+        other.wait();
+        assert_eq!(rust_stmt_find_any(key), 0);
+    });
+    barrier.wait();
+    rust_stmt_unregister(key);
+    // Only the other thread's strong cache reference remains after this unref.
+    rust_stmt_unref(p);
+    barrier.wait();
+    t.join().unwrap();
 }
