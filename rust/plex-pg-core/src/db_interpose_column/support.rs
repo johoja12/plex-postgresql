@@ -24,11 +24,11 @@ pub(crate) fn next_text_buffer_index() -> usize {
 }
 
 pub(crate) fn validate_type_consistency(
+    raw_pg_stmt: *mut PgStmt,
     p_stmt: *mut sqlite3_stmt,
     idx: c_int,
     accessor_name: &str,
 ) {
-    let raw_pg_stmt = pg_find_any_stmt(p_stmt);
     if raw_pg_stmt.is_null() || unsafe { (&*raw_pg_stmt).is_pg == 0 } {
         return;
     }
