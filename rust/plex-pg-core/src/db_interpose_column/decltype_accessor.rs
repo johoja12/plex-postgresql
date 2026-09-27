@@ -109,9 +109,9 @@ pub(super) fn column_decltype_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *co
 
 /// Caller holds the statement mutex. Cached values are owned by the immutable
 /// schema cache or static storage, not the libpq result itself.
-pub(super) fn column_decltype_locked(pg_stmt: &mut PgStmt, idx: c_int) -> (*const c_char, c_int) {
+pub(super) fn column_decltype_locked(pg_stmt: &mut PgStmt, idx: c_int) -> (*const c_char, c_int, c_int) {
     if pg_stmt.result.is_null() || idx < 0 || idx >= pg_stmt.num_cols {
-        return (text_decltype(), SQLITE_TEXT);
+        return (text_decltype(), SQLITE_TEXT, SQLITE_TEXT);
     }
     let epoch = crate::libpq_helpers::result_metadata_epoch();
     if pg_stmt.column_decltypes_epoch != epoch
@@ -130,8 +130,14 @@ pub(super) fn column_decltype_locked(pg_stmt: &mut PgStmt, idx: c_int) -> (*cons
     let decltype = resolve_column_decltype_locked(pg_stmt, idx);
     let expected = crate::db_interpose_helpers::rust_expected_sqlite_type_for_decltype(decltype);
     pg_stmt.column_decltypes.resize(pg_stmt.num_cols as usize, None);
-    pg_stmt.column_decltypes[idx_usize] = Some((decltype, expected));
-    (decltype, expected)
+    // libpq field OIDs are invariant across all rows of this PGresult. Cache
+    // the non-NULL runtime type alongside the declared type, so successful
+    // consistency checks need no per-row libpq calls. NULL remains valid too.
+    let oid = crate::db_interpose_helpers::rust_pg_result_col_oid(
+        helpers_result_ptr(pg_stmt.result), idx);
+    let actual = pg_oid_to_sqlite_type_impl(oid);
+    pg_stmt.column_decltypes[idx_usize] = Some((decltype, expected, actual));
+    (decltype, expected, actual)
 }
 
 fn resolve_column_decltype_locked(pg_stmt: &mut PgStmt, idx: c_int) -> *const c_char {
@@ -192,6 +198,7 @@ mod descriptor_tests {
         let first = column_decltype_locked(&mut stmt, 0);
         assert!(first.0.is_null());
         assert_eq!(first.1, -1);
+        assert_eq!(first.2, SQLITE_INTEGER);
         assert_eq!(stmt.column_decltypes[0], Some(first));
         assert_eq!(column_decltype_locked(&mut stmt, 0), first);
         rust_pq_clear(stmt.result);
@@ -205,10 +212,12 @@ mod descriptor_tests {
         rust_pq_clear(stmt.result);
         stmt.result = result("descriptor_unaliased", 23, 0);
         assert_eq!(column_decltype_locked(&mut stmt, 0).1, SQLITE_INTEGER);
+        assert_eq!(column_decltype_locked(&mut stmt, 0).2, SQLITE_INTEGER);
         // Simulate reuse of the exact result address with a stale descriptor.
-        stmt.column_decltypes[0] = Some((text_decltype(), SQLITE_TEXT));
+        stmt.column_decltypes[0] = Some((text_decltype(), SQLITE_TEXT, SQLITE_TEXT));
         invalidate_result_metadata();
         assert_eq!(column_decltype_locked(&mut stmt, 0).1, SQLITE_INTEGER);
+        assert_eq!(column_decltype_locked(&mut stmt, 0).2, SQLITE_INTEGER);
         rust_pq_clear(stmt.result);
     }
     #[test]
@@ -221,6 +230,7 @@ mod descriptor_tests {
         crate::db_interpose_helpers::rust_decltype_cache_insert(
             name.as_ptr(), b"INTEGER\0".as_ptr() as *const c_char);
         assert_eq!(column_decltype_locked(&mut stmt, 0).1, SQLITE_INTEGER);
+        assert_eq!(column_decltype_locked(&mut stmt, 0).2, SQLITE_INTEGER);
         rust_pq_clear(stmt.result);
     }
 }
