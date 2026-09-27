@@ -309,6 +309,27 @@ unsafe fn resolve_live_column_type(
     (result, ctx)
 }
 
+#[inline]
+fn ordinary_live_column_type(pg_stmt: &PgStmt, idx: c_int) -> c_int {
+if pg_stmt.result.is_null() || idx < 0 || idx >= pg_stmt.num_cols {
+    return SQLITE_NULL;
+}
+if pg_stmt.metadata_only_result != 0 {
+    return sqlite_type_for_oid(crate::db_interpose_helpers::rust_pg_result_col_oid(
+        helpers_result_ptr(pg_stmt.result), idx));
+}
+if pg_stmt.current_row < 0 || pg_stmt.current_row >= pg_stmt.num_rows {
+    return SQLITE_NULL;
+}
+let mut oid = 0;
+let mut is_null = 0;
+let mut value_type = SQLITE_NULL;
+crate::db_interpose_helpers::rust_pg_result_type_info(
+    helpers_result_ptr(pg_stmt.result), pg_stmt.current_row, idx,
+    &mut oid, &mut is_null, &mut value_type);
+if is_null != 0 { null_column_type(oid) } else { value_type }
+}
+
 pub(super) fn column_type_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int {
     unsafe { bump_column_type_counters() };
 
@@ -339,6 +360,17 @@ pub(super) fn column_type_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int {
         unsafe {
             let tls_query = tls_last_query_ptr();
             *tls_query = pg_stmt.pg_sql;
+        }
+
+        // Ordinary reads retain the thread-local statement/column breadcrumb
+        // above. Rich name/query diagnostics are only built when requested.
+        if crate::pg_logging::LOG_LEVEL.load(Ordering::Relaxed) < 2
+            && !super::badcast::trace_badcast_enabled()
+            && !crate::db_interpose_common::full_column_trace_enabled()
+            && pg_stmt.cached_result.is_null()
+        {
+            let _guard = unsafe { PgStmt::lock_mutex(raw_pg_stmt) };
+            return ordinary_live_column_type(pg_stmt, idx);
         }
 
         let (result, ctx) = {
@@ -465,5 +497,45 @@ mod tests {
     fn the_old_answer_is_still_reachable_for_comparison() {
         assert_eq!(null_column_type_with_policy(25, true), SQLITE_TEXT);
         assert_eq!(null_column_type_with_policy(23, true), SQLITE_INTEGER);
+    }
+}
+
+#[cfg(test)]
+mod ordinary_type_tests {
+    use super::*;
+    #[repr(C)]
+    struct Att { name: *mut c_char, table: u32, column: c_int, format: c_int,
+        oid: u32, len: c_int, modifier: c_int }
+    extern "C" {
+        fn PQmakeEmptyPGresult(conn: *mut c_void, status: c_int) -> *mut PgResultLibpq;
+        fn PQsetResultAttrs(res: *mut PgResultLibpq, count: c_int, attrs: *mut Att) -> c_int;
+        fn PQsetvalue(res: *mut PgResultLibpq, row: c_int, col: c_int, value: *mut c_char, len: c_int) -> c_int;
+    }
+    #[test]
+    fn ordinary_types_match_diagnostic_path_for_values_nulls_and_bounds() {
+        for oid in [16, 20, 23, 25, 17, 701, 1700, 1114] {
+            let mut stmt = PgStmt::new();
+            let mut attr = Att { name: b"ordinary_test\0".as_ptr() as *mut _,
+                table: 0, column: 1, format: 0, oid, len: -1, modifier: -1 };
+            unsafe {
+                stmt.result = PQmakeEmptyPGresult(ptr::null_mut(), 2);
+                assert_eq!(PQsetResultAttrs(stmt.result, 1, &mut attr), 1);
+                assert_eq!(PQsetvalue(stmt.result, 0, 0, b"1\0".as_ptr() as *mut _, 1), 1);
+                assert_eq!(PQsetvalue(stmt.result, 1, 0, ptr::null_mut(), -1), 1);
+            }
+            stmt.num_cols = 1;
+            stmt.num_rows = 2;
+            for row in [-1, 0, 1, 2] {
+                stmt.current_row = row;
+                for col in [-1, 0, 1] {
+                    let fast = ordinary_live_column_type(&stmt, col);
+                    let slow = unsafe { resolve_live_column_type(&mut stmt, ptr::null_mut(), col).0 };
+                    assert_eq!(fast, slow, "oid={oid} row={row} col={col}");
+                }
+            }
+            stmt.metadata_only_result = 1;
+            assert_eq!(ordinary_live_column_type(&stmt, 0), sqlite_type_for_oid(oid));
+            crate::libpq_helpers::rust_pq_clear(stmt.result);
+        }
     }
 }

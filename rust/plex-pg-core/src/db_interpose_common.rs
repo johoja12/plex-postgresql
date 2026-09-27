@@ -27,7 +27,7 @@ pub use common_helpers::{
     get_type_name, rewrite_blobs_schema_migrations, rust_get_type_name,
     rust_rewrite_blobs_schema_migrations, rust_simple_str_replace, simple_str_replace,
 };
-pub(crate) use exception_context::{note_column_phase, copy_context};
+pub(crate) use exception_context::{note_column_phase, copy_context, full_column_trace_enabled};
 pub use exception_context::{
     rust_pg_exception_dump_recent_phases, rust_pg_exception_dump_recent_queries,
     rust_pg_exception_note_phase, rust_pg_exception_note_query,
