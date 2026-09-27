@@ -800,3 +800,23 @@ fn collection_mask_ffi_preserves_predicate_for_long_queries() {
     let invalid_utf8 = [255_u8, 0];
     assert_eq!(rust_should_mask_collection_metadata_type(invalid_utf8.as_ptr().cast(), metadata.as_ptr(), 18), 0);
 }
+
+#[test]
+fn aggregate_alias_classification_preserves_ascii_case_and_unicode_boundaries() {
+    for name in ["COUNT", " sum ", "MAX(x)", "min(é)", " AvG(İ)"] {
+        assert!(is_aggregate_alias(name), "{name}");
+    }
+    for name in ["counted", "écount", "ｍａｘ", "count (*)", "", "minimum"] {
+        assert!(!is_aggregate_alias(name), "{name}");
+    }
+}
+
+#[test]
+fn aggregate_count_does_not_need_query_text() {
+    let col = c("count");
+    let src = c("9223372036854775807");
+    let mut out = [0 as c_char; 32];
+    assert_eq!(rust_column_text_reformat_aggregate(col.as_ptr(), 20,
+        std::ptr::null(), src.as_ptr(), out.as_mut_ptr(), out.len()), 1);
+    assert_eq!(unsafe { CStr::from_ptr(out.as_ptr()) }.to_bytes(), src.as_bytes());
+}

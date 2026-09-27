@@ -49,10 +49,10 @@ pub fn rust_column_text_reformat_aggregate(
 
     if oid == 20 {
         let val = pg_text_to_int64_impl(source_value);
-        let pg_sql = cstr_to_str(pg_sql).unwrap_or("");
+        // Only MIN/MAX timestamp formatting needs the SQL. A COUNT/SUM
+        // result must not rescan a potentially huge IN-list for every cell.
         if (col.eq_ignore_ascii_case("max") || col.eq_ignore_ascii_case("min"))
-            && !pg_sql.is_empty()
-            && pg_sql_has_timestamp_hint(pg_sql)
+            && cstr_to_str(pg_sql).is_some_and(pg_sql_has_timestamp_hint)
             && format_epoch_to_datetime_utc_impl(val, out, out_len) != 0
         {
             return 1;

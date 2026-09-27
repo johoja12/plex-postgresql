@@ -62,11 +62,14 @@ pub(super) fn is_aggregate_alias(col: &str) -> bool {
     if col.is_empty() {
         return false;
     }
-    let lower = col.trim().to_ascii_lowercase();
-    matches!(lower.as_str(), "count" | "sum" | "max" | "min" | "avg")
-        || ["count(", "sum(", "max(", "min(", "avg("]
-            .iter()
-            .any(|prefix| lower.starts_with(prefix))
+    let col = col.trim().as_bytes();
+    [b"count".as_slice(), b"sum", b"max", b"min", b"avg"]
+        .iter()
+        .any(|name| {
+            col.eq_ignore_ascii_case(name)
+                || (col.get(..name.len()).is_some_and(|p| p.eq_ignore_ascii_case(name))
+                    && col.get(name.len()) == Some(&b'('))
+        })
 }
 
 pub(super) fn pg_sql_has_timestamp_hint(pg_sql: &str) -> bool {
