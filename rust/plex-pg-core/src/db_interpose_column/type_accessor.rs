@@ -80,7 +80,15 @@ fn sqlite_type_for_oid(oid: u32) -> c_int {
 /// bug to fix. `PLEX_PG_NULL_COLUMN_TYPE_FROM_OID=1` restores the old answer
 /// for a side-by-side comparison.
 pub(super) fn null_column_type(oid: u32) -> c_int {
-    if crate::env_utils::env_truthy(b"PLEX_PG_NULL_COLUMN_TYPE_FROM_OID\0") {
+    // This is a process-start diagnostic setting, like the bad-cast trace
+    // options. Repeated getenv scans otherwise dominate sparse result reads.
+    static FROM_OID: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    null_column_type_with_policy(oid, *FROM_OID.get_or_init(||
+        crate::env_utils::env_truthy(b"PLEX_PG_NULL_COLUMN_TYPE_FROM_OID\0")))
+}
+
+fn null_column_type_with_policy(oid: u32, from_oid: bool) -> c_int {
+    if from_oid {
         return sqlite_type_for_oid(oid);
     }
     SQLITE_NULL
@@ -431,7 +439,6 @@ fn column_type_emit_log(pg_stmt: *mut PgStmt, p_stmt: *mut sqlite3_stmt, ctx: &C
 #[cfg(test)]
 mod tests {
     use super::*;
-    static NULL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn null_oid_mapping_keeps_timestamp_columns_integer() {
@@ -445,10 +452,9 @@ mod tests {
     // std::out_of_range. OID 25 is text, 23 is int4.
     #[test]
     fn a_null_column_reads_as_null_whatever_its_postgres_type_is() {
-        let _guard = NULL_ENV_LOCK.lock().unwrap();
         for oid in [25u32, 23, 20, 16, 1114, 701, 17] {
             assert_eq!(
-                null_column_type(oid),
+                null_column_type_with_policy(oid, false),
                 SQLITE_NULL,
                 "oid {oid} should report SQLITE_NULL when the value is NULL"
             );
@@ -457,10 +463,7 @@ mod tests {
 
     #[test]
     fn the_old_answer_is_still_reachable_for_comparison() {
-        let _guard = NULL_ENV_LOCK.lock().unwrap();
-        std::env::set_var("PLEX_PG_NULL_COLUMN_TYPE_FROM_OID", "1");
-        assert_eq!(null_column_type(25), SQLITE_TEXT);
-        assert_eq!(null_column_type(23), SQLITE_INTEGER);
-        std::env::remove_var("PLEX_PG_NULL_COLUMN_TYPE_FROM_OID");
+        assert_eq!(null_column_type_with_policy(25, true), SQLITE_TEXT);
+        assert_eq!(null_column_type_with_policy(23, true), SQLITE_INTEGER);
     }
 }
