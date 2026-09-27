@@ -8,12 +8,12 @@ counts, and issue full episode/movie catalogue requests over localhost. Measure
 HTTP through complete response receipt, separately from XML parsing. Alternate
 engine order, use five runs each, and compare counts and unique item IDs.
 
-On a QNAP test host, p12 medians were:
+On a QNAP test host, the final candidate medians were:
 
 | Workload | Rows | Native SQLite | PostgreSQL shim | Overhead |
 |---|---:|---:|---:|---:|
-| Full episodes | 18,049 | 8.3392 s | 8.7436 s | 4.85% |
-| Full movies | 3,166 | 1.6850 s | 1.7351 s | 2.97% |
+| Full episodes | 18,049 | 8.0668 s | 8.2595 s | 2.39% |
+| Full movies | 3,166 | 1.5745 s | 1.6974 s | 7.81% |
 
 The previous shim baseline was 37.1330 s / 6.0362 s. The earlier native baseline
 was 7.8493 s / 1.7507 s; use contemporary controls because host load changes.
@@ -59,3 +59,7 @@ return different results. This performance change does not claim to fix those.
 
 Integration unit suite: 792 tests passed. Clean upstream branch: 785 tests passed.
 A separate native SQLite aggregate-decltype comparison also passed.
+
+Concurrent browse check: full 18,049-episode response in 8.1841 s while a
+50-item page completed in 0.2887 s, both HTTP 200. A prior five-run candidate
+series independently measured 4.85% episode and 2.97% movie overhead.
