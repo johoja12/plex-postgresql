@@ -43,9 +43,9 @@ pub(crate) fn validate_type_consistency(
         if pg_stmt.result.is_null() || idx < 0 || idx >= pg_stmt.num_cols {
             return;
         }
-        let (col_decltype, expected) =
+        let (col_decltype, expected, actual) =
             super::decltype_accessor::column_decltype_locked(pg_stmt, idx);
-        if col_decltype.is_null() || expected == -1 {
+        if col_decltype.is_null() || expected == -1 || actual == expected {
             return;
         }
         let mut oid = 0;

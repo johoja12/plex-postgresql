@@ -172,7 +172,7 @@ pub struct PgStmt {
     pub col_tables_resolved: c_int,
     // (declared type, expected runtime type); Some(NULL, -1) is a cached
     // expression decltype, distinct from an unresolved entry.
-    pub column_decltypes: Vec<Option<(*const c_char, c_int)>>,
+    pub column_decltypes: Vec<Option<(*const c_char, c_int, c_int)>>,
     pub owned_column_text: Vec<Option<Vec<u8>>>,
     pub column_decltypes_epoch: u64,
     pub column_decltypes_result: usize,
