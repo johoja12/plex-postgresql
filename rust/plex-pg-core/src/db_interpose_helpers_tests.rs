@@ -768,6 +768,22 @@ fn column_text_reformat_aggregate_alias_expression_int8() {
 }
 
 #[test]
+fn column_text_max_added_at_keeps_sqlite_epoch_text() {
+    let col = c("max");
+    let sql = c("SELECT max(added_at) FROM metadata_items WHERE library_section_id = 2");
+    let src = c("1790506488");
+    let mut out = [0 as c_char; 32];
+
+    assert_eq!(
+        rust_column_text_reformat_aggregate(
+            col.as_ptr(), 20, sql.as_ptr(), src.as_ptr(), out.as_mut_ptr(), out.len(),
+        ),
+        1
+    );
+    assert_eq!(unsafe { CStr::from_ptr(out.as_ptr()) }.to_bytes(), src.as_bytes());
+}
+
+#[test]
 fn column_text_reformat_aggregate_non_match_returns_zero() {
     let col = c("id");
     let sql = c("select id from t");
@@ -842,9 +858,9 @@ fn transformed_text_is_complete_nul_terminated_and_handles_invalid_utf8() {
 }
 
 #[test]
-fn owned_aggregate_transformation_preserves_int64_and_timestamp_rules() {
-    let sql = c("select max(created_at) from metadata_items");
-    let value = c("0");
+fn owned_aggregate_transformation_preserves_integer_epoch_text() {
+    let sql = c("select max(added_at) from metadata_items");
+    let value = c("1790506488");
     let name = c("max");
     let out = column_text_transform_owned(name.as_ptr(), 20, sql.as_ptr(),
         value.as_ptr(), value.as_bytes()).unwrap();
@@ -852,4 +868,5 @@ fn owned_aggregate_transformation_preserves_int64_and_timestamp_rules() {
     assert_eq!(rust_column_text_transform(name.as_ptr(), 20, sql.as_ptr(),
         value.as_ptr(), value.as_bytes().len(), previous.as_mut_ptr(), previous.len()), 1);
     assert_eq!(out, unsafe { CStr::from_ptr(previous.as_ptr()) }.to_bytes_with_nul());
+    assert_eq!(out, b"1790506488\0");
 }
