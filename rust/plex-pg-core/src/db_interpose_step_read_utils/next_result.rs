@@ -204,3 +204,62 @@ pub(super) fn log_debug_context_impl(stmt: *mut PgStmt, exec_conn: *mut PgConnec
         }
     }
 }
+
+/// A materialized result is independent of its libpq connection. Advancing it
+/// does not need parameter rebuilding or a thread-local pool checkout. Keep
+/// the original result connection reference alive until the result is cleared.
+pub(crate) unsafe fn try_advance_materialized(stmt: *mut PgStmt) -> Option<c_int> {
+    if stmt.is_null() { return None; }
+    let _guard = PgStmt::lock_mutex(stmt);
+    let s = &mut *stmt;
+    if s.is_pg != 2 || s.streaming_mode != 0 || s.metadata_only_result != 0 {
+        return None;
+    }
+    if s.read_done != 0 { return Some(STEP_RESULT_DONE); }
+    if s.current_row < 0 || (s.result.is_null() && s.cached_result.is_null()) {
+        return None;
+    }
+    s.current_row += 1;
+    if s.current_row < s.num_rows { return Some(STEP_RESULT_ROW); }
+    if !s.cached_result.is_null() {
+        crate::pg_query_cache::rust_query_cache_release(s.cached_result);
+        s.cached_result = std::ptr::null_mut();
+    } else {
+        crate::libpq_helpers::rust_pq_clear(s.result);
+        s.result = std::ptr::null_mut();
+        s.set_result_conn(std::ptr::null_mut());
+    }
+    s.read_done = 1;
+    Some(STEP_RESULT_DONE)
+}
+
+#[cfg(test)]
+mod fast_advance_tests {
+    use super::*;
+    extern "C" {
+        fn PQmakeEmptyPGresult(conn: *mut crate::libpq_helpers::PGconn, status: c_int) -> *mut PGresult;
+    }
+    #[test]
+    fn materialized_rows_advance_without_connection_and_clear_at_end() {
+        let mut s = PgStmt::new();
+        s.is_pg = 2; s.current_row = 0; s.num_rows = 2;
+        s.result = unsafe { PQmakeEmptyPGresult(std::ptr::null_mut(), PGRES_TUPLES_OK) };
+        assert!(!s.result.is_null());
+        assert_eq!(unsafe { try_advance_materialized(&mut s) }, Some(STEP_RESULT_ROW));
+        assert_eq!(s.current_row, 1);
+        assert_eq!(unsafe { try_advance_materialized(&mut s) }, Some(STEP_RESULT_DONE));
+        assert!(s.result.is_null());
+        assert_eq!(unsafe { try_advance_materialized(&mut s) }, Some(STEP_RESULT_DONE));
+    }
+    #[test]
+    fn first_execution_metadata_and_streaming_keep_normal_path() {
+        let mut s = PgStmt::new(); s.is_pg = 2;
+        assert_eq!(unsafe { try_advance_materialized(&mut s) }, None);
+        s.read_done = 1; s.metadata_only_result = 1;
+        assert_eq!(unsafe { try_advance_materialized(&mut s) }, None);
+        s.metadata_only_result = 0; s.streaming_mode = 1;
+        assert_eq!(unsafe { try_advance_materialized(&mut s) }, None);
+        s.streaming_mode = 0; s.is_pg = 1;
+        assert_eq!(unsafe { try_advance_materialized(&mut s) }, None);
+    }
+}

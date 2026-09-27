@@ -241,6 +241,10 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
         }
     }
 
+    if let Some(rc) = crate::db_interpose_step_read_utils::try_advance_materialized(pg_stmt) {
+        return rc;
+    }
+
     let mut exec_conn: *mut PgConnection = std::ptr::null_mut();
 
     if !pg_stmt.is_null() {
