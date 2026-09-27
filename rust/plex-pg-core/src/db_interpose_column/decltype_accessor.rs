@@ -230,7 +230,9 @@ mod descriptor_tests {
         crate::db_interpose_helpers::rust_decltype_cache_insert(
             name.as_ptr(), b"INTEGER\0".as_ptr() as *const c_char);
         assert_eq!(column_decltype_locked(&mut stmt, 0).1, SQLITE_INTEGER);
-        assert_eq!(column_decltype_locked(&mut stmt, 0).2, SQLITE_INTEGER);
+        // The declared type changes, but the libpq field remains TEXT: this
+        // must still take the mismatch/NULL validation path.
+        assert_eq!(column_decltype_locked(&mut stmt, 0).2, SQLITE_TEXT);
         rust_pq_clear(stmt.result);
     }
 }
