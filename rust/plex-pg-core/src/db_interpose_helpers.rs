@@ -33,6 +33,7 @@ pub use ffi_strings::{
     rust_free_cstring, rust_free_normalized_sql, rust_normalize_sql_literals,
     rust_rewrite_server_library_uri, rust_validate_utf8, RustNormalizedSql,
 };
+pub(crate) use pg_result::column_text_transform_owned;
 pub use pg_result::{
     rust_column_text_reformat_aggregate, rust_column_text_transform, rust_get_table_from_pgresult,
     rust_pg_create_column_value, rust_pg_decode_bytea, rust_pg_result_blob_copy,

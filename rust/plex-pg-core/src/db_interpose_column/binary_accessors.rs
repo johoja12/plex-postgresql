@@ -214,6 +214,10 @@ pub(super) fn column_bytes_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int 
         return 0;
     };
 
+    if let Some(Some(owned)) = pg_stmt.owned_column_text.get(idx as usize) {
+        return owned.len().saturating_sub(1) as c_int;
+    }
+
     if state.oid_u == 17 {
         let mut blob_len = 0;
         pg_decode_bytea_cached_impl(raw_pg_stmt, state.row, idx, &mut blob_len as *mut c_int);
