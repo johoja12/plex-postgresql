@@ -8,7 +8,6 @@ struct CachedTypeState {
     row: c_int,
     col_name: *const c_char,
     oid: u32,
-    value_ptr: *const c_char,
     is_null: bool,
 }
 
@@ -18,8 +17,6 @@ struct LiveTypeState {
     oid: u32,
     sqlite_type: c_int,
     is_null: bool,
-    value_buf: [c_char; 128],
-    value_len: c_int,
 }
 
 impl LiveTypeState {
@@ -108,17 +105,11 @@ unsafe fn load_cached_type_state(pg_stmt: &mut PgStmt, idx: c_int) -> Option<Cac
     } else {
         0
     };
-    let value_ptr = if !crow.values.is_null() {
-        *crow.values.add(idx as usize)
-    } else {
-        ptr::null()
-    };
 
     Some(CachedTypeState {
         row,
         col_name,
         oid,
-        value_ptr,
         is_null,
     })
 }
@@ -177,16 +168,6 @@ unsafe fn resolve_cached_column_type(
         return (result, ctx);
     }
 
-    if !state.value_ptr.is_null() {
-        let raw_val = pg_text_to_int64_impl(state.value_ptr);
-        let mut masked = 0i64;
-        if mask_collection_metadata_type(pg_stmt, state.col_name, raw_val, &mut masked) {
-            let result = sqlite_type_for_oid(state.oid);
-            ctx.result = result;
-            return (result, ctx);
-        }
-    }
-
     let result = sqlite_type_for_oid(state.oid);
     ctx.result = result;
     (result, ctx)
@@ -224,25 +205,13 @@ unsafe fn load_live_type_state(pg_stmt: &mut PgStmt, idx: c_int) -> Option<LiveT
         idx,
     );
 
-    let mut state = LiveTypeState {
+    let state = LiveTypeState {
         row,
         col_name,
         oid: oid_u as u32,
         sqlite_type,
         is_null: is_null != 0,
-        value_buf: [0; 128],
-        value_len: -1,
     };
-
-    if !state.is_null {
-        state.value_len = crate::db_interpose_helpers::rust_pg_result_text_copy(
-            helpers_result_ptr(pg_stmt.result),
-            row,
-            idx,
-            state.value_buf.as_mut_ptr(),
-            state.value_buf.len(),
-        );
-    }
 
     Some(state)
 }
@@ -339,19 +308,8 @@ unsafe fn resolve_live_column_type(
         return (result, ctx);
     }
 
-    if state.value_len >= 0 {
-        let raw_val = pg_text_to_int64_impl(state.value_buf.as_ptr());
-        let mut masked = 0i64;
-        if mask_collection_metadata_type(pg_stmt, state.col_name, raw_val, &mut masked) {
-            // Return the column's actual type (not SQLITE_NULL) to prevent
-            // holder/type mismatch → bad_cast. The mask sets the value to 0,
-            // which column_int will return. SOCI's typed holder stays valid.
-            let result = state.sqlite_type;
-            ctx.result = result;
-            return (result, ctx);
-        }
-    }
-
+    // Masking metadata_type changes the value, never its SQLite type. Avoid
+    // copying/parsing every cell merely to return the same OID-derived type.
     let result = state.sqlite_type;
     ctx.result = result;
     ctx.decltype_guess = state.decltype_guess();

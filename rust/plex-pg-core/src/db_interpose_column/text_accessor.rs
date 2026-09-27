@@ -146,8 +146,6 @@ unsafe fn write_live_text_output(
 ) -> *const c_uchar {
     let buf_idx = next_text_buffer_index();
     let mut out_ptr: *const c_uchar = ptr::null();
-    let mut preview = [0u8; 128];
-    let mut source_len: usize = 0;
     let mut transform_rc: c_int = 0;
     COLUMN_TEXT_BUFFERS.with(|bufs| {
         let mut bufs = bufs.borrow_mut();
@@ -162,9 +160,9 @@ unsafe fn write_live_text_output(
             0,
             buf.as_mut_ptr() as *mut c_char,
             TEXT_BUFFER_SIZE,
-            preview.as_mut_ptr() as *mut c_char,
-            preview.len(),
-            &mut source_len as *mut usize,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
         );
         out_ptr = buf.as_ptr();
     });
