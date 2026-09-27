@@ -7,25 +7,9 @@ struct CachedScalarState {
 }
 
 struct LiveScalarState {
-    _row: c_int,
-    _oid: u32,
     col_name: *const c_char,
     is_null: bool,
-    value_buf: [c_char; 128],
     value_ptr: *const c_char,
-}
-
-impl LiveScalarState {
-    fn new(row: c_int, oid: u32, col_name: *const c_char, is_null: bool) -> Self {
-        Self {
-            _row: row,
-            _oid: oid,
-            col_name,
-            is_null,
-            value_buf: [0; 128],
-            value_ptr: ptr::null(),
-        }
-    }
 }
 
 unsafe fn load_cached_scalar_state(pg_stmt: &mut PgStmt, idx: c_int) -> Option<CachedScalarState> {
@@ -76,36 +60,20 @@ unsafe fn load_live_scalar_state(
     }
 
     let mut is_null = 0;
-    let mut oid_u: c_uint = 0;
-    let mut sqlite_type = SQLITE_NULL;
-    crate::db_interpose_helpers::rust_pg_result_type_info(
-        helpers_result_ptr(pg_stmt.result),
-        row,
-        idx,
-        &mut oid_u as *mut c_uint,
-        &mut is_null as *mut c_int,
-        &mut sqlite_type as *mut c_int,
+    let mut value_ptr = ptr::null();
+    let mut length = 0;
+    let ok = crate::db_interpose_helpers::rust_pg_result_value_ptr_len(
+        helpers_result_ptr(pg_stmt.result), row, idx,
+        &mut value_ptr, &mut length, &mut is_null,
     );
+    if ok == 0 { return None; }
     let col_name = crate::db_interpose_helpers::rust_pg_result_col_name(
-        helpers_result_ptr(pg_stmt.result),
-        idx,
+        helpers_result_ptr(pg_stmt.result), idx,
     );
-    let mut state = LiveScalarState::new(row, oid_u as u32, col_name, is_null != 0);
+    // Borrow while the caller holds the statement lock. A pointer into a
+    // returned struct's inline buffer could dangle when that struct moved.
+    Some(LiveScalarState { col_name, is_null: is_null != 0, value_ptr })
 
-    if !state.is_null {
-        let val_len = crate::db_interpose_helpers::rust_pg_result_text_copy(
-            helpers_result_ptr(pg_stmt.result),
-            row,
-            idx,
-            state.value_buf.as_mut_ptr(),
-            state.value_buf.len(),
-        );
-        if val_len >= 0 {
-            state.value_ptr = state.value_buf.as_ptr();
-        }
-    }
-
-    Some(state)
 }
 
 pub(super) fn column_int_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int {
