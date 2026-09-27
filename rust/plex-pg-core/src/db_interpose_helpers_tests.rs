@@ -820,3 +820,36 @@ fn aggregate_count_does_not_need_query_text() {
         std::ptr::null(), src.as_ptr(), out.as_mut_ptr(), out.len()), 1);
     assert_eq!(unsafe { CStr::from_ptr(out.as_ptr()) }.to_bytes(), src.as_bytes());
 }
+
+#[test]
+fn ordinary_text_can_be_borrowed_without_truncating_long_unicode() {
+    let value = c(&"Plex é 📺 ".repeat(10000));
+    let name = c("title");
+    assert!(column_text_transform_owned(name.as_ptr(), 25, std::ptr::null(),
+        value.as_ptr(), value.as_bytes()).is_none());
+}
+
+#[test]
+fn transformed_text_is_complete_nul_terminated_and_handles_invalid_utf8() {
+    let name = c("uri");
+    let suffix = "é".repeat(10000);
+    let value = c(&format!("server://machine/com.plexapp.plugins.library/library/{suffix}"));
+    let output = column_text_transform_owned(name.as_ptr(), 25, std::ptr::null(),
+        value.as_ptr(), value.as_bytes()).unwrap();
+    assert_eq!(output, format!("library://{suffix}\0").as_bytes());
+    assert_eq!(column_text_transform_owned(name.as_ptr(), 25, std::ptr::null(),
+        std::ptr::null(), &[0xff]).unwrap(), vec![0]);
+}
+
+#[test]
+fn owned_aggregate_transformation_preserves_int64_and_timestamp_rules() {
+    let sql = c("select max(created_at) from metadata_items");
+    let value = c("0");
+    let name = c("max");
+    let out = column_text_transform_owned(name.as_ptr(), 20, sql.as_ptr(),
+        value.as_ptr(), value.as_bytes()).unwrap();
+    let mut previous = [0 as c_char; 64];
+    assert_eq!(rust_column_text_transform(name.as_ptr(), 20, sql.as_ptr(),
+        value.as_ptr(), value.as_bytes().len(), previous.as_mut_ptr(), previous.len()), 1);
+    assert_eq!(out, unsafe { CStr::from_ptr(previous.as_ptr()) }.to_bytes_with_nul());
+}
