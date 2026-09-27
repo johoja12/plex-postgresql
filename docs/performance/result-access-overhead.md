@@ -63,3 +63,12 @@ A separate native SQLite aggregate-decltype comparison also passed.
 Concurrent browse check: full 18,049-episode response in 8.1841 s while a
 50-item page completed in 0.2887 s, both HTTP 200. A prior five-run candidate
 series independently measured 4.85% episode and 2.97% movie overhead.
+
+## Helper scaling check
+
+`cargo bench --manifest-path rust/plex-pg-core/Cargo.toml --bench bench_result_hotpath -- --sample-size 10 --measurement-time 1 --warm-up-time 1` completed successfully.
+Across SQL lengths 64, 64,000 and 700,000 bytes, ordinary-value checks measured
+2.76–3.19 ns and ordinary-column checks 29.86–32.26 ns. Across 10, 100 and 1,000
+schema entries, cached alias hits measured 103.56–113.11 ns and misses
+70.41–71.31 ns. Neither path shows proportional growth with SQL/schema size.
+These local helper timings are distinct from the QNAP HTTP measurements.
