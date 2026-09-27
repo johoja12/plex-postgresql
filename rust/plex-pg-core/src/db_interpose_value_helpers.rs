@@ -1,4 +1,3 @@
-use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 
 pub(crate) const SQLITE_INTEGER_CONST: i32 = 1;
@@ -16,24 +15,23 @@ pub(crate) fn pg_oid_to_sqlite_type_impl(oid: u32) -> i32 {
     }
 }
 
-fn is_pg_bool_text_true_false(bytes: &[u8]) -> Option<i32> {
-    if bytes.len() == 1 {
-        if bytes[0] == b't' {
-            return Some(1);
-        }
-        if bytes[0] == b'f' {
-            return Some(0);
+fn is_pg_bool_text_true_false(value: *const c_char) -> Option<i32> {
+    // Only the one-byte libpq bool spellings need special handling. Do not
+    // strlen every ordinary number before atoi/atoll/atof scans it again.
+    unsafe {
+        match *value as u8 {
+            b't' if *value.add(1) == 0 => Some(1),
+            b'f' if *value.add(1) == 0 => Some(0),
+            _ => None,
         }
     }
-    None
 }
 
 pub(crate) fn pg_text_to_int_impl(value: *const c_char) -> c_int {
     if value.is_null() {
         return 0;
     }
-    let bytes = unsafe { CStr::from_ptr(value) }.to_bytes();
-    if let Some(v) = is_pg_bool_text_true_false(bytes) {
+    if let Some(v) = is_pg_bool_text_true_false(value) {
         return v;
     }
     unsafe { libc::atoi(value) }
@@ -43,8 +41,7 @@ pub(crate) fn pg_text_to_int64_impl(value: *const c_char) -> i64 {
     if value.is_null() {
         return 0;
     }
-    let bytes = unsafe { CStr::from_ptr(value) }.to_bytes();
-    if let Some(v) = is_pg_bool_text_true_false(bytes) {
+    if let Some(v) = is_pg_bool_text_true_false(value) {
         return v as i64;
     }
     unsafe { libc::atoll(value) }
@@ -54,8 +51,7 @@ pub(crate) fn pg_text_to_double_impl(value: *const c_char) -> f64 {
     if value.is_null() {
         return 0.0;
     }
-    let bytes = unsafe { CStr::from_ptr(value) }.to_bytes();
-    if let Some(v) = is_pg_bool_text_true_false(bytes) {
+    if let Some(v) = is_pg_bool_text_true_false(value) {
         return v as f64;
     }
     unsafe { libc::atof(value) }
