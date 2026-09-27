@@ -195,7 +195,7 @@ pub(super) fn column_text_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const 
         );
     }
 
-    validate_type_consistency(p_stmt, idx, "column_text");
+    validate_type_consistency(dbg_stmt, p_stmt, idx, "column_text");
 
     if dbg_stmt.is_null() || unsafe { (&*dbg_stmt).is_pg == 0 } {
         return get_orig_sqlite3_column_text()
