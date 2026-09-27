@@ -35,42 +35,41 @@ pub(crate) fn validate_type_consistency(
 
     let pg_stmt = unsafe { &mut *raw_pg_stmt };
 
-    let col_type = rust_my_sqlite3_column_type(p_stmt, idx);
-    let col_decltype = rust_my_sqlite3_column_decltype(p_stmt, idx);
-
-    // Acquire mutex only to extract data; all logging happens after release.
+    // Resolve once under the existing statement lock. Calling the public
+    // column_type/decltype entry points here repeated registry lookups, crash
+    // breadcrumbs and locks for every value read, without changing conversion.
     let mismatch_ctx = {
         let _guard = unsafe { PgStmt::lock_mutex(raw_pg_stmt) };
-        if pg_stmt.result.is_null() {
+        if pg_stmt.result.is_null() || idx < 0 || idx >= pg_stmt.num_cols {
             return;
         }
-
-        let oid = crate::db_interpose_helpers::rust_pg_result_col_oid(
-            helpers_result_ptr(pg_stmt.result),
-            idx,
+        let (col_decltype, expected) =
+            super::decltype_accessor::column_decltype_locked(pg_stmt, idx);
+        if col_decltype.is_null() || expected == -1 {
+            return;
+        }
+        let mut oid = 0;
+        let mut is_null = 0;
+        let mut col_type = SQLITE_NULL;
+        crate::db_interpose_helpers::rust_pg_result_type_info(
+            helpers_result_ptr(pg_stmt.result), pg_stmt.current_row, idx,
+            &mut oid, &mut is_null, &mut col_type,
         );
+        if is_null != 0 {
+            col_type = super::type_accessor::null_column_type(oid);
+        }
+        if col_type == SQLITE_NULL || col_type == expected {
+            return;
+        }
         let col_name = crate::db_interpose_helpers::rust_pg_result_col_name(
-            helpers_result_ptr(pg_stmt.result),
-            idx,
+            helpers_result_ptr(pg_stmt.result), idx,
         );
-
-        if col_decltype.is_null() {
-            return;
-        }
-        let expected =
-            crate::db_interpose_helpers::rust_expected_sqlite_type_for_decltype(col_decltype);
-        if expected == -1 || col_type == SQLITE_NULL || col_type == expected {
-            return; // No mismatch — fast path
-        }
-
-        let current_row = pg_stmt.current_row;
-        let pg_sql = pg_stmt.pg_sql;
-        let should_trace = trace_badcast_should_log(raw_pg_stmt, idx);
-        (oid, col_name, expected, current_row, pg_sql, should_trace)
+        (oid, col_name, expected, pg_stmt.current_row, pg_stmt.pg_sql,
+            trace_badcast_should_log(raw_pg_stmt, idx), col_decltype, col_type)
     };
 
     // MISMATCH DETECTED — always log at ERROR level so we can diagnose bad_cast.
-    let (oid, col_name, expected, current_row, pg_sql, should_trace) = mismatch_ctx;
+    let (oid, col_name, expected, current_row, pg_sql, should_trace, col_decltype, col_type) = mismatch_ctx;
     log_error(&format!(
         "TYPE_MISMATCH: accessor={} col='{}' idx={} row={} decltype='{}' expects {} but column_type={} (OID={}) sql={}",
         accessor_name,
