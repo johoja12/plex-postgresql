@@ -50,6 +50,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # Runtime stage
 FROM linuxserver/plex:latest
 
+# Plex's job manager owns SIGCHLD. Forcing SIG_IGN auto-reaps scanner children
+# and prevents Plex from receiving their normal completion notifications.
+# Keep the existing explicit FORCE override available for troubleshooting.
+ENV PLEX_PG_DISABLE_SIGCHLD_IGNORE=1
+
 # Install PostgreSQL client for health checks, sqlite3 for schema fixes,
 # python3 for data migration, gdb for debugging
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -119,7 +124,7 @@ RUN if [ -f /etc/s6-overlay/s6-rc.d/init-plex-claim/run ]; then \
     fi
 
 # Keep upstream CrashUploader binary.
-# With SIGCHLD forced to SIG_IGN, child exits should no longer destabilize Plex.
+# Preserve Plex's own child-exit handling (see the runtime ENV above).
 
 # s6 finish script — defense-in-depth for the BindAddrInUseException crash loop.
 #
