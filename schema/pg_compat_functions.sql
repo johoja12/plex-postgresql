@@ -102,6 +102,11 @@ BEGIN
             FROM plex.metadata_items;
     END IF;
     IF to_regclass('plex.tags') IS NOT NULL THEN
+        -- Preserve MATCH semantics while indexing its exact source expression.
+        -- Production operators can pre-create this index CONCURRENTLY before
+        -- upgrading to avoid a write lock on a busy existing database.
+        CREATE INDEX IF NOT EXISTS idx_tags_tag_simple_fts
+            ON plex.tags USING gin (to_tsvector('simple'::regconfig, tag));
         CREATE OR REPLACE VIEW plex.fts4_tag_titles AS
             SELECT id AS rowid, tag AS title, search_vector AS title_fts, tag
             FROM plex.tags;
