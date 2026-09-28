@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::db_interpose_conn_utils::{cstr_to_string_or, log_error};
@@ -13,8 +14,6 @@ const FINALIZED_RING_SIZE: usize = 2048;
 const FINALIZED_RECENT_MS: u64 = 2000;
 const PREPARED_RING_SIZE: usize = 4096;
 
-static FINALIZED_RING_IDX: AtomicU32 = AtomicU32::new(0);
-static PREPARED_RING_IDX: AtomicU32 = AtomicU32::new(0);
 static CLEAR_BINDINGS_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 static SKIP_CLEAR_BINDINGS_CACHED: AtomicI32 = AtomicI32::new(-1);
@@ -71,16 +70,61 @@ impl PreparedEntry {
     }
 }
 
-// Use vec![].into_boxed_slice() to allocate directly on the heap.
-// Box::new([T; N]) would place the array on the stack first (~560KB for
-// FinalizedEntry × 2048), exceeding Plex's 544K worker thread stacks.
-static FINALIZED_RING: LazyLock<Mutex<Box<[FinalizedEntry]>>> = LazyLock::new(|| {
-    Mutex::new(vec![FinalizedEntry::empty(); FINALIZED_RING_SIZE].into_boxed_slice())
-});
+// Keep bounded FIFO retention, but index statement addresses instead of
+// scanning thousands of large diagnostic records on every prepare/finalize.
+// Entries and the index share the enclosing mutex, including pointer reuse.
+struct StatementRing<T: Copy> {
+    entries: Box<[Option<(usize, T)>]>,
+    positions: HashMap<usize, usize>,
+    next: usize,
+}
 
-static PREPARED_RING: LazyLock<Mutex<Box<[PreparedEntry]>>> = LazyLock::new(|| {
-    Mutex::new(vec![PreparedEntry::empty(); PREPARED_RING_SIZE].into_boxed_slice())
-});
+impl<T: Copy> StatementRing<T> {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0);
+        Self {
+            // Allocate on the heap: Plex worker stacks are only about 544 KiB.
+            entries: vec![None; capacity].into_boxed_slice(),
+            positions: HashMap::with_capacity(capacity),
+            next: 0,
+        }
+    }
+
+    fn remove(&mut self, key: usize) {
+        if let Some(slot) = self.positions.remove(&key) {
+            self.entries[slot] = None;
+        }
+    }
+
+    fn insert(&mut self, key: usize, value: T) {
+        self.remove(key);
+        let slot = self.next;
+        if let Some((old_key, _)) = self.entries[slot].take() {
+            self.positions.remove(&old_key);
+        }
+        self.entries[slot] = Some((key, value));
+        self.positions.insert(key, slot);
+        self.next = (slot + 1) % self.entries.len();
+    }
+
+    fn get(&self, key: usize) -> Option<T> {
+        self.positions
+            .get(&key)
+            .and_then(|&slot| self.entries[slot].map(|(_, value)| value))
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.fill(None);
+        self.positions.clear();
+        self.next = 0;
+    }
+}
+
+static FINALIZED_RING: LazyLock<Mutex<StatementRing<FinalizedEntry>>> =
+    LazyLock::new(|| Mutex::new(StatementRing::new(FINALIZED_RING_SIZE)));
+static PREPARED_RING: LazyLock<Mutex<StatementRing<PreparedEntry>>> =
+    LazyLock::new(|| Mutex::new(StatementRing::new(PREPARED_RING_SIZE)));
 
 pub(super) fn skip_clear_bindings_on_finalized() -> bool {
     let cached = SKIP_CLEAR_BINDINGS_CACHED.load(Ordering::Relaxed);
@@ -145,27 +189,27 @@ pub(super) unsafe fn remember_finalized_stmt(
     if stmt.is_null() {
         return;
     }
-    let idx = FINALIZED_RING_IDX.fetch_add(1, Ordering::Relaxed) as usize % FINALIZED_RING_SIZE;
     let mut ring = FINALIZED_RING.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = &mut ring[idx];
+    let mut entry = FinalizedEntry::empty();
     entry.stmt = stmt;
     entry.ts_ns = now_monotonic_ns();
     entry.tid = libc::pthread_self() as u64;
     entry.is_pg = is_pg;
     write_sql_buf(&mut entry.sql, sql);
+    ring.insert(stmt as usize, entry);
 }
 
 pub(super) unsafe fn remember_prepared_stmt(stmt: *mut sqlite3_stmt, sql: *const c_char) {
     if stmt.is_null() {
         return;
     }
-    let idx = PREPARED_RING_IDX.fetch_add(1, Ordering::Relaxed) as usize % PREPARED_RING_SIZE;
     let mut ring = PREPARED_RING.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = &mut ring[idx];
+    let mut entry = PreparedEntry::empty();
     entry.stmt = stmt;
     entry.ts_ns = now_monotonic_ns();
     entry.tid = libc::pthread_self() as u64;
     write_sql_buf(&mut entry.sql, sql);
+    ring.insert(stmt as usize, entry);
 }
 
 pub(super) unsafe fn is_prepared_stmt(stmt: *mut sqlite3_stmt) -> bool {
@@ -173,12 +217,7 @@ pub(super) unsafe fn is_prepared_stmt(stmt: *mut sqlite3_stmt) -> bool {
         return false;
     }
     let ring = PREPARED_RING.lock().unwrap_or_else(|e| e.into_inner());
-    for i in 0..PREPARED_RING_SIZE {
-        if ring[i].stmt == stmt {
-            return true;
-        }
-    }
-    false
+    ring.get(stmt as usize).is_some()
 }
 
 pub(super) unsafe fn clear_prepared_stmt(stmt: *mut sqlite3_stmt) {
@@ -186,12 +225,7 @@ pub(super) unsafe fn clear_prepared_stmt(stmt: *mut sqlite3_stmt) {
         return;
     }
     let mut ring = PREPARED_RING.lock().unwrap_or_else(|e| e.into_inner());
-    for i in 0..PREPARED_RING_SIZE {
-        if ring[i].stmt == stmt {
-            ring[i] = PreparedEntry::empty();
-            return;
-        }
-    }
+    ring.remove(stmt as usize);
 }
 
 pub(super) unsafe fn clear_finalized_entry(stmt: *mut sqlite3_stmt) {
@@ -199,12 +233,7 @@ pub(super) unsafe fn clear_finalized_entry(stmt: *mut sqlite3_stmt) {
         return;
     }
     let mut ring = FINALIZED_RING.lock().unwrap_or_else(|e| e.into_inner());
-    for i in 0..FINALIZED_RING_SIZE {
-        if ring[i].stmt == stmt {
-            ring[i] = FinalizedEntry::empty();
-            return;
-        }
-    }
+    ring.remove(stmt as usize);
 }
 
 fn find_finalized_entry(stmt: *mut sqlite3_stmt) -> Option<FinalizedEntry> {
@@ -212,12 +241,7 @@ fn find_finalized_entry(stmt: *mut sqlite3_stmt) -> Option<FinalizedEntry> {
         return None;
     }
     let ring = FINALIZED_RING.lock().unwrap_or_else(|e| e.into_inner());
-    for i in 0..FINALIZED_RING_SIZE {
-        if ring[i].stmt == stmt {
-            return Some(ring[i]);
-        }
-    }
-    None
+    ring.get(stmt as usize)
 }
 
 pub(super) unsafe fn log_clear_bindings_anomaly(reason: &str, stmt: *mut sqlite3_stmt) {
@@ -287,22 +311,52 @@ pub(super) unsafe fn is_recently_finalized_stmt(stmt: *mut sqlite3_stmt) -> bool
 
 #[cfg(test)]
 pub(super) unsafe fn reset_test_state() {
-    FINALIZED_RING_IDX.store(0, Ordering::Relaxed);
-    PREPARED_RING_IDX.store(0, Ordering::Relaxed);
     CLEAR_BINDINGS_COUNTER.store(0, Ordering::Relaxed);
     SKIP_CLEAR_BINDINGS_CACHED.store(1, Ordering::Relaxed);
     TRACE_CLEAR_BINDINGS_CACHED.store(0, Ordering::Relaxed);
 
     {
         let mut ring = FINALIZED_RING.lock().unwrap_or_else(|e| e.into_inner());
-        for i in 0..FINALIZED_RING_SIZE {
-            ring[i] = FinalizedEntry::empty();
-        }
+        ring.clear();
     }
     {
         let mut ring = PREPARED_RING.lock().unwrap_or_else(|e| e.into_inner());
-        for i in 0..PREPARED_RING_SIZE {
-            ring[i] = PreparedEntry::empty();
+        ring.clear();
+    }
+}
+
+#[cfg(test)]
+mod indexed_ring_tests {
+    use super::StatementRing;
+
+    #[test]
+    fn bounded_history_evicts_old_addresses() {
+        let mut ring = StatementRing::new(3);
+        for i in 1..=100 {
+            ring.insert(i, i * 10);
+            assert_eq!(ring.get(i), Some(i * 10));
+            assert!(ring.positions.len() <= 3);
+            if i > 3 {
+                assert_eq!(ring.get(i - 3), None);
+            }
         }
+    }
+
+    #[test]
+    fn reused_pointer_keeps_new_record_when_old_slot_is_evicted() {
+        let mut ring = StatementRing::new(3);
+        ring.insert(10, 1);
+        ring.insert(20, 2);
+        ring.insert(10, 3);
+        ring.insert(30, 4);
+        assert_eq!(ring.get(10), Some(3));
+        ring.remove(10);
+        assert_eq!(ring.get(10), None);
+        ring.insert(10, 5);
+        assert_eq!(ring.get(10), Some(5));
+        assert_eq!(ring.get(20), None);
+        ring.clear();
+        assert_eq!(ring.get(10), None);
+        assert!(ring.positions.is_empty());
     }
 }
