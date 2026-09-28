@@ -398,6 +398,42 @@ pub extern "C" fn ensure_real_sqlite_loaded() {
     }
 }
 
+// /proc/self/cmdline is NUL-separated. Arguments may contain slashes (for
+// example the scanner's --content-type=application/json); only argv[0]
+// identifies the executable whose database calls we must interpose.
+fn executable_basename(cmdline: &[u8]) -> &[u8] {
+    let executable = cmdline.split(|&b| b == 0).next().unwrap_or_default();
+    executable.rsplit(|&b| b == b'/').next().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod process_name_tests {
+    use super::executable_basename;
+
+    #[test]
+    fn scanner_json_argument_does_not_disable_interposition() {
+        assert_eq!(executable_basename(b"/usr/lib/plexmediaserver/Plex Media Scanner.real\0--match\0--content-type=application/json\0"), b"Plex Media Scanner.real");
+    }
+
+    #[test]
+    fn media_path_argument_does_not_change_server_or_scanner_identity() {
+        for name in ["Plex Media Server", "Plex Media Scanner.real"] {
+            let cmdline =
+                format!("/usr/lib/plexmediaserver/{name}\0--directory\0/mnt/plex/Movies\0");
+            assert_eq!(executable_basename(cmdline.as_bytes()), name.as_bytes());
+        }
+        assert_eq!(
+            executable_basename(b"/bin/helper\0/Plex Media Server\0"),
+            b"helper"
+        );
+        assert_eq!(
+            executable_basename(b"Plex Media Scanner\0"),
+            b"Plex Media Scanner"
+        );
+        assert_eq!(executable_basename(b""), b"");
+    }
+}
+
 unsafe extern "C" fn shim_init() {
     // Eagerly resolve all interposition hooks before any other thread can
     // call the interposed wrappers.  This eliminates data races on the
@@ -411,13 +447,7 @@ unsafe extern "C" fn shim_init() {
         || {
             // Process name filtering: skip non-server/scanner processes.
             if let Ok(cmdline) = std::fs::read("/proc/self/cmdline") {
-                let mut base = cmdline.as_slice();
-                if let Some(pos) = cmdline.iter().rposition(|&b| b == b'/') {
-                    base = &cmdline[pos + 1..];
-                }
-                if let Some(pos) = base.iter().position(|&b| b == 0) {
-                    base = &base[..pos];
-                }
+                let base = executable_basename(&cmdline);
                 let base_str = std::str::from_utf8(base).unwrap_or_default();
                 if !base_str.contains("Plex Media Server")
                     && !base_str.contains("Plex Media Scanner")
