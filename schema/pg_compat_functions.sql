@@ -86,3 +86,14 @@ CREATE OPERATOR public.= (
 );
 
 
+-- Match the source expression used by translated tag MATCH queries.
+-- For busy existing databases, pre-create this index CONCURRENTLY using
+-- scripts/search-expression-index.sql before upgrading.
+DO $tag_match_index$
+BEGIN
+    IF to_regclass('plex.tags') IS NOT NULL THEN
+        CREATE INDEX IF NOT EXISTS idx_tags_tag_simple_fts
+            ON plex.tags USING gin (to_tsvector('simple'::regconfig, tag));
+    END IF;
+END;
+$tag_match_index$;

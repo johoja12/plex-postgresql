@@ -4179,6 +4179,9 @@ CREATE INDEX idx_taggings_tag_metadata ON plex.taggings USING btree (tag_id, met
 
 CREATE INDEX idx_tags_fts ON plex.tags USING gin (search_vector);
 
+-- Match the source expression used by translated tag MATCH queries.
+CREATE INDEX idx_tags_tag_simple_fts ON plex.tags USING gin (to_tsvector('simple'::regconfig, tag));
+
 
 --
 -- Name: idx_tags_key; Type: INDEX; Schema: plex; Owner: -
