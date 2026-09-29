@@ -56,6 +56,8 @@ fn transform_query(q: &mut Query) {
         }
     }
 
+    prune_collection_prefetch_tag_joins(q);
+
     // Check for DISTINCT + aggregate in ORDER BY → remove DISTINCT
     fix_distinct_with_agg_orderby(q);
 
@@ -81,6 +83,75 @@ fn transform_query(q: &mut Query) {
 
     // Remove ORDER BY rowid (PostgreSQL doesn't have rowid)
     fix_order_by_rowid(q);
+}
+
+// Plex prefetches collection members with unused tag LEFT JOINs. Those joins
+// multiply wide metadata rows before DISTINCT (hundreds of MB of sort work).
+// Recognize only the plain, fully qualified column projection / ID-list shape.
+// Keep DISTINCT: other joins can still duplicate rows. Fail closed on any extra
+// clause, aggregate, wildcard, alias on a table, or expression we do not know.
+fn prune_collection_prefetch_tag_joins(q: &mut Query) {
+    let SetExpr::Select(sel) = q.body.as_ref() else {
+        return;
+    };
+    if !matches!(sel.distinct, Some(Distinct::Distinct)) {
+        return;
+    }
+    let safe_column = |e: &Expr| match e {
+        Expr::CompoundIdentifier(ids) if ids.len() == 2 => matches!(
+            ids[0].value.as_str(),
+            "metadata_items" | "media_items" | "media_parts" | "metadata_item_settings"
+        ),
+        _ => false,
+    };
+    if sel.projection.is_empty()
+        || !sel.projection.iter().all(|p| match p {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                safe_column(e)
+            }
+            _ => false,
+        })
+    {
+        return;
+    }
+    let Some(Expr::InList {
+        expr,
+        list,
+        negated: false,
+    }) = &sel.selection
+    else {
+        return;
+    };
+    if expr.to_string() != "metadata_items.id" || list.is_empty() || !list.iter().all(|e|
+        matches!(e, Expr::Value(v) if matches!(&v.value, Value::Number(n, _) if n.bytes().all(|b| b.is_ascii_digit())))
+    ) { return; }
+    let Some(ob) = &q.order_by else { return };
+    let OrderByKind::Expressions(order) = &ob.kind else {
+        return;
+    };
+    if !order.iter().all(|e| safe_column(&e.expr)) {
+        return;
+    }
+    const FROM: &str = "metadata_items LEFT JOIN media_items ON media_items.metadata_item_id = metadata_items.id LEFT JOIN media_parts ON media_parts.media_item_id = media_items.id LEFT JOIN metadata_item_settings ON metadata_item_settings.guid = metadata_items.guid AND metadata_item_settings.account_id = 1 LEFT JOIN taggings ON taggings.metadata_item_id = metadata_items.id LEFT JOIN tags ON taggings.tag_id = tags.id";
+    let expected = format!(
+        "SELECT DISTINCT {} FROM {} WHERE {} {}",
+        sel.projection
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        FROM,
+        sel.selection.as_ref().unwrap(),
+        ob
+    );
+    // This full-shape check also rejects WITH, GROUP BY, HAVING, windows,
+    // LIMIT/OFFSET, locks and other additions without needing a field denylist.
+    if q.to_string() != expected {
+        return;
+    }
+    if let SetExpr::Select(sel) = q.body.as_mut() {
+        sel.from[0].joins.truncate(3);
+    }
 }
 
 fn transform_set_expr(se: &mut SetExpr) {
@@ -1915,5 +1986,51 @@ mod fts_boolean_regressions {
         assert_eq!(super::convert_fts_term("(star*)"), "(star:*)");
         assert_eq!(super::convert_fts_term("é* OR 日本*"), "é:* | 日本:*");
         assert_eq!(super::convert_fts_term("a O日"), "a & O日");
+    }
+}
+
+#[cfg(test)]
+mod collection_prefetch_tests {
+    use super::*;
+    use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+    const SQL: &str = "SELECT DISTINCT media_items.id AS mid, metadata_items.title FROM metadata_items LEFT JOIN media_items ON media_items.metadata_item_id = metadata_items.id LEFT JOIN media_parts ON media_parts.media_item_id = media_items.id LEFT JOIN metadata_item_settings ON metadata_item_settings.guid = metadata_items.guid AND metadata_item_settings.account_id = 1 LEFT JOIN taggings ON taggings.metadata_item_id = metadata_items.id LEFT JOIN tags ON taggings.tag_id = tags.id WHERE metadata_items.id IN (1, 2, 3) ORDER BY metadata_items.title ASC, media_parts.id ASC";
+    fn rewrite(s: &str) -> (String, String) {
+        let mut stmt = Parser::parse_sql(&PostgreSqlDialect {}, s)
+            .unwrap()
+            .remove(0);
+        let before = stmt.to_string();
+        if let Statement::Query(q) = &mut stmt {
+            prune_collection_prefetch_tag_joins(q);
+        }
+        (before, stmt.to_string())
+    }
+    #[test]
+    fn removes_only_unused_tag_fanout() {
+        let (_, after) = rewrite(SQL);
+        assert!(!after.contains("JOIN taggings"));
+        assert!(!after.contains("JOIN tags"));
+        assert!(after.contains("SELECT DISTINCT"));
+        assert!(after.contains("JOIN media_parts"));
+        assert!(after.contains("JOIN metadata_item_settings"));
+    }
+    #[test]
+    fn preserves_other_query_shapes_and_referenced_tags() {
+        for sql in [
+            SQL.replace("DISTINCT ", ""),
+            SQL.replace("media_items.id AS mid", "tags.id AS mid"),
+            SQL.replace("media_items.id AS mid", "taggings.id AS mid"),
+            SQL.replace("media_items.id AS mid", "count(*) AS mid"),
+            SQL.replace("media_items.id AS mid", "random() AS mid"),
+            SQL.replace("media_items.id AS mid", "*"),
+            SQL.replace("metadata_items.title ASC", "tags.tag ASC"),
+            SQL.replace("IN (1, 2, 3)", "IN (SELECT id FROM tags)"),
+            SQL.replace("IN (1, 2, 3)", "IN (1, 2, 3) AND tags.tag_type = 1"),
+            SQL.replace("LEFT JOIN taggings", "JOIN taggings"),
+            SQL.replace("account_id = 1", "account_id = 2"),
+            format!("{} LIMIT 10", SQL),
+        ] {
+            let (before, after) = rewrite(&sql);
+            assert_eq!(before, after, "unexpected rewrite: {sql}");
+        }
     }
 }
