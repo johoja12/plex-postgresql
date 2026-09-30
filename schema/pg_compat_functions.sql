@@ -94,6 +94,12 @@ CREATE OPERATOR public.= (
 DO $fts_views$
 BEGIN
     IF to_regclass('plex.metadata_items') IS NOT NULL THEN
+        -- MATCH is translated against these source columns, not title_fts.
+        -- Pre-create on a busy live database with CONCURRENTLY before upgrade.
+        CREATE INDEX IF NOT EXISTS idx_metadata_items_title_simple_fts
+            ON plex.metadata_items USING gin (to_tsvector('simple'::regconfig, title));
+        CREATE INDEX IF NOT EXISTS idx_metadata_items_title_sort_simple_fts
+            ON plex.metadata_items USING gin (to_tsvector('simple'::regconfig, title_sort));
         CREATE OR REPLACE VIEW plex.fts4_metadata_titles AS
             SELECT id AS rowid, title, title_fts, title_sort, original_title
             FROM plex.metadata_items;

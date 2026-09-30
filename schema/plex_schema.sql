@@ -4045,6 +4045,13 @@ CREATE INDEX idx_metadata_items_title_sort ON plex.metadata_items USING btree (t
 
 CREATE INDEX idx_metadata_items_title_trgm ON plex.metadata_items USING gin (title plex.gin_trgm_ops);
 
+-- Translated MATCH searches use these source-column expressions through the
+-- fts4_metadata_titles views; title_fts/search_vector cannot serve them.
+CREATE INDEX idx_metadata_items_title_simple_fts
+    ON plex.metadata_items USING gin (to_tsvector('simple'::regconfig, title));
+CREATE INDEX idx_metadata_items_title_sort_simple_fts
+    ON plex.metadata_items USING gin (to_tsvector('simple'::regconfig, title_sort));
+
 
 --
 -- Name: idx_metadata_items_type; Type: INDEX; Schema: plex; Owner: -
