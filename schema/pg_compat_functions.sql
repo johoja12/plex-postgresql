@@ -1,6 +1,20 @@
 -- PostgreSQL compatibility functions used by the SQLite->PostgreSQL translator.
 -- This file is safe to run multiple times.
 
+-- MATCH translation searches the metadata source columns, not title_fts.
+-- Operators can create these indexes CONCURRENTLY before upgrading a busy
+-- database; this idempotent fallback covers older schemas at startup.
+DO $metadata_match_indexes$
+BEGIN
+    IF to_regclass('plex.metadata_items') IS NOT NULL THEN
+        CREATE INDEX IF NOT EXISTS idx_metadata_items_title_simple_fts
+            ON plex.metadata_items USING gin (to_tsvector('simple'::regconfig, title));
+        CREATE INDEX IF NOT EXISTS idx_metadata_items_title_sort_simple_fts
+            ON plex.metadata_items USING gin (to_tsvector('simple'::regconfig, title_sort));
+    END IF;
+END;
+$metadata_match_indexes$;
+
 CREATE OR REPLACE FUNCTION public.jsonb_mergepatch(target jsonb, patch jsonb)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -84,5 +98,4 @@ CREATE OPERATOR public.= (
   RIGHTARG = boolean,
   COMMUTATOR = =
 );
-
 
