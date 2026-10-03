@@ -56,6 +56,7 @@ fn transform_query(q: &mut Query) {
         }
     }
 
+    deduplicate_smart_tv_hub_pages(q);
     prune_collection_prefetch_tag_joins(q);
 
     // Check for DISTINCT + aggregate in ORDER BY → remove DISTINCT
@@ -487,9 +488,109 @@ fn fix_where_numeric(expr: &mut Expr) {
 
 // ─── Main expression transformer ─────────────────────────────────────────────
 
+const UNWATCHED_LEAF_COUNT: &str = "SELECT count(*) FROM metadata_items AS leaves JOIN metadata_items AS parents ON leaves.parent_id = parents.id LEFT JOIN metadata_item_settings ON metadata_item_settings.guid = leaves.guid AND metadata_item_settings.account_id = 1 WHERE (parents.parent_id = metadata_items.id OR parents.id = metadata_items.id) AND (metadata_item_settings.view_count = 0 OR metadata_item_settings.view_count IS NULL) AND leaves.metadata_type IN (1, 4, 10)";
+
+// The smart hub joins each show to every episode, then deduplicates IDs in
+// Plex after LIMIT/OFFSET. A 12-show hub can therefore fetch dozens of pages.
+// Select each show once before paging, ordered by its first occurrence in the
+// original descending episode order. Preserve PG's existing NULL-first DESC
+// behavior explicitly; MAX alone would ignore NULL and change ordering.
+fn deduplicate_smart_tv_hub_pages(q: &mut Query) {
+    let SetExpr::Select(sel) = q.body.as_ref() else {
+        return;
+    };
+    if sel.projection.len() != 1
+        || !matches!(&sel.projection[0], SelectItem::UnnamedExpr(e) if expr_to_key(e) == "metadata_items.id")
+    {
+        return;
+    }
+    const FROM: &str = "metadata_items JOIN metadata_items AS children ON children.parent_id = metadata_items.id JOIN metadata_items AS grandchildren ON grandchildren.parent_id = children.id LEFT JOIN metadata_item_settings ON metadata_item_settings.guid = metadata_items.guid AND metadata_item_settings.account_id = 1";
+    let predicate = format!("metadata_items.library_section_id IN (2) AND (({UNWATCHED_LEAF_COUNT}) >= 1 AND metadata_item_settings.rating = 10 AND (metadata_items.metadata_type = 2 OR metadata_items.metadata_type = 10)) AND metadata_items.metadata_type = 2");
+    let Some(selection) = &sel.selection else {
+        return;
+    };
+    if !selection.to_string().eq_ignore_ascii_case(&predicate) {
+        return;
+    }
+    let Some(order) = &q.order_by else {
+        return;
+    };
+    let order = order.to_string();
+    if order != "ORDER BY grandchildren.added_at DESC, metadata_items.title_sort, metadata_items.title_sort" { return; }
+    let prefix = format!(
+        "SELECT {} FROM {FROM} WHERE {selection} {order} LIMIT ",
+        sel.projection[0]
+    );
+    let rendered = q.to_string();
+    let Some(page) = rendered.strip_prefix(&prefix) else {
+        return;
+    };
+    let Some((limit, offset)) = page.split_once(" OFFSET ") else {
+        return;
+    };
+    if limit.is_empty()
+        || offset.is_empty()
+        || !limit
+            .bytes()
+            .chain(offset.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return;
+    }
+    // The full string match above rejects DISTINCT, additional clauses, joins,
+    // projections, expressions, other account/section/filter/order shapes.
+    let sql = format!("SELECT metadata_items.id FROM {FROM} WHERE {selection} GROUP BY metadata_items.id, metadata_items.title_sort ORDER BY CASE WHEN bool_or(grandchildren.added_at IS NULL) THEN NULL ELSE max(grandchildren.added_at) END DESC, metadata_items.title_sort LIMIT {limit} OFFSET {offset}");
+    if let Ok(mut statements) =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, &sql)
+    {
+        if let Statement::Query(replacement) = statements.remove(0) {
+            *q = *replacement;
+        }
+    }
+}
+
+// Plex pages smart TV hubs repeatedly while deduplicating shows expanded by
+// episode joins. COUNT(*) >= 1 rescans every episode (and can trigger JIT) on
+// every page. EXISTS is equivalent for this exact ungrouped, non-null count,
+// lets PG apply the favourite filter first, and stops after one unwatched leaf.
+// Match the whole known subquery so HAVING, OFFSET, windows, other aggregates
+// and expression side effects cannot accidentally change meaning.
+fn optimize_unwatched_leaf_exists(expr: &mut Expr) {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::GtEq,
+        right,
+    } = expr
+    else {
+        return;
+    };
+    if !matches!(right.as_ref(), Expr::Value(v) if matches!(&v.value, Value::Number(n, _) if n == "1"))
+    {
+        return;
+    }
+    let Expr::Subquery(q) = left.as_ref() else {
+        return;
+    };
+
+    if !q.to_string().eq_ignore_ascii_case(UNWATCHED_LEAF_COUNT) {
+        return;
+    }
+    let mut subquery = q.clone();
+    if let SetExpr::Select(sel) = subquery.body.as_mut() {
+        sel.projection = vec![SelectItem::UnnamedExpr(Expr::Value(
+            Value::Number("1".into(), false).into(),
+        ))];
+    }
+    *expr = Expr::Exists {
+        subquery,
+        negated: false,
+    };
+}
+
 /// Recursively transform an expression in place, applying all query-level
 /// fixups (CASE booleans, max/min→GREATEST/LEAST, COLLATE, FTS MATCH, etc.).
 fn transform_expr(expr: &mut Expr) {
+    optimize_unwatched_leaf_exists(expr);
     match expr {
         // Fix 4: CASE WHEN x THEN 1 ELSE 0 END → TRUE/FALSE
         Expr::Case {
@@ -2031,6 +2132,87 @@ mod collection_prefetch_tests {
         ] {
             let (before, after) = rewrite(&sql);
             assert_eq!(before, after, "unexpected rewrite: {sql}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod unwatched_leaf_exists_tests {
+    const COUNT: &str = "SELECT count(*) FROM metadata_items AS leaves JOIN metadata_items AS parents ON leaves.parent_id = parents.id LEFT JOIN metadata_item_settings ON metadata_item_settings.guid = leaves.guid AND metadata_item_settings.account_id = 1 WHERE (parents.parent_id = metadata_items.id OR parents.id = metadata_items.id) AND (metadata_item_settings.view_count = 0 OR metadata_item_settings.view_count IS NULL) AND leaves.metadata_type IN (1, 4, 10)";
+    #[test]
+    fn smart_tv_hub_uses_exists_without_changing_paging_or_order() {
+        let sql = format!("SELECT metadata_items.id FROM metadata_items WHERE ({COUNT}) >= 1 AND metadata_items.metadata_type = 2 ORDER BY metadata_items.title_sort LIMIT 21 OFFSET 42");
+        let result = crate::translate(&sql).unwrap().sql;
+        assert!(result.contains("EXISTS (SELECT 1 FROM"), "{result}");
+        assert!(!result.contains("count(*)"), "{result}");
+        assert!(
+            result.contains("ORDER BY metadata_items.title_sort LIMIT 21 OFFSET 42"),
+            "{result}"
+        );
+    }
+    #[test]
+    fn other_count_semantics_fail_closed() {
+        for sub in [
+            COUNT.replace("count(*)", "count(leaves.view_count)"),
+            format!("{COUNT} HAVING count(*) > 1"),
+            format!("{COUNT} LIMIT 1 OFFSET 1"),
+            COUNT.replace("account_id = 1", "account_id = 2"),
+            COUNT.replace("count(*)", "count(random())"),
+        ] {
+            let result = crate::translate(&format!(
+                "SELECT metadata_items.id FROM metadata_items WHERE ({sub}) >= 1"
+            ))
+            .unwrap()
+            .sql;
+            assert!(!result.contains("EXISTS"), "{result}");
+        }
+        for comparison in [">= 2", "= 1", "> 1", "< 1"] {
+            let result = crate::translate(&format!(
+                "SELECT metadata_items.id FROM metadata_items WHERE ({COUNT}) {comparison}"
+            ))
+            .unwrap()
+            .sql;
+            assert!(!result.contains("EXISTS"), "{result}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod smart_tv_page_tests {
+    use super::*;
+    fn sql() -> String {
+        format!("SELECT metadata_items.id FROM metadata_items JOIN metadata_items AS children ON children.parent_id = metadata_items.id JOIN metadata_items AS grandchildren ON grandchildren.parent_id = children.id LEFT JOIN metadata_item_settings ON metadata_item_settings.guid = metadata_items.guid AND metadata_item_settings.account_id = 1 WHERE metadata_items.library_section_id IN (2) AND (({UNWATCHED_LEAF_COUNT}) >= 1 AND metadata_item_settings.rating = 10 AND (metadata_items.metadata_type = 2 OR metadata_items.metadata_type = 10)) AND metadata_items.metadata_type = 2 ORDER BY grandchildren.added_at DESC, metadata_items.title_sort, metadata_items.title_sort LIMIT 21 OFFSET 0")
+    }
+    #[test]
+    fn hub_pages_distinct_shows_in_first_episode_order() {
+        let result = crate::translate(&sql()).unwrap().sql;
+        assert!(
+            result.contains("GROUP BY metadata_items.id, metadata_items.title_sort"),
+            "{result}"
+        );
+        assert!(
+            result.contains("bool_or(grandchildren.added_at IS NULL)"),
+            "{result}"
+        );
+        assert!(result.contains("max(grandchildren.added_at)"), "{result}");
+        assert!(result.contains("EXISTS (SELECT 1 FROM"), "{result}");
+        assert!(result.ends_with("LIMIT 21 OFFSET 0"), "{result}");
+    }
+    #[test]
+    fn other_hub_shapes_are_not_grouped() {
+        for sql in [
+            sql().replace("rating = 10", "rating = 5"),
+            sql().replace("account_id = 1", "account_id = 2"),
+            sql().replace("IN (2)", "IN (3)"),
+            sql().replace("LIMIT 21 OFFSET 0", ""),
+            sql().replace("DESC", "ASC"),
+            sql().replace(
+                "SELECT metadata_items.id FROM",
+                "SELECT metadata_items.id, metadata_items.title FROM",
+            ),
+        ] {
+            let result = crate::translate(&sql).unwrap().sql;
+            assert!(!result.contains("GROUP BY metadata_items.id"), "{result}");
         }
     }
 }
