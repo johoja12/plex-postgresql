@@ -39,7 +39,9 @@ unsafe extern "C" {
 
 pub(super) unsafe fn orig_step(p_stmt: *mut sqlite3_stmt) -> c_int {
     match orig_sqlite3_step {
-        Some(f) => f(p_stmt),
+        Some(f) => crate::db_interpose_stmt_lifecycle::shadow_step::with_shadow_step(
+            p_stmt, || f(p_stmt),
+        ),
         None => super::SQLITE_ERROR,
     }
 }

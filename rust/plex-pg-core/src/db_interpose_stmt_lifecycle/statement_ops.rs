@@ -30,16 +30,13 @@ unsafe fn reset_pg_stmt_locked(p_stmt: *mut sqlite3_stmt, stmt: *mut PgStmt) -> 
     clear_dynamic_param_values(stmt_ref);
     pg_stmt_clear_result(stmt);
 
-    // PG-routed non-cached stmts: skip orig_sqlite3_reset entirely.
-    // This prevents LD_PRELOAD self-deadlock (SQLite internal re-entry).
-    // PG state is already cleared above via pg_stmt_clear_result().
+    // PG-only statements have no executing shadow VM. Cached statements do:
+    // original step can auto-reset it after DONE. Reset that VM as well, but
+    // release the PG mutex first so SQLite callbacks cannot self-deadlock.
     if stmt_ref.is_pg != 0 && stmt_ref.is_cached == 0 {
         return SQLITE_OK;
     }
-    // Legacy: cached PgRead stmts also skip
-    if stmt_ref.is_pg == 2 {
-        return SQLITE_OK;
-    }
+    drop(_guard);
     orig_sqlite3_reset
         .map(|f| f(p_stmt))
         .unwrap_or(SQLITE_ERROR)
@@ -53,6 +50,15 @@ pub(super) fn note_stmt_prepare_impl(p_stmt: *mut sqlite3_stmt, sql: *const c_ch
 }
 
 pub(super) fn reset_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
+    // SQLite calls the interposed reset from inside sqlite3_step when its VM
+    // is halted. Returning OK without resetting that VM makes SQLite spin.
+    // This reset belongs to SQLite only, even if the statement also has PG
+    // state; clearing the PG result here would discard rows mid-read.
+    if super::shadow_step::is_shadow_step(p_stmt) {
+        return unsafe {
+            orig_sqlite3_reset.map(|f| f(p_stmt)).unwrap_or(SQLITE_ERROR)
+        };
+    }
     let pg_stmt = pg_find_any_stmt(p_stmt);
     if !pg_stmt.is_null() {
         return unsafe { reset_pg_stmt_locked(p_stmt, pg_stmt) };
