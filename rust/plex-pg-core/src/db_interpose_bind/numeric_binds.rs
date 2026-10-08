@@ -9,13 +9,17 @@ pub(super) fn bind_int_impl(p_stmt: *mut sqlite3_stmt, idx: c_int, val: c_int) -
     let rc = if is_pg_routed_noncached(pg_stmt) {
         SQLITE_OK
     } else {
-        let mut rc = get_orig_sqlite3_bind_int()
-            .map(|f| unsafe { f(p_stmt, idx, val) })
+        // Plex's SQLite implements bind_int by calling bind_int64 through
+        // its PLT. Calling bind_int while holding StmtGuard would re-enter
+        // our bind_int64 interposer and lock this same non-recursive mutex.
+        // Bind the sign-extended value directly with the original leaf API.
+        let mut rc = get_orig_sqlite3_bind_int64()
+            .map(|f| unsafe { f(p_stmt, idx, i64::from(val)) })
             .unwrap_or(SQLITE_ERROR);
         unsafe {
             rc = retry_on_misuse(rc, p_stmt, pg_stmt, || {
-                get_orig_sqlite3_bind_int()
-                    .map(|f| f(p_stmt, idx, val))
+                get_orig_sqlite3_bind_int64()
+                    .map(|f| f(p_stmt, idx, i64::from(val)))
                     .unwrap_or(SQLITE_ERROR)
             });
         }
