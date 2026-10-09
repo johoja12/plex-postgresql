@@ -1,4 +1,5 @@
 use super::*;
+use crate::byte_utils::push_utf8_byte;
 
 pub(super) fn rewrite_server_library_uri_bytes(
     input_bytes: &[u8],
@@ -124,7 +125,7 @@ pub(super) fn normalize_sql_literals_impl(sql: &str) -> Option<(String, Vec<Stri
         }
 
         let b = bytes[i];
-        out.push(b as char);
+        push_utf8_byte(&mut out, sql, i);
         if b == b'\'' && !in_double {
             in_single = !in_single;
         } else if b == b'"' && !in_single {

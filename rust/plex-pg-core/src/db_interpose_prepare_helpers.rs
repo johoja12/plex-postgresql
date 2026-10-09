@@ -1,3 +1,4 @@
+use crate::byte_utils::push_utf8_byte;
 use std::cell::RefCell;
 
 #[inline]
@@ -55,7 +56,7 @@ fn replace_ascii_icase_all(input: &str, pattern: &str, replacement: &str) -> Str
             out.push_str(replacement);
             i += pat.len();
         } else {
-            out.push(bytes[i] as char);
+            push_utf8_byte(&mut out, input, i);
             i += 1;
         }
     }
@@ -380,5 +381,11 @@ mod tests {
                 let _ = prepare_query_loop_tick(sql);
             }
         }
+    }
+
+    #[test]
+    fn replace_ascii_icase_all_keeps_non_ascii_text() {
+        let out = replace_ascii_icase_all("SELECT COUNT(*), 'Caché' FROM t", "count(*)", "n");
+        assert_eq!(out, "SELECT n, 'Caché' FROM t");
     }
 }

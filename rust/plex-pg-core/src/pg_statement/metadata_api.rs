@@ -15,6 +15,9 @@ fn is_aggregate_expression_name(col: &str) -> bool {
     }
 
     let lower = col.to_ascii_lowercase();
+    // Plex names its counts `<table>_count` (`count(tags.id) as tags_count`
+    // in every tag directory). The caller only asks for expression columns,
+    // so a table's own `leaf_count` never lands here.
     matches!(
         lower.as_str(),
         "count" | "cnt" | "sum" | "max" | "min" | "avg"

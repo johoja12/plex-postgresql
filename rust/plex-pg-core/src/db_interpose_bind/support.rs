@@ -274,14 +274,27 @@ pub(super) unsafe fn mapped_param_index(
     Some(pg_idx as usize)
 }
 
-pub(super) unsafe fn free_dynamic_param_value(pg_stmt: *mut PgStmt, pg_idx: usize) {
+/// Make parameter `pg_idx` NULL, freeing a value a bind allocated. Every bind
+/// starts here, so a slot never carries the previous binding's value, length
+/// or format into the next. A value in the preallocated buffer (an int or a
+/// double) must be forgotten as well as a heap one: when it was left in
+/// place, `sqlite3_bind_null` was a no-op after an integer, and Plex's reused
+/// `UPDATE metadata_items` sent the previous row's `parent_id` -- an episode's
+/// season -- for the movie or show it saved next.
+pub(super) unsafe fn clear_param_value(pg_stmt: *mut PgStmt, pg_idx: usize) {
     let stmt = &mut *pg_stmt;
     if pg_idx >= stmt.param_values.len() {
-        log_debug("free_dynamic_param_value: pg_idx out of bounds");
+        log_debug("clear_param_value: pg_idx out of bounds");
         return;
     }
     if !stmt.param_values[pg_idx].is_null() && !stmt.is_preallocated_buffer(pg_idx) {
         libc::free(stmt.param_values[pg_idx] as *mut c_void);
-        stmt.param_values[pg_idx] = ptr::null_mut();
+    }
+    stmt.param_values[pg_idx] = ptr::null_mut();
+    if let Some(len) = stmt.param_lengths.get_mut(pg_idx) {
+        *len = 0;
+    }
+    if let Some(format) = stmt.param_formats.get_mut(pg_idx) {
+        *format = 0;
     }
 }

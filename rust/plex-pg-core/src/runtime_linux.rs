@@ -212,8 +212,10 @@ fn setup_exception_catcher_if_enabled() {
 /// returns a clean 401 without the shim and terminates with the same
 /// exception uncaught with it.
 ///
-///     libc++abi: terminating with uncaught exception of type
-///     UnauthorizedException: HTTP status code 401
+/// ```text
+/// libc++abi: terminating with uncaught exception of type
+/// UnauthorizedException: HTTP status code 401
+/// ```
 ///
 /// Plex throws and catches routinely, so the first throw of the process is
 /// fatal whatever it was -- which is why this has surfaced as three unrelated

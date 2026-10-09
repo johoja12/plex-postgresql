@@ -2221,10 +2221,15 @@ fn replace_metadata_items_refs(sql: &str, new_alias: &str) -> String {
     result
 }
 
-/// Fix `?identifier` placeholders that sqlparser can't handle.
-/// SQLite allows `?left` (positional placeholder followed by identifier without space),
-/// but sqlparser chokes on it because `left` is a keyword.
-/// We strip the trailing identifier part: `?left` → `?`.
+/// Separate a `?` placeholder from the word written against it.
+///
+/// In SQLite a `?` takes only digits (`?NNN`); named parameters are `:name`,
+/// `@name` and `$name`. So `?left` is a placeholder and then `left`, whatever
+/// the word is, and sqlparser has to be shown the space SQLite's tokenizer
+/// implies. Plex writes `account_id=?left join media_items` in its tag
+/// directories; reading `?left` as one named placeholder dropped the LEFT,
+/// turned the join into an inner one, and emptied every TV library's genres
+/// (2026-10-08).
 fn fix_placeholder_spacing(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut result = String::with_capacity(sql.len());
@@ -2256,55 +2261,12 @@ fn fix_placeholder_spacing(sql: &str) -> String {
             continue;
         }
 
-        if b == b'?' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_alphabetic() {
-            // `?keyword` — SQLite allows a placeholder immediately followed by a SQL keyword
-            // with no space (e.g. `=?group by`). sqlparser fails to parse this.
-            // Read the word that follows the `?` and check if it's a SQL keyword.
-            // If it is, insert a space so the keyword is recognised: `?group` → `? group`.
-            // If it's just an identifier suffix (e.g. `?left` used as a named param),
-            // strip the identifier to keep it as a single `?`.
-            let word_start = i + 1;
-            let mut word_end = word_start;
-            while word_end < bytes.len()
-                && (bytes[word_end].is_ascii_alphanumeric() || bytes[word_end] == b'_')
-            {
-                word_end += 1;
-            }
-            let word = std::str::from_utf8(&bytes[word_start..word_end])
-                .unwrap_or("")
-                .to_ascii_uppercase();
-            // SQL clause/operator keywords that can legally follow a placeholder value
-            // but are never valid SQLite named-parameter suffixes.
-            // Excludes things like LEFT/RIGHT/JOIN/FROM which Plex uses as param names.
-            const SQL_KEYWORDS: &[&str] = &[
-                "GROUP",
-                "ORDER",
-                "HAVING",
-                "LIMIT",
-                "UNION",
-                "EXCEPT",
-                "INTERSECT",
-                "WHERE",
-                "AND",
-                "OR",
-                "NOT",
-                "BETWEEN",
-                "GLOB",
-                "THEN",
-                "ELSE",
-                "END",
-                "WHEN",
-                "CASE",
-            ];
-            result.push('?');
-            if SQL_KEYWORDS.contains(&word.as_str()) {
-                // Insert space so the keyword is separately tokenised
-                result.push(' ');
-                i += 1; // just skip the `?`, keep the keyword as-is
-            } else {
-                // Non-keyword suffix: strip it (was a SQLite named param like ?left)
-                i = word_end;
-            }
+        if b == b'?'
+            && i + 1 < bytes.len()
+            && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_')
+        {
+            result.push_str("? ");
+            i += 1;
             continue;
         }
 
@@ -2353,8 +2315,8 @@ fn rewrite_glob(sql: &str) -> String {
         }
 
         // Check for GLOB keyword (case-insensitive, word boundary)
-        let rest = &sql[i..];
-        let rest_upper = &upper[i..];
+        let rest = sql.get(i..).unwrap_or("");
+        let rest_upper = upper.get(i..).unwrap_or("");
         if rest_upper.starts_with("GLOB") {
             // Must be followed by whitespace / quote (word boundary)
             let after = i + 4;

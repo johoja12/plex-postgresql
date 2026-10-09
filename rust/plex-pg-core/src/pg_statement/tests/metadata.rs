@@ -368,6 +368,26 @@ fn decltype_special_case_sum_alias_returns_null_case() {
     assert_eq!(rc, DECLTYPE_CASE_NULL);
 }
 
+// Plex's tag directories (/library/sections/N/genre, the Categories view)
+// select `count(tags.id) as tags_count`. Declared dt_integer(8), SOCI threw
+// std::bad_cast and every movie library's genres answered 500 (2026-10-08).
+#[test]
+fn decltype_special_case_a_count_aliased_with_a_count_suffix_returns_null_case() {
+    let col = cs("tags_count");
+    let sql = cs("SELECT * FROM (SELECT tags.tag AS \"tags_tag\", count(tags.id) AS tags_count FROM tags) AS sub");
+    let rc = rust_decltype_special_case(20, col.as_ptr(), sql.as_ptr(), 0);
+    assert_eq!(rc, DECLTYPE_CASE_NULL);
+}
+
+// A table's own *_count column keeps its type: it has a table oid.
+#[test]
+fn decltype_special_case_a_count_suffixed_table_column_keeps_its_type() {
+    let col = cs("leaf_count");
+    let sql = cs("select metadata_items.leaf_count from metadata_items");
+    let rc = rust_decltype_special_case(23, col.as_ptr(), sql.as_ptr(), 42);
+    assert_eq!(rc, DECLTYPE_CASE_NONE);
+}
+
 #[test]
 fn decltype_special_case_regular_column_without_table_oid_uses_oid_mapping() {
     let col = cs("identifier");

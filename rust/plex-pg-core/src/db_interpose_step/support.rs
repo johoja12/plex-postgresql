@@ -38,6 +38,9 @@ unsafe extern "C" {
 }
 
 pub(super) unsafe fn orig_step(p_stmt: *mut sqlite3_stmt) -> c_int {
+    // The finalize guard needs the statement's connection: see ConnScope.
+    let _scope =
+        crate::db_interpose_stmt_lifecycle::ConnScope::enter(call_sqlite3_db_handle(p_stmt));
     match orig_sqlite3_step {
         Some(f) => crate::db_interpose_stmt_lifecycle::shadow_step::with_shadow_step(
             p_stmt, || f(p_stmt),

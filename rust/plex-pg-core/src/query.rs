@@ -1764,6 +1764,38 @@ mod tests {
     use crate::translate;
 
     #[test]
+    fn a_placeholder_written_against_a_keyword_keeps_the_keyword() {
+        // Plex's tag directory (/library/sections/N/genre, the Categories
+        // view) writes `account_id=?left join media_items` with no space.
+        // In SQLite `?` takes only digits, so that is a placeholder and then
+        // LEFT JOIN. Read as one placeholder named `?left`, the LEFT went
+        // and the join became an inner one: a show has no media_items row,
+        // so every TV library's genres came back empty (2026-10-08).
+        // The backtick sends it through the MySQL fallback, as Plex's does.
+        let r = translate(
+            "select tags.tag from tags join taggings on taggings.tag_id=tags.id \
+             join metadata_items on metadata_items.id=taggings.metadata_item_id \
+             left join metadata_item_settings on metadata_item_settings.guid = metadata_items.guid \
+             and metadata_item_settings.account_id=?left join media_items \
+             on media_items.metadata_item_id=metadata_items.id \
+             where tags.tag_type=? and (taggings.`index` <= ? or -1 = ?)",
+        )
+        .unwrap();
+        let sql = r.sql.to_uppercase();
+        assert!(
+            sql.contains("LEFT JOIN MEDIA_ITEMS"),
+            "the LEFT of `?left join` must survive, got: {}",
+            r.sql
+        );
+        assert_eq!(
+            r.param_names.len(),
+            4,
+            "four placeholders, got {:?}",
+            r.param_names
+        );
+    }
+
+    #[test]
     fn schema_migrations_version_compares_as_text_even_to_a_bigint_literal() {
         // schema_migrations.version is text. Plex writes the literal unquoted
         // -- `where version=202608120900` -- which SQLite compares as text by

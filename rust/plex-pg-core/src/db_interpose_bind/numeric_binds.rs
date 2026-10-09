@@ -1,6 +1,6 @@
 use super::*;
 use crate::db_interpose_bind::support::{
-    begin_bind, is_pg_routed_noncached, mapped_param_index, retry_on_misuse,
+    begin_bind, clear_param_value, is_pg_routed_noncached, mapped_param_index, retry_on_misuse,
 };
 
 pub(super) fn bind_int_impl(p_stmt: *mut sqlite3_stmt, idx: c_int, val: c_int) -> c_int {
@@ -28,6 +28,7 @@ pub(super) fn bind_int_impl(p_stmt: *mut sqlite3_stmt, idx: c_int, val: c_int) -
 
     if let Some(pg_idx) = unsafe { mapped_param_index(pg_stmt, p_stmt, idx) } {
         unsafe {
+            clear_param_value(pg_stmt, pg_idx);
             let stmt = &mut *pg_stmt;
             libc::snprintf(
                 stmt.param_buffers[pg_idx].as_mut_ptr(),
@@ -64,6 +65,7 @@ pub(super) fn bind_int64_impl(p_stmt: *mut sqlite3_stmt, idx: c_int, val: i64) -
 
     if let Some(pg_idx) = unsafe { mapped_param_index(pg_stmt, p_stmt, idx) } {
         unsafe {
+            clear_param_value(pg_stmt, pg_idx);
             let stmt = &mut *pg_stmt;
             libc::snprintf(
                 stmt.param_buffers[pg_idx].as_mut_ptr(),
@@ -100,6 +102,7 @@ pub(super) fn bind_double_impl(p_stmt: *mut sqlite3_stmt, idx: c_int, val: f64) 
 
     if let Some(pg_idx) = unsafe { mapped_param_index(pg_stmt, p_stmt, idx) } {
         unsafe {
+            clear_param_value(pg_stmt, pg_idx);
             let stmt = &mut *pg_stmt;
             libc::snprintf(
                 stmt.param_buffers[pg_idx].as_mut_ptr(),

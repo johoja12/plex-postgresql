@@ -870,3 +870,66 @@ fn owned_aggregate_transformation_preserves_integer_epoch_text() {
     assert_eq!(out, unsafe { CStr::from_ptr(previous.as_ptr()) }.to_bytes_with_nul());
     assert_eq!(out, b"1790506488\0");
 }
+
+// Plex lists a library's Categories (/library/sections/N/categories) by
+// asking `select exists(select 1 ...)` per genre and keeping a genre whose
+// answer is 1. PostgreSQL's boolean reads as the text "t"; SQLite has no
+// booleans and answers 1, so every category was dropped (2026-10-08).
+#[test]
+fn column_text_transform_reads_a_boolean_as_sqlite_does() {
+    for (src, want) in [("t", "1"), ("f", "0")] {
+        let col = c("exists");
+        let sql = c("SELECT EXISTS (SELECT 1 FROM taggings WHERE taggings.tag_id = $1)");
+        let value = c(src);
+        let mut out = [0 as c_char; 32];
+        let rc = rust_column_text_transform(
+            col.as_ptr(),
+            16,
+            sql.as_ptr(),
+            value.as_ptr(),
+            1,
+            out.as_mut_ptr(),
+            out.len(),
+        );
+        assert_eq!(rc, 1, "{src} is rewritten");
+        let got = unsafe { CStr::from_ptr(out.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(got, want, "{src}");
+    }
+}
+
+#[test]
+fn column_text_transform_leaves_a_text_t_alone() {
+    let col = c("tag");
+    let sql = c("SELECT tags.tag FROM tags");
+    let value = c("t");
+    let mut out = [0 as c_char; 32];
+    let rc = rust_column_text_transform(
+        col.as_ptr(),
+        25,
+        sql.as_ptr(),
+        value.as_ptr(),
+        1,
+        out.as_mut_ptr(),
+        out.len(),
+    );
+    assert_eq!(rc, 0, "text is passed through untouched");
+}
+
+#[test]
+fn owned_boolean_transform_matches_upstream_and_borrows_ordinary_text() {
+    let name = c("exists");
+    for (source, expected) in [("t", b"1\0"), ("f", b"0\0")] {
+        let value = c(source);
+        let owned = column_text_transform_owned(name.as_ptr(), 16, std::ptr::null(),
+            value.as_ptr(), value.as_bytes()).unwrap();
+        assert_eq!(owned, expected);
+        let mut legacy = [0 as c_char; 8];
+        assert_eq!(rust_column_text_transform(name.as_ptr(), 16, std::ptr::null(),
+            value.as_ptr(), value.as_bytes().len(), legacy.as_mut_ptr(), legacy.len()), 1);
+        assert_eq!(owned, unsafe { CStr::from_ptr(legacy.as_ptr()) }.to_bytes_with_nul());
+        assert!(column_text_transform_owned(name.as_ptr(), 25, std::ptr::null(),
+            value.as_ptr(), value.as_bytes()).is_none());
+    }
+}

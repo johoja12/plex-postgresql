@@ -25,7 +25,7 @@ path = "src/bin/exception_parity_test.rs"
 test = false
 
 [dependencies]
-sqlparser = { version = "0.61", features = ["serde"] }
+sqlparser = { version = "0.61", features = ["serde", "visitor"] }
 serde_json = "1"
 libc = "0.2"
 postgres = "0.19"

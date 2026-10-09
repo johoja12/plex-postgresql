@@ -336,6 +336,12 @@ pub fn rust_common_load_sqlite_symbols(handle: *mut c_void) {
             Sqlite3StmtToDbFn
         );
         load_sym!(
+            orig_sqlite3_next_stmt,
+            handle,
+            b"sqlite3_next_stmt\0",
+            Sqlite3NextStmtFn
+        );
+        load_sym!(
             orig_sqlite3_sql,
             handle,
             b"sqlite3_sql\0",

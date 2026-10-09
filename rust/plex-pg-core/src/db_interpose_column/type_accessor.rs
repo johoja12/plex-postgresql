@@ -68,8 +68,10 @@ fn sqlite_type_for_oid(oid: u32) -> c_int {
 /// without a prefix; told it is TEXT, Plex looks for the second '/' in "",
 /// does not find it, and builds a substring at the resulting negative offset:
 ///
-///     libc++abi: terminating with uncaught exception of type
-///     std::out_of_range: basic_string
+/// ```text
+/// libc++abi: terminating with uncaught exception of type
+/// std::out_of_range: basic_string
+/// ```
 ///
 /// That kills the server a second after it starts serving.
 ///

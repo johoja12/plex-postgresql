@@ -209,6 +209,10 @@ pub static mut orig_sqlite3_free: Option<Sqlite3FreeFn> = None;
 pub static mut orig_sqlite3_malloc: Option<Sqlite3MallocFn> = None;
 #[no_mangle]
 pub static mut orig_sqlite3_db_handle: Option<Sqlite3StmtToDbFn> = None;
+/// `sqlite3_next_stmt`: the finalize guard walks a connection's live
+/// statements with it (db_interpose_stmt_lifecycle).
+#[no_mangle]
+pub static mut orig_sqlite3_next_stmt: Option<Sqlite3NextStmtFn> = None;
 #[no_mangle]
 pub static mut orig_sqlite3_sql: Option<Sqlite3StmtToCStrFn> = None;
 #[no_mangle]

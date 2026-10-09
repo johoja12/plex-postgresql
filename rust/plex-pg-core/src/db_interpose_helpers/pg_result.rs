@@ -65,6 +65,15 @@ pub(crate) fn column_text_transform_owned(
     source: *const c_char, bytes: &[u8],
 ) -> Option<Vec<u8>> {
     if std::str::from_utf8(bytes).is_err() { return Some(vec![0]); }
+    // Keep upstream boolean conversion in the owned/borrowed fast path too.
+    // Plex reads EXISTS predicates as SQLite integer text, not libpq's t/f.
+    if oid == 16 {
+        match bytes {
+            b"t" => return Some(b"1\0".to_vec()),
+            b"f" => return Some(b"0\0".to_vec()),
+            _ => {}
+        }
+    }
     if matches!(oid, 20 | 21 | 23) {
         let mut aggregate = [0 as c_char; 32];
         if rust_column_text_reformat_aggregate(col_name, oid, pg_sql, source,
@@ -105,6 +114,24 @@ pub fn rust_column_text_transform(
 
     if rust_column_text_reformat_aggregate(col_name, oid, pg_sql, source_value, out, out_len) != 0 {
         return 1;
+    }
+
+    // SQLite has no booleans: a comparison or exists() reads as 1 or 0, as
+    // text too. PostgreSQL's text is "t" or "f", which Plex parses as 0, so
+    // `select exists(...)` dropped every genre from the Categories view.
+    if oid == 16 && out_len >= 2 {
+        let digit = match bytes {
+            b"t" => Some(b'1'),
+            b"f" => Some(b'0'),
+            _ => None,
+        };
+        if let Some(d) = digit {
+            unsafe {
+                *out = d as c_char;
+                *out.add(1) = 0;
+            }
+            return 1;
+        }
     }
 
     let out_cap = out_len.saturating_sub(1);

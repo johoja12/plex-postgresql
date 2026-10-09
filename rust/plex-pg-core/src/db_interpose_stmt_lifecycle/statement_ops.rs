@@ -22,6 +22,19 @@ unsafe fn clear_dynamic_param_values(stmt: &mut PgStmt) {
     }
 }
 
+/// `sqlite3_clear_bindings`: every parameter becomes NULL, an int or a double
+/// in the preallocated buffer as much as a heap value. Reset keeps those
+/// (`clear_dynamic_param_values`); a clear that kept them sent the previous
+/// row's integers to a statement whose caller cleared and bound only some.
+unsafe fn clear_all_param_values(stmt: &mut PgStmt) {
+    clear_dynamic_param_values(stmt);
+    for v in stmt.param_values.iter_mut() {
+        *v = ptr::null_mut();
+    }
+    stmt.param_lengths.iter_mut().for_each(|l| *l = 0);
+    stmt.param_formats.iter_mut().for_each(|f| *f = 0);
+}
+
 unsafe fn reset_pg_stmt_locked(p_stmt: *mut sqlite3_stmt, stmt: *mut PgStmt) -> c_int {
     let stmt_ref = &mut *stmt;
     let _guard = PgStmt::lock_mutex(stmt);
@@ -76,9 +89,42 @@ pub(super) fn reset_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
     }
 }
 
+/// Whether `p_stmt` is a live statement of the connection the shim is running
+/// real SQLite on in this thread (`ConnScope`).
+///
+/// SQLite prepares statements of its own inside exec, prepare and step, so the
+/// shim never notes them and a recently finalized entry for their address
+/// survives; SQLite then finalizes them through the shim. Without this check
+/// the guard below took such a live statement for a double finalize and left
+/// it open, "in progress" -- FTS3's `PRAGMA 'main'.page_size`, when an FTS4
+/// table was created or connected -- so the connection's next VACUUM failed
+/// (Plex's XMLTV EPG migration, DVR creation 500, 2026-10-07).
+/// `sqlite3_next_stmt` walks only live statements, on the thread that holds
+/// the connection, so a freed address is never read.
+unsafe fn is_live_stmt_of_current_conn(p_stmt: *mut sqlite3_stmt) -> bool {
+    let db = super::current_conn();
+    if db.is_null() || p_stmt.is_null() {
+        return false;
+    }
+    let Some(next) = crate::db_interpose_common::orig_sqlite3_next_stmt else {
+        return false;
+    };
+    let mut cur = next(db, ptr::null_mut());
+    while !cur.is_null() {
+        if cur == p_stmt {
+            return true;
+        }
+        cur = next(db, cur);
+    }
+    false
+}
+
 pub(super) fn finalize_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
     unsafe {
-        if skip_clear_bindings_on_finalized() && is_recently_finalized_stmt(p_stmt) {
+        if skip_clear_bindings_on_finalized()
+            && is_recently_finalized_stmt(p_stmt)
+            && !is_live_stmt_of_current_conn(p_stmt)
+        {
             log_clear_bindings_anomaly("finalize on recently finalized", p_stmt);
             clear_prepared_stmt(p_stmt);
             return SQLITE_OK;
@@ -173,7 +219,7 @@ pub(super) fn clear_bindings_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
         if !pg_stmt.is_null() {
             let pg_stmt_ref = &mut *pg_stmt;
             let _guard = PgStmt::lock_mutex(pg_stmt);
-            clear_dynamic_param_values(pg_stmt_ref);
+            clear_all_param_values(pg_stmt_ref);
             if pg_stmt_ref.is_pg == 0 {
                 return orig_sqlite3_clear_bindings
                     .map(|f| f(p_stmt))

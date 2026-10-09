@@ -33,6 +33,12 @@ use support::{
     shim_alloc_maybe_log,
 };
 
+/// Real `sqlite3_step` as the shim calls it, for other modules' tests.
+#[cfg(test)]
+pub(crate) unsafe fn orig_step_for_tests(p_stmt: *mut sqlite3_stmt) -> c_int {
+    orig_step(p_stmt)
+}
+
 fn set_stmt_translation_error(pg_stmt: *mut PgStmt, msg: &str) {
     unsafe {
         if pg_stmt.is_null() {
