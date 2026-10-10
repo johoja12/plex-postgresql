@@ -41,6 +41,26 @@ fn transform_query(q: &mut Query) {
     };
 
     let has_group_by = !gb_exprs.is_empty();
+    // DISTINCT does not make aggregation redundant. Plex's tag searches order
+    // groups by count(*) even though the projection contains only the tag ID.
+    let needs_groups = if let SetExpr::Select(sel) = q.body.as_ref() {
+        sel.having.is_some()
+            || sel.projection.iter().any(|item| match item {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    contains_aggregate(e)
+                }
+                _ => false,
+            })
+            || q.order_by.as_ref().is_some_and(|order| match &order.kind {
+                OrderByKind::Expressions(exprs) => {
+                    exprs.iter().any(|e| contains_aggregate(&e.expr))
+                }
+                _ => false,
+            })
+    } else {
+        false
+    };
+    let remove_group_by = has_distinct && !needs_groups;
 
     // Fix ORDER BY: if a bare column appears as arg of aggregate in SELECT,
     // replace the ORDER BY expression with the aggregate call.
@@ -58,8 +78,8 @@ fn transform_query(q: &mut Query) {
 
     // Now mutate the SELECT body
     if let SetExpr::Select(sel) = q.body.as_mut() {
-        if has_distinct {
-            // DISTINCT present — remove GROUP BY (it's redundant with DISTINCT)
+        if remove_group_by {
+            // Preserve grouping whenever aggregates or HAVING depend on it.
             sel.group_by = GroupByExpr::Expressions(vec![], vec![]);
         } else if has_group_by {
             // Collect missing non-aggregate columns from SELECT projection
@@ -626,5 +646,46 @@ mod tests {
             "t.id should appear exactly once in GROUP BY, got: {}",
             r.sql
         );
+    }
+}
+
+fn contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(function) => {
+            is_aggregate_name(&func_name_str(function))
+                || match &function.args {
+                    FunctionArguments::List(args) => args.args.iter().any(|arg| match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => contains_aggregate(e),
+                        _ => false,
+                    }),
+                    _ => false,
+                }
+        }
+        Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } | Expr::Cast { expr: e, .. } => {
+            contains_aggregate(e)
+        }
+        Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod grouped_distinct_regressions {
+    #[test]
+    fn tag_search_retains_grouping() {
+        let query = "select distinct(tags.id) from metadata_items join taggings on taggings.metadata_item_id=metadata_items.id join tags on tags.id=taggings.tag_id join fts4_tag_titles_icu on fts4_tag_titles_icu.rowid=tags.id where fts4_tag_titles_icu.tag match '(star*)' and tag_type=6 and metadata_items.library_section_id in (2) and metadata_items.metadata_type=2 group by tags.id order by count(*) desc limit 5";
+        let result = crate::translate(query).unwrap().sql;
+        assert!(result.contains("GROUP BY tags.id"), "{result}");
+    }
+
+    #[test]
+    fn distinct_projection_aggregate_retains_grouping() {
+        let result = crate::translate(
+            "SELECT DISTINCT tag_type, count(*) FROM tags GROUP BY tag_type HAVING count(*) > 1",
+        )
+        .unwrap()
+        .sql;
+        assert!(result.contains("GROUP BY tag_type"), "{result}");
+        assert!(result.contains("HAVING"), "{result}");
     }
 }

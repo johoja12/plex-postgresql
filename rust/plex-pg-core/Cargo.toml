@@ -25,7 +25,7 @@ path = "src/bin/exception_parity_test.rs"
 test = false
 
 [dependencies]
-sqlparser = { version = "0.61", features = ["serde"] }
+sqlparser = { version = "0.61", features = ["serde", "visitor"] }
 serde_json = "1"
 libc = "0.2"
 postgres = "0.19"
@@ -70,3 +70,8 @@ path = "benches/bench_pipeline.rs"
 name = "bench_core"
 harness = false
 path = "benches/bench_core.rs"
+
+[[bench]]
+name = "bench_result_hotpath"
+harness = false
+path = "benches/bench_result_hotpath.rs"

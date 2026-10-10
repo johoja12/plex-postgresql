@@ -768,6 +768,22 @@ fn column_text_reformat_aggregate_alias_expression_int8() {
 }
 
 #[test]
+fn column_text_max_added_at_keeps_sqlite_epoch_text() {
+    let col = c("max");
+    let sql = c("SELECT max(added_at) FROM metadata_items WHERE library_section_id = 2");
+    let src = c("1790506488");
+    let mut out = [0 as c_char; 32];
+
+    assert_eq!(
+        rust_column_text_reformat_aggregate(
+            col.as_ptr(), 20, sql.as_ptr(), src.as_ptr(), out.as_mut_ptr(), out.len(),
+        ),
+        1
+    );
+    assert_eq!(unsafe { CStr::from_ptr(out.as_ptr()) }.to_bytes(), src.as_bytes());
+}
+
+#[test]
 fn column_text_reformat_aggregate_non_match_returns_zero() {
     let col = c("id");
     let sql = c("select id from t");
@@ -783,4 +799,137 @@ fn column_text_reformat_aggregate_non_match_returns_zero() {
         out.len(),
     );
     assert_eq!(rc, 0);
+}
+
+#[test]
+fn collection_mask_ffi_preserves_predicate_for_long_queries() {
+    let sql = CString::new(format!("select * from taggings as related where id in ({})",
+        std::iter::repeat_n("123456", 100_000).collect::<Vec<_>>().join(","))).unwrap();
+    let metadata = CString::new("metadata_items_metadata_type").unwrap();
+    let ordinary = CString::new("metadata_items_id").unwrap();
+    assert_eq!(rust_should_mask_collection_metadata_type(sql.as_ptr(), metadata.as_ptr(), 18), 1);
+    for value in [0, 1, 4, 17, 19, i64::MAX] {
+        assert_eq!(rust_should_mask_collection_metadata_type(sql.as_ptr(), metadata.as_ptr(), value), 0);
+    }
+    assert_eq!(rust_should_mask_collection_metadata_type(sql.as_ptr(), ordinary.as_ptr(), 18), 0);
+    assert_eq!(rust_should_mask_collection_metadata_type(std::ptr::null(), metadata.as_ptr(), 18), 0);
+    let invalid_utf8 = [255_u8, 0];
+    assert_eq!(rust_should_mask_collection_metadata_type(invalid_utf8.as_ptr().cast(), metadata.as_ptr(), 18), 0);
+}
+
+#[test]
+fn aggregate_alias_classification_preserves_ascii_case_and_unicode_boundaries() {
+    for name in ["COUNT", " sum ", "MAX(x)", "min(é)", " AvG(İ)"] {
+        assert!(is_aggregate_alias(name), "{name}");
+    }
+    for name in ["counted", "écount", "ｍａｘ", "count (*)", "", "minimum"] {
+        assert!(!is_aggregate_alias(name), "{name}");
+    }
+}
+
+#[test]
+fn aggregate_count_does_not_need_query_text() {
+    let col = c("count");
+    let src = c("9223372036854775807");
+    let mut out = [0 as c_char; 32];
+    assert_eq!(rust_column_text_reformat_aggregate(col.as_ptr(), 20,
+        std::ptr::null(), src.as_ptr(), out.as_mut_ptr(), out.len()), 1);
+    assert_eq!(unsafe { CStr::from_ptr(out.as_ptr()) }.to_bytes(), src.as_bytes());
+}
+
+#[test]
+fn ordinary_text_can_be_borrowed_without_truncating_long_unicode() {
+    let value = c(&"Plex é 📺 ".repeat(10000));
+    let name = c("title");
+    assert!(column_text_transform_owned(name.as_ptr(), 25, std::ptr::null(),
+        value.as_ptr(), value.as_bytes()).is_none());
+}
+
+#[test]
+fn transformed_text_is_complete_nul_terminated_and_handles_invalid_utf8() {
+    let name = c("uri");
+    let suffix = "é".repeat(10000);
+    let value = c(&format!("server://machine/com.plexapp.plugins.library/library/{suffix}"));
+    let output = column_text_transform_owned(name.as_ptr(), 25, std::ptr::null(),
+        value.as_ptr(), value.as_bytes()).unwrap();
+    assert_eq!(output, format!("library://{suffix}\0").as_bytes());
+    assert_eq!(column_text_transform_owned(name.as_ptr(), 25, std::ptr::null(),
+        std::ptr::null(), &[0xff]).unwrap(), vec![0]);
+}
+
+#[test]
+fn owned_aggregate_transformation_preserves_integer_epoch_text() {
+    let sql = c("select max(added_at) from metadata_items");
+    let value = c("1790506488");
+    let name = c("max");
+    let out = column_text_transform_owned(name.as_ptr(), 20, sql.as_ptr(),
+        value.as_ptr(), value.as_bytes()).unwrap();
+    let mut previous = [0 as c_char; 64];
+    assert_eq!(rust_column_text_transform(name.as_ptr(), 20, sql.as_ptr(),
+        value.as_ptr(), value.as_bytes().len(), previous.as_mut_ptr(), previous.len()), 1);
+    assert_eq!(out, unsafe { CStr::from_ptr(previous.as_ptr()) }.to_bytes_with_nul());
+    assert_eq!(out, b"1790506488\0");
+}
+
+// Plex lists a library's Categories (/library/sections/N/categories) by
+// asking `select exists(select 1 ...)` per genre and keeping a genre whose
+// answer is 1. PostgreSQL's boolean reads as the text "t"; SQLite has no
+// booleans and answers 1, so every category was dropped (2026-10-08).
+#[test]
+fn column_text_transform_reads_a_boolean_as_sqlite_does() {
+    for (src, want) in [("t", "1"), ("f", "0")] {
+        let col = c("exists");
+        let sql = c("SELECT EXISTS (SELECT 1 FROM taggings WHERE taggings.tag_id = $1)");
+        let value = c(src);
+        let mut out = [0 as c_char; 32];
+        let rc = rust_column_text_transform(
+            col.as_ptr(),
+            16,
+            sql.as_ptr(),
+            value.as_ptr(),
+            1,
+            out.as_mut_ptr(),
+            out.len(),
+        );
+        assert_eq!(rc, 1, "{src} is rewritten");
+        let got = unsafe { CStr::from_ptr(out.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(got, want, "{src}");
+    }
+}
+
+#[test]
+fn column_text_transform_leaves_a_text_t_alone() {
+    let col = c("tag");
+    let sql = c("SELECT tags.tag FROM tags");
+    let value = c("t");
+    let mut out = [0 as c_char; 32];
+    let rc = rust_column_text_transform(
+        col.as_ptr(),
+        25,
+        sql.as_ptr(),
+        value.as_ptr(),
+        1,
+        out.as_mut_ptr(),
+        out.len(),
+    );
+    assert_eq!(rc, 0, "text is passed through untouched");
+}
+
+#[test]
+fn owned_boolean_transform_matches_upstream_and_borrows_ordinary_text() {
+    let name = c("exists");
+    for (source, expected) in [("t", b"1\0"), ("f", b"0\0")] {
+        let value = c(source);
+        let owned = column_text_transform_owned(name.as_ptr(), 16, std::ptr::null(),
+            value.as_ptr(), value.as_bytes()).unwrap();
+        assert_eq!(owned, expected);
+        let mut legacy = [0 as c_char; 8];
+        assert_eq!(rust_column_text_transform(name.as_ptr(), 16, std::ptr::null(),
+            value.as_ptr(), value.as_bytes().len(), legacy.as_mut_ptr(), legacy.len()), 1);
+        assert_eq!(owned, unsafe { CStr::from_ptr(legacy.as_ptr()) }.to_bytes_with_nul());
+        assert!(column_text_transform_owned(name.as_ptr(), 25, std::ptr::null(),
+            value.as_ptr(), value.as_bytes()).is_none());
+    }
 }

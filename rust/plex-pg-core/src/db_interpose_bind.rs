@@ -134,3 +134,6 @@ pub extern "C" fn rust_my_sqlite3_bind_value(
 pub extern "C" fn rust_my_sqlite3_bind_null(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int {
     bind_null_impl(p_stmt, idx)
 }
+
+#[cfg(test)]
+mod tests;

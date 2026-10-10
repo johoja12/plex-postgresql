@@ -238,9 +238,14 @@ pub extern "C" fn rust_my_sqlite3_close(db: *mut sqlite3) -> c_int {
         crate::pg_client::rust_pg_close(handle_conn);
     }
 
-    let rc = get_orig_sqlite3_close()
-        .map(|f| unsafe { f(db) })
-        .unwrap_or(SQLITE_ERROR);
+    // Closing disconnects virtual tables, and FTS3 finalizes the statements
+    // it cached: the finalize guard needs the connection, see ConnScope.
+    let rc = {
+        let _scope = crate::db_interpose_stmt_lifecycle::ConnScope::enter(db);
+        get_orig_sqlite3_close()
+            .map(|f| unsafe { f(db) })
+            .unwrap_or(SQLITE_ERROR)
+    };
     if rc == SQLITE_OK {
         untrack_db_handle_filename(db);
     }
@@ -261,9 +266,14 @@ pub extern "C" fn rust_my_sqlite3_close_v2(db: *mut sqlite3) -> c_int {
         crate::pg_client::rust_pg_close(handle_conn);
     }
 
-    let rc = get_orig_sqlite3_close_v2()
-        .map(|f| unsafe { f(db) })
-        .unwrap_or(SQLITE_ERROR);
+    // Closing disconnects virtual tables, and FTS3 finalizes the statements
+    // it cached: the finalize guard needs the connection, see ConnScope.
+    let rc = {
+        let _scope = crate::db_interpose_stmt_lifecycle::ConnScope::enter(db);
+        get_orig_sqlite3_close_v2()
+            .map(|f| unsafe { f(db) })
+            .unwrap_or(SQLITE_ERROR)
+    };
     if rc == SQLITE_OK {
         untrack_db_handle_filename(db);
     }

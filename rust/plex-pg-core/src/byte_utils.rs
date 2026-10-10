@@ -33,6 +33,27 @@ pub(crate) fn starts_with_icase_bytes(haystack: &[u8], prefix: &[u8]) -> bool {
         .all(|(a, b)| ascii_lower(*a) == ascii_lower(*b))
 }
 
+/// Copies byte `i` of `s` onto `out` as UTF-8, for a rewrite that walks SQL
+/// byte by byte: an ASCII byte as itself, the first byte of a multi-byte
+/// character as that whole character, and a continuation byte as nothing, since
+/// its character went in with its first byte.
+///
+/// `out.push(bytes[i] as char)` is the bug this replaces. It reads each byte as
+/// a character of its own, so "Caché" came out as "CachÃ©", and each pass that
+/// did it encoded the text again.
+///
+/// Every byte of a multi-byte character is 0x80 or above, and a lexical rewrite
+/// only ever branches on ASCII, so all of a character's bytes reach the same
+/// copy and the character arrives whole.
+pub(crate) fn push_utf8_byte(out: &mut String, s: &str, i: usize) {
+    let b = s.as_bytes()[i];
+    if b.is_ascii() {
+        out.push(b as char);
+    } else if let Some(c) = s.get(i..).and_then(|rest| rest.chars().next()) {
+        out.push(c);
+    }
+}
+
 pub(crate) unsafe fn cstr_bytes<'a>(ptr: *const c_char) -> &'a [u8] {
     if ptr.is_null() {
         return &[];

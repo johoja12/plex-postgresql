@@ -368,6 +368,26 @@ fn decltype_special_case_sum_alias_returns_null_case() {
     assert_eq!(rc, DECLTYPE_CASE_NULL);
 }
 
+// Plex's tag directories (/library/sections/N/genre, the Categories view)
+// select `count(tags.id) as tags_count`. Declared dt_integer(8), SOCI threw
+// std::bad_cast and every movie library's genres answered 500 (2026-10-08).
+#[test]
+fn decltype_special_case_a_count_aliased_with_a_count_suffix_returns_null_case() {
+    let col = cs("tags_count");
+    let sql = cs("SELECT * FROM (SELECT tags.tag AS \"tags_tag\", count(tags.id) AS tags_count FROM tags) AS sub");
+    let rc = rust_decltype_special_case(20, col.as_ptr(), sql.as_ptr(), 0);
+    assert_eq!(rc, DECLTYPE_CASE_NULL);
+}
+
+// A table's own *_count column keeps its type: it has a table oid.
+#[test]
+fn decltype_special_case_a_count_suffixed_table_column_keeps_its_type() {
+    let col = cs("leaf_count");
+    let sql = cs("select metadata_items.leaf_count from metadata_items");
+    let rc = rust_decltype_special_case(23, col.as_ptr(), sql.as_ptr(), 42);
+    assert_eq!(rc, DECLTYPE_CASE_NONE);
+}
+
 #[test]
 fn decltype_special_case_regular_column_without_table_oid_uses_oid_mapping() {
     let col = cs("identifier");
@@ -390,4 +410,53 @@ fn decltype_special_case_none_for_regular_column() {
     let sql = cs("select id from t");
     let rc = rust_decltype_special_case(23, col.as_ptr(), sql.as_ptr(), 123);
     assert_eq!(rc, DECLTYPE_CASE_NONE);
+}
+
+#[test]
+fn prefixed_aggregate_alias_has_sqlite_expression_decltype() {
+    for alias in [
+        "tags_count",
+        "metadata_items_count",
+        "result_sum",
+        "result_avg",
+        "TAGS_COUNT",
+    ] {
+        let col = cs(alias);
+        let sql = cs(&format!("SELECT count(tags.id) AS {alias} FROM tags"));
+        assert_eq!(
+            rust_decltype_special_case(20, col.as_ptr(), sql.as_ptr(), 0),
+            DECLTYPE_CASE_NULL
+        );
+        // A real table column keeps its declared type, even with the same name.
+        assert_eq!(
+            rust_decltype_special_case(20, col.as_ptr(), sql.as_ptr(), 42),
+            DECLTYPE_CASE_NONE
+        );
+    }
+}
+
+#[cfg(not(feature = "interpose"))]
+#[test]
+fn native_sqlite_aggregate_alias_decltype_is_null() {
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    db.execute_batch("CREATE TABLE tags(id INTEGER); INSERT INTO tags VALUES(1),(2)")
+        .unwrap();
+    let sql = cs("SELECT count(id) AS tags_count FROM tags");
+    unsafe {
+        let mut stmt = std::ptr::null_mut();
+        assert_eq!(
+            rusqlite::ffi::sqlite3_prepare_v2(
+                db.handle(),
+                sql.as_ptr(),
+                -1,
+                &mut stmt,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert!(rusqlite::ffi::sqlite3_column_decltype(stmt, 0).is_null());
+        assert_eq!(rusqlite::ffi::sqlite3_step(stmt), 100);
+        assert_eq!(rusqlite::ffi::sqlite3_column_type(stmt, 0), 1);
+        rusqlite::ffi::sqlite3_finalize(stmt);
+    }
 }

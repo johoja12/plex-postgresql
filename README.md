@@ -2,6 +2,8 @@
 
 **Run Plex Media Server with PostgreSQL instead of SQLite.**
 
+This fork maintains the QNAP patch integration on `qnap/mediactl-patched`. See [the fork guide](docs/qnap-fork.md) for source history and build requirements.
+
 🇩🇪 [Deutsch](README.de.md) | 🇳🇱 [Nederlands](README.nl.md) | 🇮🇪 [Gaeilge](README.ga.md) | 🟢 [Esperanto](README.eo.md) | 🇪🇸 [Espa&ntilde;ol](README.es.md)
 
 A small shim library that catches Plex SQLite calls and sends them to PostgreSQL. You do not need to change Plex source code.

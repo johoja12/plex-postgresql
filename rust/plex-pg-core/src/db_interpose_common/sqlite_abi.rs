@@ -71,6 +71,8 @@ pub(crate) type Sqlite3BindValueFn =
 pub(crate) type Sqlite3BindNullFn = unsafe extern "C" fn(*mut sqlite3_stmt, c_int) -> c_int;
 pub(crate) type Sqlite3StmtToIntFn = unsafe extern "C" fn(*mut sqlite3_stmt) -> c_int;
 pub(crate) type Sqlite3StmtToDbFn = unsafe extern "C" fn(*mut sqlite3_stmt) -> *mut sqlite3;
+pub(crate) type Sqlite3NextStmtFn =
+    unsafe extern "C" fn(*mut sqlite3, *mut sqlite3_stmt) -> *mut sqlite3_stmt;
 pub(crate) type Sqlite3StmtToCStrFn = unsafe extern "C" fn(*mut sqlite3_stmt) -> *const c_char;
 pub(crate) type Sqlite3StmtToMutCStrFn = unsafe extern "C" fn(*mut sqlite3_stmt) -> *mut c_char;
 pub(crate) type Sqlite3StmtIndexToIntFn = unsafe extern "C" fn(*mut sqlite3_stmt, c_int) -> c_int;

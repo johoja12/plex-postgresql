@@ -136,7 +136,7 @@ unsafe fn load_live_text_state(pg_stmt: &mut PgStmt, idx: c_int) -> Option<LiveT
     })
 }
 
-/// Write live (non-cached) text output into a thread-local buffer.
+/// Borrow ordinary live text; retain transformed text on the statement.
 /// SAFETY: Must be called while stmt mutex is held. Does NOT call log_debug/log_error
 /// to avoid deadlock with the LOGGER mutex.
 unsafe fn write_live_text_output(
@@ -144,38 +144,30 @@ unsafe fn write_live_text_output(
     idx: c_int,
     state: &LiveTextState,
 ) -> *const c_uchar {
-    let buf_idx = next_text_buffer_index();
-    let mut out_ptr: *const c_uchar = ptr::null();
-    let mut preview = [0u8; 128];
-    let mut source_len: usize = 0;
-    let mut transform_rc: c_int = 0;
-    COLUMN_TEXT_BUFFERS.with(|bufs| {
-        let mut bufs = bufs.borrow_mut();
-        let buf = &mut bufs[buf_idx];
-        transform_rc = crate::db_interpose_helpers::rust_pg_result_text_transform_copy(
-            helpers_result_ptr(pg_stmt.result),
-            state.row,
-            idx,
-            state.col_name,
-            state.oid_u,
-            pg_stmt.pg_sql,
-            0,
-            buf.as_mut_ptr() as *mut c_char,
-            TEXT_BUFFER_SIZE,
-            preview.as_mut_ptr() as *mut c_char,
-            preview.len(),
-            &mut source_len as *mut usize,
-        );
-        out_ptr = buf.as_ptr();
-    });
-
-    if transform_rc == -2 {
-        // PQgetvalue returned NULL for a non-NULL cell — likely a stale PGresult
-        // race condition. Match the C shim behavior: return empty string instead
-        // of NULL to prevent std::string(nullptr) → basic_string exception.
+    if let Some(Some(owned)) = pg_stmt.owned_column_text.get(idx as usize) {
+        return owned.as_ptr();
+    }
+    let mut source = ptr::null();
+    let mut len = 0;
+    let mut is_null = 0;
+    let ok = crate::db_interpose_helpers::rust_pg_result_value_ptr_len(
+        helpers_result_ptr(pg_stmt.result), state.row, idx,
+        &mut source, &mut len, &mut is_null,
+    );
+    if ok == 0 || is_null != 0 || source.is_null() || len < 0 {
         return b"\0".as_ptr();
     }
-    out_ptr
+    let bytes = std::slice::from_raw_parts(source as *const u8, len as usize);
+    if let Some(owned) = crate::db_interpose_helpers::column_text_transform_owned(
+        state.col_name, state.oid_u, pg_stmt.pg_sql, source, bytes,
+    ) {
+        pg_stmt.owned_column_text.resize_with(pg_stmt.num_cols as usize, || None);
+        pg_stmt.owned_column_text[idx as usize] = Some(owned);
+        return pg_stmt.owned_column_text[idx as usize].as_ref().unwrap().as_ptr();
+    }
+    // libpq owns this immutable, NUL-terminated value until PQclear. The
+    // statement keeps that result alive through subsequent column accesses.
+    source as *const u8
 }
 
 pub(super) fn column_text_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const c_uchar {
@@ -194,15 +186,16 @@ pub(super) fn column_text_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const 
         .map(|f| unsafe { f(p_stmt) })
         .unwrap_or(ptr::null_mut());
     unsafe {
-        pg_exception_note_phase(
-            b"column_text\0".as_ptr() as *const c_char,
+        crate::db_interpose_common::note_column_phase(
+            b"column_text\0",
             dbg_sql,
-            p_stmt,
-            dbg_db,
+            p_stmt as *const c_void,
+            dbg_db as *const c_void,
+            idx,
         );
     }
 
-    validate_type_consistency(p_stmt, idx, "column_text");
+    validate_type_consistency(dbg_stmt, p_stmt, idx, "column_text");
 
     if dbg_stmt.is_null() || unsafe { (&*dbg_stmt).is_pg == 0 } {
         return get_orig_sqlite3_column_text()
@@ -242,4 +235,45 @@ pub(super) fn column_text_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const 
         }
     }
     // Mutex released here.
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    use crate::libpq_helpers::{PGconn, PGresult};
+    #[repr(C)]
+    struct AttDesc {
+        name: *mut c_char, tableid: u32, columnid: c_int, format: c_int,
+        typid: u32, typlen: c_int, atttypmod: c_int,
+    }
+    extern "C" {
+        fn PQmakeEmptyPGresult(conn: *mut PGconn, status: c_int) -> *mut PGresult;
+        fn PQsetResultAttrs(res: *mut PGresult, count: c_int, attrs: *mut AttDesc) -> c_int;
+        fn PQsetvalue(res: *mut PGresult, row: c_int, col: c_int, value: *mut c_char, len: c_int) -> c_int;
+    }
+    #[test]
+    fn transformed_column_pointers_survive_other_columns_and_reset_releases_ownership() {
+        let name = CString::new("uri").unwrap();
+        let mut attrs: Vec<_> = (0..70).map(|_| AttDesc { name: name.as_ptr() as *mut _,
+            tableid: 0, columnid: 0, format: 0, typid: 25, typlen: -1, atttypmod: -1 }).collect();
+        let mut stmt = PgStmt::new();
+        stmt.result = unsafe { PQmakeEmptyPGresult(ptr::null_mut(), 2) };
+        stmt.num_cols = attrs.len() as c_int; stmt.num_rows = 1; stmt.current_row = 0;
+        assert_eq!(unsafe { PQsetResultAttrs(stmt.result, stmt.num_cols, attrs.as_mut_ptr()) }, 1);
+        let mut pointers = Vec::new();
+        for col in 0..stmt.num_cols {
+            let suffix = format!("{col}/{}", "é".repeat(5000));
+            let input = CString::new(format!("server://m/com.plexapp.plugins.library/library/{suffix}")).unwrap();
+            assert_eq!(unsafe { PQsetvalue(stmt.result, 0, col, input.as_ptr() as *mut _, input.as_bytes().len() as c_int) }, 1);
+            let state = LiveTextState { row: 0, col_name: name.as_ptr(), _oid: 25, oid_u: 25 };
+            pointers.push((unsafe { write_live_text_output(&mut stmt, col, &state) }, format!("library://{suffix}")));
+        }
+        for (pointer, expected) in pointers {
+            assert_eq!(unsafe { CStr::from_ptr(pointer as *const c_char) }.to_bytes(), expected.as_bytes());
+        }
+        assert_eq!(stmt.owned_column_text.len(), 70);
+        crate::pg_statement::rust_stmt_clear_result(&mut stmt);
+        assert!(stmt.owned_column_text.is_empty());
+        assert!(stmt.result.is_null());
+    }
 }

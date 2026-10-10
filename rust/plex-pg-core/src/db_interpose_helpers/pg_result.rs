@@ -6,9 +6,8 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 
 use super::{
-    cstr_to_str, format_epoch_to_datetime_utc_impl, is_aggregate_alias, pg_sql_has_timestamp_hint,
-    rewrite_server_library_uri_bytes, rust_decode_hex_bytes, write_i32_to_buf, write_i64_to_buf,
-    PGresult, SQLITE_NULL_CONST,
+    cstr_to_str, is_aggregate_alias, rewrite_server_library_uri_bytes, rust_decode_hex_bytes,
+    write_i32_to_buf, write_i64_to_buf, PGresult, SQLITE_NULL_CONST,
 };
 
 extern "C" {
@@ -25,7 +24,7 @@ extern "C" {
 pub fn rust_column_text_reformat_aggregate(
     col_name: *const c_char,
     oid: c_uint,
-    pg_sql: *const c_char,
+    _pg_sql: *const c_char,
     source_value: *const c_char,
     out: *mut c_char,
     out_len: usize,
@@ -49,19 +48,47 @@ pub fn rust_column_text_reformat_aggregate(
 
     if oid == 20 {
         let val = pg_text_to_int64_impl(source_value);
-        let pg_sql = cstr_to_str(pg_sql).unwrap_or("");
-        if (col.eq_ignore_ascii_case("max") || col.eq_ignore_ascii_case("min"))
-            && !pg_sql.is_empty()
-            && pg_sql_has_timestamp_hint(pg_sql)
-            && format_epoch_to_datetime_utc_impl(val, out, out_len) != 0
-        {
-            return 1;
-        }
+        // SQLite returns decimal integer text for max()/min() over dt_integer
+        // columns. Formatting max(added_at) as a date made Plex use the year
+        // (e.g. 2026) as its new-content cutoff and resend entire libraries.
         return c_int::from(write_i64_to_buf(out, out_len, val));
     }
 
     let val = pg_text_to_int_impl(source_value);
     c_int::from(write_i32_to_buf(out, out_len, val))
+}
+
+/// None means libpq's NUL-terminated storage can be borrowed unchanged.
+/// Owned output has a trailing NUL and is kept until the next step/reset.
+pub(crate) fn column_text_transform_owned(
+    col_name: *const c_char, oid: c_uint, pg_sql: *const c_char,
+    source: *const c_char, bytes: &[u8],
+) -> Option<Vec<u8>> {
+    if std::str::from_utf8(bytes).is_err() { return Some(vec![0]); }
+    // Keep upstream boolean conversion in the owned/borrowed fast path too.
+    // Plex reads EXISTS predicates as SQLite integer text, not libpq's t/f.
+    if oid == 16 {
+        match bytes {
+            b"t" => return Some(b"1\0".to_vec()),
+            b"f" => return Some(b"0\0".to_vec()),
+            _ => {}
+        }
+    }
+    if matches!(oid, 20 | 21 | 23) {
+        let mut aggregate = [0 as c_char; 32];
+        if rust_column_text_reformat_aggregate(col_name, oid, pg_sql, source,
+            aggregate.as_mut_ptr(), aggregate.len()) != 0
+        {
+            return Some(unsafe { CStr::from_ptr(aggregate.as_ptr()) }.to_bytes_with_nul().to_vec());
+        }
+    }
+    // Most ordinary fields cannot contain a server URI. Avoid the multi-byte
+    // substring matcher for values with no colon.
+    if !bytes.contains(&b':') { return None; }
+    rewrite_server_library_uri_bytes(bytes, bytes.len()).map(|mut value| {
+        value.push(0);
+        value
+    })
 }
 
 pub fn rust_column_text_transform(
@@ -87,6 +114,24 @@ pub fn rust_column_text_transform(
 
     if rust_column_text_reformat_aggregate(col_name, oid, pg_sql, source_value, out, out_len) != 0 {
         return 1;
+    }
+
+    // SQLite has no booleans: a comparison or exists() reads as 1 or 0, as
+    // text too. PostgreSQL's text is "t" or "f", which Plex parses as 0, so
+    // `select exists(...)` dropped every genre from the Categories view.
+    if oid == 16 && out_len >= 2 {
+        let digit = match bytes {
+            b"t" => Some(b'1'),
+            b"f" => Some(b'0'),
+            _ => None,
+        };
+        if let Some(d) = digit {
+            unsafe {
+                *out = d as c_char;
+                *out.add(1) = 0;
+            }
+            return 1;
+        }
     }
 
     let out_cap = out_len.saturating_sub(1);

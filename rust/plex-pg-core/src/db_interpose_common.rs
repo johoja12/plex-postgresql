@@ -27,6 +27,7 @@ pub use common_helpers::{
     get_type_name, rewrite_blobs_schema_migrations, rust_get_type_name,
     rust_rewrite_blobs_schema_migrations, rust_simple_str_replace, simple_str_replace,
 };
+pub(crate) use exception_context::{note_column_phase, copy_context, full_column_trace_enabled};
 pub use exception_context::{
     rust_pg_exception_dump_recent_phases, rust_pg_exception_dump_recent_queries,
     rust_pg_exception_note_phase, rust_pg_exception_note_query,
@@ -91,14 +92,15 @@ pub use state::{
     orig_sqlite3_create_collation_v2, orig_sqlite3_data_count, orig_sqlite3_db_handle,
     orig_sqlite3_errcode, orig_sqlite3_errmsg, orig_sqlite3_exec, orig_sqlite3_expanded_sql,
     orig_sqlite3_extended_errcode, orig_sqlite3_finalize, orig_sqlite3_free,
-    orig_sqlite3_get_table, orig_sqlite3_last_insert_rowid, orig_sqlite3_malloc, orig_sqlite3_open,
-    orig_sqlite3_open_v2, orig_sqlite3_prepare, orig_sqlite3_prepare16_v2, orig_sqlite3_prepare_v2,
-    orig_sqlite3_prepare_v3, orig_sqlite3_reset, orig_sqlite3_sql, orig_sqlite3_step,
-    orig_sqlite3_stmt_busy, orig_sqlite3_stmt_readonly, orig_sqlite3_stmt_status,
-    orig_sqlite3_value_blob, orig_sqlite3_value_bytes, orig_sqlite3_value_double,
-    orig_sqlite3_value_int, orig_sqlite3_value_int64, orig_sqlite3_value_text,
-    orig_sqlite3_value_type, shim_sqlite3_errcode, shim_sqlite3_errmsg, shim_sqlite3_prepare_v2,
-    sqlite_handle, CxaDemangleFn, CXA_DEMANGLE_FN, SHIM_INITIALIZED, SHIM_PASSTHROUGH_ONLY,
+    orig_sqlite3_get_table, orig_sqlite3_last_insert_rowid, orig_sqlite3_malloc,
+    orig_sqlite3_next_stmt, orig_sqlite3_open, orig_sqlite3_open_v2, orig_sqlite3_prepare,
+    orig_sqlite3_prepare16_v2, orig_sqlite3_prepare_v2, orig_sqlite3_prepare_v3,
+    orig_sqlite3_reset, orig_sqlite3_sql, orig_sqlite3_step, orig_sqlite3_stmt_busy,
+    orig_sqlite3_stmt_readonly, orig_sqlite3_stmt_status, orig_sqlite3_value_blob,
+    orig_sqlite3_value_bytes, orig_sqlite3_value_double, orig_sqlite3_value_int,
+    orig_sqlite3_value_int64, orig_sqlite3_value_text, orig_sqlite3_value_type,
+    shim_sqlite3_errcode, shim_sqlite3_errmsg, shim_sqlite3_prepare_v2, sqlite_handle,
+    CxaDemangleFn, CXA_DEMANGLE_FN, SHIM_INITIALIZED, SHIM_PASSTHROUGH_ONLY,
 };
 pub(crate) use state::{
     CRASH_COLUMN_MAX_LEN as CRASH_LAST_COLUMN_MAX_LEN, CRASH_LAST_COLUMN, CRASH_LAST_COLUMN_LEN,

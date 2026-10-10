@@ -197,6 +197,9 @@ pub(super) fn prepare_v2_internal_impl(
     pz_tail: *mut *const c_char,
     from_worker: c_int,
 ) -> c_int {
+    // The finalize guard needs the connection, on the prepare worker's thread
+    // too: see ConnScope.
+    let _scope = crate::db_interpose_stmt_lifecycle::ConnScope::enter(db);
     unsafe {
         note_prepare_phase(db, z_sql);
     }

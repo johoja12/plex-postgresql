@@ -52,6 +52,8 @@ pub(crate) fn orig_exec(
     arg: *mut c_void,
     errmsg: *mut *mut c_char,
 ) -> c_int {
+    // The finalize guard needs exec's connection: see ConnScope.
+    let _scope = crate::db_interpose_stmt_lifecycle::ConnScope::enter(db);
     unsafe {
         match orig_sqlite3_exec {
             Some(f) => f(db, sql, callback, arg, errmsg),

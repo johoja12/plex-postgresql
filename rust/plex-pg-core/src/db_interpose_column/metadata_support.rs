@@ -118,19 +118,11 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         crate::libpq_helpers::rust_pq_clear(pending);
     }
 
-    let mut has_unbound_params = false;
-    if pg_stmt_ref.param_count > 0 {
-        has_unbound_params = true;
-        for i in 0..pg_stmt_ref.param_count as usize {
-            if !pg_stmt_ref.param_values[i].is_null() {
-                has_unbound_params = false;
-                break;
-            }
-        }
-    }
-
     unsafe {
-        if has_unbound_params && pg_stmt_ref.stmt_name[0] != 0 {
+        // Column metadata must not execute a full library SELECT merely to
+        // discard its rows at the first sqlite3_step. Describe works for bound
+        // and parameter-free statements too, and preserves original column OIDs.
+        if pg_stmt_ref.stmt_name[0] != 0 {
             log_info_lazy!(
                 "METADATA_DESCRIBE: Using prepared-statement describe for: {}",
                 cstr_prefix(pg_stmt_ref.pg_sql, 100, "?")
@@ -207,6 +199,13 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
                     pg_stmt_ref.num_cols,
                     cstr_prefix(pg_stmt_ref.pg_sql, 100, "?")
                 );
+                // Table-origin metadata is present on described results too.
+                // Resolve it before SOCI chooses its holders, just as the old
+                // execute-for-metadata path did. Never nest the connection lock.
+                drop(_conn_guard);
+                if rust_resolve_column_tables(pg_stmt, exec_conn) < 0 {
+                    log_error("Failed to resolve described column tables");
+                }
                 return true;
             }
 

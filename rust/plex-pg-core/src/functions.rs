@@ -1,3 +1,4 @@
+use crate::byte_utils::push_utf8_byte;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 /// Module: functions
 ///
@@ -372,7 +373,7 @@ fn parse_json_path_segments(path: &str) -> Option<Vec<String>> {
                     while i < bytes.len() {
                         if bytes[i] == b'\\' && i + 1 < bytes.len() {
                             i += 1;
-                            key.push(bytes[i] as char);
+                            push_utf8_byte(&mut key, path, i);
                             i += 1;
                             continue;
                         }
@@ -385,7 +386,7 @@ fn parse_json_path_segments(path: &str) -> Option<Vec<String>> {
                             }
                             break;
                         }
-                        key.push(bytes[i] as char);
+                        push_utf8_byte(&mut key, path, i);
                         i += 1;
                     }
                     if i >= bytes.len() || bytes[i] != quote {
@@ -1625,5 +1626,12 @@ mod tests {
         let sql3 = "SELECT datetime('now') FROM t";
         let stmts3 = Parser::parse_sql(&SQLiteDialect {}, sql3);
         eprintln!("Parse3: {:?}", stmts3);
+    }
+
+    #[test]
+    fn subset_core__json_path_keeps_non_ascii_keys() {
+        let r = translate(r#"SELECT json_extract(extra, '$."clé"') FROM t"#).unwrap();
+        assert!(r.sql.contains("clé"), "{}", r.sql);
+        assert!(!r.sql.contains('Ã'), "{}", r.sql);
     }
 }

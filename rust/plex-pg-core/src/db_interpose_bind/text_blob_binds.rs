@@ -1,6 +1,6 @@
 use super::*;
 use crate::db_interpose_bind::support::{
-    begin_bind, bytes_to_pg_hex, contains_binary_bytes, free_dynamic_param_value,
+    begin_bind, bytes_to_pg_hex, clear_param_value, contains_binary_bytes,
     invoke_destructor_if_custom, is_pg_routed_noncached, mapped_param_index, retry_on_misuse,
 };
 use crate::log_debug_lazy;
@@ -44,7 +44,7 @@ unsafe fn store_text_param(
     idx: c_int,
     label: &str,
 ) {
-    free_dynamic_param_value(pg_stmt, pg_idx);
+    clear_param_value(pg_stmt, pg_idx);
     let stmt = &mut *pg_stmt;
 
     if contains_binary_bytes(val as *const u8, actual_len) {
@@ -96,7 +96,7 @@ unsafe fn store_blob_hex_param(
     idx: c_int,
     label: &str,
 ) {
-    free_dynamic_param_value(pg_stmt, pg_idx);
+    clear_param_value(pg_stmt, pg_idx);
     let stmt = &mut *pg_stmt;
     log_debug_lazy!(
         "{}: converting {} bytes to hex at idx={}",
@@ -222,6 +222,14 @@ pub(super) fn bind_text_impl(
         rc
     };
 
+    // SQLite binds NULL for a NULL pointer, so the slot must not keep the
+    // value it held before.
+    if val.is_null() {
+        if let Some(pg_idx) = unsafe { mapped_param_index(pg_stmt, p_stmt, idx) } {
+            unsafe { clear_param_value(pg_stmt, pg_idx) };
+        }
+    }
+
     if !val.is_null() {
         if let Some(pg_idx) = unsafe { mapped_param_index(pg_stmt, p_stmt, idx) } {
             let actual_len = if n_bytes < 0 {
@@ -276,7 +284,15 @@ pub(super) fn bind_blob_impl(
         rc
     };
 
-    if !val.is_null() && n_bytes > 0 {
+    // SQLite binds NULL for a NULL pointer and an empty blob for a zero
+    // length, so the slot must not keep the value it held before.
+    if val.is_null() {
+        if let Some(pg_idx) = unsafe { mapped_param_index(pg_stmt, p_stmt, idx) } {
+            unsafe { clear_param_value(pg_stmt, pg_idx) };
+        }
+    }
+
+    if !val.is_null() {
         if let Some(pg_idx) = unsafe { mapped_param_index(pg_stmt, p_stmt, idx) } {
             unsafe {
                 store_blob_hex_param(pg_stmt, pg_idx, val, n_bytes as usize, idx, "bind_blob");
@@ -316,7 +332,15 @@ pub(super) fn bind_blob64_impl(
         rc
     };
 
-    if !val.is_null() && n_bytes > 0 {
+    // SQLite binds NULL for a NULL pointer and an empty blob for a zero
+    // length, so the slot must not keep the value it held before.
+    if val.is_null() {
+        if let Some(pg_idx) = unsafe { mapped_param_index(pg_stmt, p_stmt, idx) } {
+            unsafe { clear_param_value(pg_stmt, pg_idx) };
+        }
+    }
+
+    if !val.is_null() {
         if let Some(pg_idx) = unsafe { mapped_param_index(pg_stmt, p_stmt, idx) } {
             unsafe {
                 store_blob_hex_param(pg_stmt, pg_idx, val, n_bytes as usize, idx, "bind_blob64")
@@ -403,6 +427,14 @@ pub(super) fn bind_text64_impl(
         }
         rc
     };
+
+    // SQLite binds NULL for a NULL pointer, so the slot must not keep the
+    // value it held before.
+    if val.is_null() {
+        if let Some(pg_idx) = unsafe { mapped_param_index(pg_stmt, p_stmt, idx) } {
+            unsafe { clear_param_value(pg_stmt, pg_idx) };
+        }
+    }
 
     if !val.is_null() {
         if let Some(pg_idx) = unsafe { mapped_param_index(pg_stmt, p_stmt, idx) } {

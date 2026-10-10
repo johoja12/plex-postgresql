@@ -16,6 +16,7 @@ use crate::db_interpose_conn_utils::{
 use crate::ffi_types::{sqlite3, sqlite3_stmt, PgConnection, PgStmt, StmtGuard};
 use crate::libpq_helpers::PGresult;
 use first_execute::first_execute_impl;
+pub(crate) use next_result::try_advance_materialized;
 use next_result::{
     advance_cached_result_impl, eager_next_impl, log_debug_context_impl, streaming_next_impl,
 };

@@ -7,8 +7,63 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::{LazyLock, RwLock};
 
-static DECLTYPE_CACHE: LazyLock<RwLock<HashMap<String, CString>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+#[derive(Default)]
+struct DecltypeCache {
+    entries: HashMap<String, CString>,
+    // Cache misses too: expression aliases often have no schema entry.
+    aliases: HashMap<String, Option<String>>,
+}
+
+impl DecltypeCache {
+    fn insert(&mut self, key: String, value: CString) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.entries.entry(key) {
+            entry.insert(value);
+            // A newly loaded schema entry can resolve a previous miss or provide
+            // a longer match. Published CStrings themselves are never replaced.
+            self.aliases.clear();
+            crate::libpq_helpers::invalidate_result_metadata();
+        }
+    }
+
+    fn cached_alias(&self, alias: &str) -> Option<*const c_char> {
+        if let Some(value) = self.entries.get(alias) {
+            return Some(value.as_ptr());
+        }
+        self.aliases.get(alias).map(|key| {
+            key.as_ref()
+                .and_then(|key| self.entries.get(key))
+                .map_or(std::ptr::null(), |value| value.as_ptr())
+        })
+    }
+
+    fn resolve_alias(&mut self, alias: &str) -> *const c_char {
+        if let Some(value) = self.cached_alias(alias) {
+            return value;
+        }
+        let mut best: Option<&String> = None;
+        for key in self.entries.keys() {
+            if alias_matches_cache_key(alias, key)
+                && best.is_none_or(|previous| key.len() > previous.len())
+            {
+                best = Some(key);
+            }
+        }
+        let resolved = best.cloned();
+        let result = resolved
+            .as_ref()
+            .and_then(|key| self.entries.get(key))
+            .map_or(std::ptr::null(), |value| value.as_ptr());
+        // Bound query-generated alias memory without touching published values.
+        if self.aliases.len() >= 4096 {
+            self.aliases.clear();
+        }
+        self.aliases.insert(alias.to_owned(), resolved);
+        result
+    }
+}
+
+static DECLTYPE_CACHE: LazyLock<RwLock<DecltypeCache>> =
+    LazyLock::new(|| RwLock::new(DecltypeCache::default()));
 static OID_TABLE_CACHE: LazyLock<RwLock<HashMap<u32, CString>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
@@ -46,7 +101,7 @@ pub fn rust_decltype_cache_insert(key: *const c_char, decltype_val: *const c_cha
     // CString and free it underneath every holder. Re-inserting a key is the
     // normal case, not an edge one -- the decltype preload re-runs its whole
     // pass whenever a previous attempt failed -- so first publication wins.
-    cache.entry(key_str.to_string()).or_insert(normalized_owned);
+    cache.insert(key_str.to_string(), normalized_owned);
     1
 }
 
@@ -60,6 +115,7 @@ pub fn rust_decltype_cache_lookup(key: *const c_char) -> *const c_char {
         Err(poisoned) => poisoned.into_inner(),
     };
     cache
+        .entries
         .get(key_str)
         .map(|s| s.as_ptr())
         .unwrap_or(std::ptr::null())
@@ -156,27 +212,15 @@ pub fn rust_decltype_cache_lookup_alias(alias: *const c_char) -> *const c_char {
         Err(poisoned) => poisoned.into_inner(),
     };
 
-    if let Some(existing) = cache.get(alias_str) {
-        return existing.as_ptr();
+    if let Some(value) = cache.cached_alias(alias_str) {
+        return value;
     }
-
-    let mut best_match: Option<(&String, &CString)> = None;
-    for (key, value) in cache.iter() {
-        if !alias_matches_cache_key(alias_str, key) {
-            continue;
-        }
-        let should_replace = match best_match {
-            Some((best_key, _)) => key.len() > best_key.len(),
-            None => true,
-        };
-        if should_replace {
-            best_match = Some((key, value));
-        }
-    }
-
-    best_match
-        .map(|(_, value)| value.as_ptr())
-        .unwrap_or(std::ptr::null())
+    drop(cache);
+    let mut cache = match DECLTYPE_CACHE.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    cache.resolve_alias(alias_str)
 }
 
 fn alias_matches_cache_key(alias: &str, cache_key: &str) -> bool {
@@ -202,13 +246,58 @@ fn alias_matches_cache_key(alias: &str, cache_key: &str) -> bool {
             continue;
         }
 
-        let mut suffix = String::with_capacity(column.len() + 1);
-        suffix.push('_');
-        suffix.push_str(column);
-        if alias.ends_with(&suffix) {
+        if alias.ends_with(&cache_key[idx..]) {
             return true;
         }
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alias_cache_preserves_matches_misses_and_published_pointers() {
+        let mut cache = DecltypeCache::default();
+        cache.insert("media_items_id".into(), CString::new("INTEGER").unwrap());
+        let pointer = cache.resolve_alias("media_items_42_id");
+        assert!(!pointer.is_null());
+        assert_eq!(cache.cached_alias("media_items_42_id"), Some(pointer));
+        assert!(cache.resolve_alias("new_table_1_title").is_null());
+        assert_eq!(
+            cache.cached_alias("new_table_1_title"),
+            Some(std::ptr::null())
+        );
+        cache.insert("new_table_title".into(), CString::new("TEXT").unwrap());
+        assert!(cache.cached_alias("new_table_1_title").is_none());
+        assert!(!cache.resolve_alias("new_table_1_title").is_null());
+        cache.insert("media_items_id".into(), CString::new("TEXT").unwrap());
+        assert_eq!(cache.resolve_alias("media_items_42_id"), pointer);
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(pointer) }.to_bytes(),
+            b"INTEGER"
+        );
+        for n in 0..5000 {
+            assert!(cache.resolve_alias(&format!("unknown_{n}")).is_null());
+        }
+        assert!(cache.aliases.len() <= 4096);
+        assert_eq!(cache.resolve_alias("media_items_42_id"), pointer);
+    }
+
+    #[test]
+    fn new_longer_alias_match_invalidates_previous_resolution() {
+        let mut cache = DecltypeCache::default();
+        cache.insert("a_id".into(), CString::new("INTEGER").unwrap());
+        let short = cache.resolve_alias("a_b_1_id");
+        cache.insert("a_b_id".into(), CString::new("TEXT").unwrap());
+        let longer = cache.resolve_alias("a_b_1_id");
+        assert_ne!(short, longer);
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(longer) }.to_bytes(),
+            b"TEXT"
+        );
+        assert_eq!(cache.resolve_alias("a_id"), short);
+    }
 }

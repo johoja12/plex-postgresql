@@ -1,6 +1,20 @@
 use crate::log_info_lazy;
 use std::os::raw::{c_char, c_int};
 
+// Conservatively invalidate per-statement descriptors whenever any PGresult
+// is freed, or schema type metadata is extended. This also handles allocator
+// address reuse and metadata-only/streamed results without a pointer-only key.
+static RESULT_METADATA_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn result_metadata_epoch() -> u64 {
+    RESULT_METADATA_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn invalidate_result_metadata() {
+    RESULT_METADATA_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 #[repr(C)]
 pub struct PGconn {
     _private: [u8; 0],
@@ -174,6 +188,7 @@ pub extern "C" fn rust_pq_clear(res: *mut PGresult) {
     if res.is_null() {
         return;
     }
+    invalidate_result_metadata();
     unsafe { PQclear(res) }
 }
 
@@ -535,7 +550,7 @@ pub extern "C" fn rust_pg_probe_max_connections(
                 max_connections = v;
             }
         }
-        unsafe { PQclear(res) };
+        rust_pq_clear(res);
     }
     unsafe { PQfinish(probe) };
     if max_connections > 0 {
@@ -617,7 +632,7 @@ pub extern "C" fn rust_pg_probe_idle_timeouts(
                 got_in_tx = true;
             }
         }
-        unsafe { PQclear(res) };
+        rust_pq_clear(res);
     }
     unsafe { PQfinish(probe) };
     i32::from(got_session && got_in_tx)

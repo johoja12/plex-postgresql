@@ -1,7 +1,6 @@
 use super::*;
 use crate::db_interpose_bind::support::{
-    begin_bind, free_dynamic_param_value, is_pg_routed_noncached, mapped_param_index,
-    retry_on_misuse,
+    begin_bind, clear_param_value, is_pg_routed_noncached, mapped_param_index, retry_on_misuse,
 };
 
 unsafe fn store_sqlite_value_param(
@@ -10,7 +9,7 @@ unsafe fn store_sqlite_value_param(
     mutable_value: *mut sqlite3_value,
 ) {
     let vtype = crate::db_interpose_value::rust_my_sqlite3_value_type(mutable_value);
-    free_dynamic_param_value(pg_stmt, pg_idx);
+    clear_param_value(pg_stmt, pg_idx);
     let stmt = &mut *pg_stmt;
 
     match vtype {
@@ -120,7 +119,7 @@ pub(super) fn bind_null_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int {
     };
 
     if let Some(pg_idx) = unsafe { mapped_param_index(pg_stmt, p_stmt, idx) } {
-        unsafe { free_dynamic_param_value(pg_stmt, pg_idx) };
+        unsafe { clear_param_value(pg_stmt, pg_idx) };
     }
 
     drop(guard);

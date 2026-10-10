@@ -1136,7 +1136,9 @@ ALTER TABLE ONLY plex.metadata_items ALTER COLUMN metadata_type SET STATISTICS 2
 CREATE VIEW plex.fts4_metadata_titles AS
  SELECT metadata_items.id AS rowid,
     metadata_items.title,
-    metadata_items.title_fts
+    metadata_items.title_fts,
+    metadata_items.title_sort,
+    metadata_items.original_title
    FROM plex.metadata_items;
 
 
@@ -1147,7 +1149,9 @@ CREATE VIEW plex.fts4_metadata_titles AS
 CREATE VIEW plex.fts4_metadata_titles_icu AS
  SELECT metadata_items.id AS rowid,
     metadata_items.title,
-    metadata_items.title_fts
+    metadata_items.title_fts,
+    metadata_items.title_sort,
+    metadata_items.original_title
    FROM plex.metadata_items;
 
 
@@ -1180,7 +1184,8 @@ CREATE TABLE plex.tags (
 CREATE VIEW plex.fts4_tag_titles AS
  SELECT tags.id AS rowid,
     tags.tag AS title,
-    tags.search_vector AS title_fts
+    tags.search_vector AS title_fts,
+    tags.tag
    FROM plex.tags;
 
 
@@ -1191,7 +1196,8 @@ CREATE VIEW plex.fts4_tag_titles AS
 CREATE VIEW plex.fts4_tag_titles_icu AS
  SELECT tags.id AS rowid,
     tags.tag AS title,
-    tags.search_vector AS title_fts
+    tags.search_vector AS title_fts,
+    tags.tag
    FROM plex.tags;
 
 
@@ -4039,6 +4045,13 @@ CREATE INDEX idx_metadata_items_title_sort ON plex.metadata_items USING btree (t
 
 CREATE INDEX idx_metadata_items_title_trgm ON plex.metadata_items USING gin (title plex.gin_trgm_ops);
 
+-- Translated MATCH searches use these source-column expressions through the
+-- fts4_metadata_titles views; title_fts/search_vector cannot serve them.
+CREATE INDEX idx_metadata_items_title_simple_fts
+    ON plex.metadata_items USING gin (to_tsvector('simple'::regconfig, title));
+CREATE INDEX idx_metadata_items_title_sort_simple_fts
+    ON plex.metadata_items USING gin (to_tsvector('simple'::regconfig, title_sort));
+
 
 --
 -- Name: idx_metadata_items_type; Type: INDEX; Schema: plex; Owner: -
@@ -4178,6 +4191,10 @@ CREATE INDEX idx_taggings_tag_metadata ON plex.taggings USING btree (tag_id, met
 --
 
 CREATE INDEX idx_tags_fts ON plex.tags USING gin (search_vector);
+
+-- MATCH translation preserves source-column semantics with to_tsvector(tag).
+-- The search_vector index cannot serve that expression through the FTS views.
+CREATE INDEX idx_tags_tag_simple_fts ON plex.tags USING gin (to_tsvector('simple'::regconfig, tag));
 
 
 --

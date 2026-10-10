@@ -82,9 +82,12 @@ fn placeholder_in_string() {
     );
 }
 
+// A `?` takes only digits in SQLite, so `?label` is a placeholder and then
+// the word: here an implicit alias. (Ported as `b > ?left` at the end of a
+// statement, which SQLite rejects, and which pinned the word being dropped.)
 #[test]
 fn placeholder_question_alpha_space() {
-    let t = translate("SELECT * FROM t WHERE a = ? AND b > ?left").unwrap();
+    let t = translate("SELECT ?label FROM t WHERE a = ?").unwrap();
     assert_eq!(
         t.param_names.len(),
         2,
@@ -92,8 +95,13 @@ fn placeholder_question_alpha_space() {
         t.param_names
     );
     assert!(
-        !t.sql.contains("$2l"),
-        "should not have $2l glued together in: {}",
+        !t.sql.contains("$1l"),
+        "should not have $1l glued together in: {}",
+        t.sql
+    );
+    assert!(
+        t.sql.to_lowercase().contains("label"),
+        "the alias must survive in: {}",
         t.sql
     );
 }

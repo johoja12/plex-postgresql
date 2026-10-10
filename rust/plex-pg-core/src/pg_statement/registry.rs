@@ -20,11 +20,13 @@ impl StmtRegistry {
             }
         }
         self.reverse.insert(pg_stmt, sqlite_stmt);
+        super::registry_api::invalidate_fast_lookup();
     }
 
     pub(super) fn unregister(&mut self, sqlite_stmt: usize) {
         if let Some(pg_stmt) = self.forward.remove(&sqlite_stmt) {
             self.reverse.remove(&pg_stmt);
+            super::registry_api::invalidate_fast_lookup();
         }
     }
 
@@ -39,6 +41,7 @@ impl StmtRegistry {
     pub(super) fn clear(&mut self) {
         self.forward.clear();
         self.reverse.clear();
+        super::registry_api::invalidate_fast_lookup();
     }
 
     pub(super) fn len(&self) -> usize {

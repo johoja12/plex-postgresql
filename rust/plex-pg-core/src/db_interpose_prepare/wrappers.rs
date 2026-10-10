@@ -85,6 +85,8 @@ pub(super) fn prepare16_v2_impl(
     pp_stmt: *mut *mut sqlite3_stmt,
     pz_tail: *mut *const c_void,
 ) -> c_int {
+    // The finalize guard needs the connection: see ConnScope.
+    let _scope = crate::db_interpose_stmt_lifecycle::ConnScope::enter(db);
     if z_sql.is_null() {
         return unsafe {
             orig_sqlite3_prepare16_v2

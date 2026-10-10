@@ -33,6 +33,7 @@ pub use ffi_strings::{
     rust_free_cstring, rust_free_normalized_sql, rust_normalize_sql_literals,
     rust_rewrite_server_library_uri, rust_validate_utf8, RustNormalizedSql,
 };
+pub(crate) use pg_result::column_text_transform_owned;
 pub use pg_result::{
     rust_column_text_reformat_aggregate, rust_column_text_transform, rust_get_table_from_pgresult,
     rust_pg_create_column_value, rust_pg_decode_bytea, rust_pg_result_blob_copy,
@@ -45,7 +46,7 @@ use pure_helpers::{
     bytes_to_pg_hex_impl, contains_binary_bytes_impl, find_insert_column_index_impl,
     format_epoch_to_datetime_utc_impl, is_aggregate_alias, is_blobs_db_path_impl,
     is_junk_metadata_insert_impl, is_library_db_path_impl, is_library_or_blobs_db_path_impl,
-    is_related_items_query_impl, normalize_sql_literals_impl, pg_sql_has_timestamp_hint,
+    is_related_items_query_impl, normalize_sql_literals_impl,
     rewrite_server_library_uri_bytes, should_mask_collection_metadata_type_impl,
 };
 pub(crate) use string_utils::cstr_to_str_or_empty;
@@ -340,14 +341,20 @@ pub fn rust_should_mask_collection_metadata_type(
     col_name: *const c_char,
     raw_val: i64,
 ) -> c_int {
-    if pg_sql.is_null() || col_name.is_null() {
+    // This compatibility rule only applies to collection metadata_type=18.
+    // Large Plex scans use SQL with very long IN lists. Do not strlen/validate
+    // that SQL for every ordinary cell before discovering the rule cannot apply.
+    if raw_val != 18 || pg_sql.is_null() || col_name.is_null() {
         return 0;
     }
-    let pg_sql = match unsafe { CStr::from_ptr(pg_sql) }.to_str() {
+    let col_name = match unsafe { CStr::from_ptr(col_name) }.to_str() {
         Ok(s) => s,
         Err(_) => return 0,
     };
-    let col_name = match unsafe { CStr::from_ptr(col_name) }.to_str() {
+    if !col_name.contains("metadata_type") {
+        return 0;
+    }
+    let pg_sql = match unsafe { CStr::from_ptr(pg_sql) }.to_str() {
         Ok(s) => s,
         Err(_) => return 0,
     };

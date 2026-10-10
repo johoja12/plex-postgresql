@@ -70,7 +70,7 @@ fn trace_badcast_init() {
     });
 }
 
-fn trace_badcast_enabled() -> bool {
+pub(super) fn trace_badcast_enabled() -> bool {
     trace_badcast_init();
     unsafe { TRACE_BADCAST_ENABLED != 0 }
 }

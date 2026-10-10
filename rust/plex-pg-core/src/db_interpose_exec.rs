@@ -15,6 +15,18 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use support::orig_exec;
 
+/// Real `sqlite3_exec` as the shim calls it, for other modules' tests.
+#[cfg(test)]
+pub(crate) fn orig_exec_for_tests(
+    db: *mut sqlite3,
+    sql: *const c_char,
+    callback: ExecCallback,
+    arg: *mut c_void,
+    errmsg: *mut *mut c_char,
+) -> c_int {
+    orig_exec(db, sql, callback, arg, errmsg)
+}
+
 const SQLITE_OK: c_int = 0;
 const SQLITE_ERROR: c_int = 1;
 

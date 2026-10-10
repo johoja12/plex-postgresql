@@ -74,7 +74,7 @@ CREATE OPERATOR public.= (
   PROCEDURE = public.eq_bool_int,
   LEFTARG = boolean,
   RIGHTARG = integer,
-  COMMUTATOR = =
+  COMMUTATOR = OPERATOR(public.=)
 );
 
 DROP OPERATOR IF EXISTS public.= (integer, boolean);
@@ -82,7 +82,43 @@ CREATE OPERATOR public.= (
   PROCEDURE = public.eq_int_bool,
   LEFTARG = integer,
   RIGHTARG = boolean,
-  COMMUTATOR = =
+  COMMUTATOR = OPERATOR(public.=)
 );
 
 
+
+-- Older schema snapshots exposed only title/title_fts in the FTS views, while
+-- the translator correctly references SQLite FTS title_sort/original_title/tag.
+-- Append missing source columns without changing existing column positions or
+-- dropping dependent objects. Re-running this upgrade is safe.
+DO $fts_views$
+BEGIN
+    IF to_regclass('plex.metadata_items') IS NOT NULL THEN
+        -- MATCH is translated against these source columns, not title_fts.
+        -- Pre-create on a busy live database with CONCURRENTLY before upgrade.
+        CREATE INDEX IF NOT EXISTS idx_metadata_items_title_simple_fts
+            ON plex.metadata_items USING gin (to_tsvector('simple'::regconfig, title));
+        CREATE INDEX IF NOT EXISTS idx_metadata_items_title_sort_simple_fts
+            ON plex.metadata_items USING gin (to_tsvector('simple'::regconfig, title_sort));
+        CREATE OR REPLACE VIEW plex.fts4_metadata_titles AS
+            SELECT id AS rowid, title, title_fts, title_sort, original_title
+            FROM plex.metadata_items;
+        CREATE OR REPLACE VIEW plex.fts4_metadata_titles_icu AS
+            SELECT id AS rowid, title, title_fts, title_sort, original_title
+            FROM plex.metadata_items;
+    END IF;
+    IF to_regclass('plex.tags') IS NOT NULL THEN
+        -- Preserve MATCH semantics while indexing its exact source expression.
+        -- Production operators can pre-create this index CONCURRENTLY before
+        -- upgrading to avoid a write lock on a busy existing database.
+        CREATE INDEX IF NOT EXISTS idx_tags_tag_simple_fts
+            ON plex.tags USING gin (to_tsvector('simple'::regconfig, tag));
+        CREATE OR REPLACE VIEW plex.fts4_tag_titles AS
+            SELECT id AS rowid, tag AS title, search_vector AS title_fts, tag
+            FROM plex.tags;
+        CREATE OR REPLACE VIEW plex.fts4_tag_titles_icu AS
+            SELECT id AS rowid, tag AS title, search_vector AS title_fts, tag
+            FROM plex.tags;
+    END IF;
+END;
+$fts_views$;

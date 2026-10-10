@@ -35,7 +35,21 @@ pub(super) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack.windows(needle.len()).position(|w| w == needle)
+    let mut offset = 0;
+    let candidates = haystack.len() - needle.len() + 1;
+    while offset < candidates {
+        // Skip directly to the next possible first byte instead of comparing
+        // the full needle at every byte of a long metadata field.
+        let found = unsafe { libc::memchr(
+            haystack.as_ptr().add(offset).cast(), needle[0] as i32,
+            candidates - offset,
+        ) };
+        if found.is_null() { return None; }
+        let index = unsafe { (found as *const u8).offset_from(haystack.as_ptr()) as usize };
+        if haystack[index..index + needle.len()] == *needle { return Some(index); }
+        offset = index + 1;
+    }
+    None
 }
 
 pub(super) fn push_capped(buf: &mut Vec<u8>, out_cap: usize, bytes: &[u8]) {
@@ -186,5 +200,24 @@ pub(super) fn write_buf(out: *mut c_char, out_len: usize, value: Option<&str>) {
     unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, n);
         *out.add(n) = 0;
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use proptest::prelude::*;
+    proptest! {
+        #[test]
+        fn byte_search_matches_windows(haystack in proptest::collection::vec(any::<u8>(), 0..2048), needle in proptest::collection::vec(any::<u8>(), 0..40)) {
+            let expected = if needle.is_empty() { None } else { haystack.windows(needle.len()).position(|v| v == needle) };
+            prop_assert_eq!(find_subslice(&haystack, &needle), expected);
+        }
+    }
+    #[test]
+    fn repeated_prefix_and_last_candidate() {
+        assert_eq!(find_subslice(b"ssssserver://", b"server://"), Some(4));
+        assert_eq!(find_subslice(b"server:/", b"server://"), None);
+        assert_eq!(find_subslice(b"\xff\0abc", b"\0abc"), Some(1));
     }
 }

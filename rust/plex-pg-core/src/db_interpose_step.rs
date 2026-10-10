@@ -33,6 +33,12 @@ use support::{
     shim_alloc_maybe_log,
 };
 
+/// Real `sqlite3_step` as the shim calls it, for other modules' tests.
+#[cfg(test)]
+pub(crate) unsafe fn orig_step_for_tests(p_stmt: *mut sqlite3_stmt) -> c_int {
+    orig_step(p_stmt)
+}
+
 fn set_stmt_translation_error(pg_stmt: *mut PgStmt, msg: &str) {
     unsafe {
         if pg_stmt.is_null() {
@@ -143,6 +149,15 @@ unsafe fn trace_step_null_select_stmt(
 #[no_mangle]
 pub extern "C" fn rust_my_sqlite3_step(p_stmt: *mut sqlite3_stmt) -> c_int {
     let dbg_stmt = crate::pg_statement::rust_stmt_find(p_stmt as usize) as *mut PgStmt;
+    // SQLite column pointers remain valid until the next step/reset/finalize.
+    // Only transformed strings are owned here; ordinary strings stay in PGresult.
+    let text_stmt = if dbg_stmt.is_null() {
+        crate::pg_statement::rust_stmt_find_any(p_stmt as usize) as *mut PgStmt
+    } else { dbg_stmt };
+    if !text_stmt.is_null() {
+        let _guard = unsafe { PgStmt::lock_mutex(text_stmt) };
+        unsafe { (&mut *text_stmt).owned_column_text.clear(); }
+    }
     let mut dbg_sql: *const c_char = std::ptr::null();
     let dbg_db: *mut sqlite3;
 
@@ -239,6 +254,10 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
         if cached_rc != STEP_RESULT_FALLBACK {
             return cached_rc;
         }
+    }
+
+    if let Some(rc) = crate::db_interpose_step_read_utils::try_advance_materialized(pg_stmt) {
+        return rc;
     }
 
     let mut exec_conn: *mut PgConnection = std::ptr::null_mut();

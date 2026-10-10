@@ -1,4 +1,5 @@
 use super::*;
+use crate::byte_utils::push_utf8_byte;
 
 pub(super) fn rewrite_server_library_uri_bytes(
     input_bytes: &[u8],
@@ -62,18 +63,14 @@ pub(super) fn is_aggregate_alias(col: &str) -> bool {
     if col.is_empty() {
         return false;
     }
-    let lower = col.trim().to_ascii_lowercase();
-    matches!(lower.as_str(), "count" | "sum" | "max" | "min" | "avg")
-        || ["count(", "sum(", "max(", "min(", "avg("]
-            .iter()
-            .any(|prefix| lower.starts_with(prefix))
-}
-
-pub(super) fn pg_sql_has_timestamp_hint(pg_sql: &str) -> bool {
-    pg_sql.contains("_at")
-        || pg_sql.contains("changed_at")
-        || pg_sql.contains("updated_at")
-        || pg_sql.contains("created_at")
+    let col = col.trim().as_bytes();
+    [b"count".as_slice(), b"sum", b"max", b"min", b"avg"]
+        .iter()
+        .any(|name| {
+            col.eq_ignore_ascii_case(name)
+                || (col.get(..name.len()).is_some_and(|p| p.eq_ignore_ascii_case(name))
+                    && col.get(name.len()) == Some(&b'('))
+        })
 }
 
 pub(super) fn normalize_sql_literals_impl(sql: &str) -> Option<(String, Vec<String>)> {
@@ -128,7 +125,7 @@ pub(super) fn normalize_sql_literals_impl(sql: &str) -> Option<(String, Vec<Stri
         }
 
         let b = bytes[i];
-        out.push(b as char);
+        push_utf8_byte(&mut out, sql, i);
         if b == b'\'' && !in_double {
             in_single = !in_single;
         } else if b == b'"' && !in_single {

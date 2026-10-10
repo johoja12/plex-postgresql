@@ -78,7 +78,7 @@ pub(super) fn first_execute_impl(
         let mut use_streaming =
             should_use_streaming(pg_stmt, disable_streaming) && !thread_has_other_streaming;
         if disable_streaming {
-            log_info("STREAM: disabled via PLEX_PG_DISABLE_STREAMING, using eager fetch");
+            log_debug("STREAM: disabled via PLEX_PG_DISABLE_STREAMING, using eager fetch");
         } else if thread_has_other_streaming {
             log_debug(
                 "STREAM: disabled because current thread already owns another active streaming connection, using eager fetch",
