@@ -2,7 +2,7 @@
 
 Repository: https://github.com/johoja12/plex-postgresql
 
-Maintained branch: `qnap/mediactl-patched`. Local independent checkout: `/opt/projects/plex-postgresql-fork`.
+Maintained branch: `main`. The previous `qnap/mediactl-patched` branch is retained as an integration snapshot. Local independent checkout: `/opt/projects/plex-postgresql-fork`.
 
 `origin` is our GitHub fork. `upstream` is https://github.com/mediactl/plex-postgresql. GitHub records the fork-network parent as cgnl/plex-postgresql; mediactl/main is the source used for current integration.
 
@@ -21,7 +21,7 @@ cd /opt/projects/plex-postgresql-fork
 git fetch upstream main
 git merge upstream/main
 # Review differences and run targeted shim regressions before publishing.
-git push origin qnap/mediactl-patched
+git push origin main
 ```
 
 An upstream merge and a GitHub push do not deploy Plex. Production image building, restored-database rehearsal, scoped rollout and live acceptance remain separate steps. Never migrate the live PostgreSQL database again or change production configuration merely to synchronize this source repository.
