@@ -87,6 +87,12 @@ unsafe fn write_cached_text_output(
             out_ptr = buf.as_ptr();
             return;
         }
+        if str_len >= TEXT_BUFFER_SIZE {
+            // Longer than the buffer: the cached row's own copy, which lives
+            // as long as SQLite keeps a column_text pointer (the row).
+            out_ptr = state.source_value as *const c_uchar;
+            return;
+        }
 
         let copy_len = str_len.min(TEXT_BUFFER_SIZE - 1);
         if copy_len > 0 {
@@ -174,6 +180,25 @@ unsafe fn write_live_text_output(
         // race condition. Match the C shim behavior: return empty string instead
         // of NULL to prevent std::string(nullptr) → basic_string exception.
         return b"\0".as_ptr();
+    }
+    if transform_rc == 0 && source_len >= TEXT_BUFFER_SIZE {
+        // Longer than the buffer, which holds the first 8,191 bytes: libpq's
+        // own copy, valid until the result is cleared -- as long as SQLite
+        // keeps a column_text pointer. A DVR device's channel map is 16 KB.
+        let mut value: *const c_char = ptr::null();
+        let mut len: c_int = 0;
+        let mut is_null: c_int = 0;
+        crate::db_interpose_helpers::rust_pg_result_value_ptr_len(
+            helpers_result_ptr(pg_stmt.result),
+            state.row,
+            idx,
+            &mut value as *mut *const c_char,
+            &mut len as *mut c_int,
+            &mut is_null as *mut c_int,
+        );
+        if !value.is_null() && is_null == 0 {
+            return value as *const c_uchar;
+        }
     }
     out_ptr
 }

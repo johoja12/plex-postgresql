@@ -214,18 +214,21 @@ pub extern "C" fn rust_my_sqlite3_data_count(p_stmt: *mut sqlite3_stmt) -> c_int
 #[cfg(test)]
 mod tests {
     use super::{
-        next_text_buffer_index, rust_my_sqlite3_column_count, rust_my_sqlite3_column_decltype,
-        set_metadata_result_state, COLUMN_TEXT_BUF_IDX, NUM_TEXT_BUFFERS,
+        next_text_buffer_index, rust_my_sqlite3_column_bytes, rust_my_sqlite3_column_count,
+        rust_my_sqlite3_column_decltype, rust_my_sqlite3_column_text, set_metadata_result_state,
+        COLUMN_TEXT_BUF_IDX, NUM_TEXT_BUFFERS,
     };
     use crate::db_interpose_common::{orig_sqlite3_column_count, orig_sqlite3_column_decltype};
     use crate::ffi_types::{sqlite3_stmt, PgConnection, PgStmt};
     use crate::libpq_helpers::PGresult as PgResultLibpq;
+    use crate::pg_query_cache::{CachedResult, CachedRow};
     use crate::pg_statement::{
         rust_stmt_create, rust_stmt_free, rust_stmt_register, rust_stmt_unregister,
     };
     use std::collections::HashSet;
     use std::ffi::{CStr, CString};
     use std::os::raw::{c_char, c_int};
+    use std::sync::atomic::AtomicI32;
 
     fn reset_text_buffer_idx() {
         COLUMN_TEXT_BUF_IDX.with(|idx| idx.set(0));
@@ -236,6 +239,147 @@ mod tests {
         let stmt = rust_stmt_create(std::ptr::null_mut(), sql.as_ptr(), std::ptr::null_mut());
         assert!(!stmt.is_null());
         stmt
+    }
+
+    // Plex keeps a DVR device's channel map in
+    // media_provider_resources.extra_data: 16,685 bytes for a block of 300
+    // channels (kind-cluster-plex, 2026-10-14). The text accessor copied
+    // every value into an 8 KiB buffer, so Plex read the JSON cut at 8,191
+    // bytes, parsed nothing and listed the DVR with no channels. SQLite
+    // returns a column's whole value.
+    #[test]
+    fn column_text_returns_a_value_longer_than_its_buffer_whole() {
+        let stmt = make_stmt();
+        let shadow_stmt = 0x30000usize as *mut sqlite3_stmt;
+        let long = format!("{{\"pv:channelMapping\":\"{}\"}}", "M".repeat(20_000));
+        let value = CString::new(long.clone()).unwrap();
+        let col = CString::new("extra_data").unwrap();
+        let mut values = [value.as_ptr() as *mut c_char];
+        let mut lengths = [long.len() as i32];
+        let mut is_null = [0i32];
+        let mut row = CachedRow {
+            values: values.as_mut_ptr(),
+            lengths: lengths.as_mut_ptr(),
+            is_null: is_null.as_mut_ptr(),
+        };
+        let mut types = [25u32];
+        let mut names = [col.as_ptr() as *mut c_char];
+        let mut cached = CachedResult {
+            cache_key: 1,
+            created_ms: 0,
+            ref_count: AtomicI32::new(1),
+            num_rows: 1,
+            num_cols: 1,
+            col_types: types.as_mut_ptr(),
+            col_names: names.as_mut_ptr(),
+            rows: &mut row,
+            hit_count: 0,
+        };
+        unsafe {
+            let s = &mut *stmt;
+            s.is_pg = 2;
+            s.cached_result = &mut cached;
+            s.current_row = 0;
+        }
+        rust_stmt_register(shadow_stmt as usize, stmt as usize);
+
+        let got = rust_my_sqlite3_column_text(shadow_stmt, 0);
+        let text = unsafe { CStr::from_ptr(got as *const c_char) }
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            text.len(),
+            long.len(),
+            "the whole value, not the buffer's 8,191 bytes"
+        );
+        assert_eq!(text, long);
+        assert_eq!(
+            rust_my_sqlite3_column_bytes(shadow_stmt, 0) as usize,
+            long.len()
+        );
+
+        rust_stmt_unregister(shadow_stmt as usize);
+        unsafe {
+            (&mut *stmt).cached_result = std::ptr::null_mut();
+        }
+        rust_stmt_free(stmt);
+    }
+
+    #[repr(C)]
+    struct PgResAttDesc {
+        name: *const c_char,
+        tableid: u32,
+        columnid: c_int,
+        format: c_int,
+        typid: u32,
+        typlen: c_int,
+        atttypmod: c_int,
+    }
+
+    extern "C" {
+        fn PQmakeEmptyPGresult(conn: *mut std::ffi::c_void, status: c_int) -> *mut PgResultLibpq;
+        fn PQsetResultAttrs(res: *mut PgResultLibpq, n: c_int, descs: *mut PgResAttDesc) -> c_int;
+        fn PQsetvalue(
+            res: *mut PgResultLibpq,
+            tup: c_int,
+            field: c_int,
+            value: *const c_char,
+            len: c_int,
+        ) -> c_int;
+        fn PQclear(res: *mut PgResultLibpq);
+    }
+
+    // The same, read straight from libpq's result rather than the cache.
+    #[test]
+    fn column_text_returns_a_long_live_value_whole() {
+        let stmt = make_stmt();
+        let shadow_stmt = 0x40000usize as *mut sqlite3_stmt;
+        let long = format!("{{\"pv:channelMapping\":\"{}\"}}", "M".repeat(20_000));
+        let value = CString::new(long.clone()).unwrap();
+        let col = CString::new("extra_data").unwrap();
+        let res = unsafe { PQmakeEmptyPGresult(std::ptr::null_mut(), 2) };
+        assert!(!res.is_null());
+        let mut desc = PgResAttDesc {
+            name: col.as_ptr(),
+            tableid: 0,
+            columnid: 0,
+            format: 0,
+            typid: 25,
+            typlen: -1,
+            atttypmod: -1,
+        };
+        unsafe {
+            assert_eq!(PQsetResultAttrs(res, 1, &mut desc), 1);
+            assert_eq!(
+                PQsetvalue(res, 0, 0, value.as_ptr(), long.len() as c_int),
+                1
+            );
+            let s = &mut *stmt;
+            s.is_pg = 2;
+            s.result = res;
+            s.num_cols = 1;
+            s.num_rows = 1;
+            s.current_row = 0;
+        }
+        rust_stmt_register(shadow_stmt as usize, stmt as usize);
+
+        let got = rust_my_sqlite3_column_text(shadow_stmt, 0);
+        let text = unsafe { CStr::from_ptr(got as *const c_char) }
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            text.len(),
+            long.len(),
+            "the whole value, not the buffer's 8,191 bytes"
+        );
+        assert_eq!(text, long);
+
+        rust_stmt_unregister(shadow_stmt as usize);
+        unsafe {
+            (&mut *stmt).result = std::ptr::null_mut();
+            PQclear(res);
+        }
+        rust_stmt_free(stmt);
     }
 
     #[test]
