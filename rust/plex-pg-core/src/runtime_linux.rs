@@ -826,7 +826,11 @@ std::arch::global_asm!(
 );
 
 // ────────────────────────────────────────────────────────────────────────────
-#[cfg(feature = "interpose")]
+// The preload entrypoints intentionally export SQLite's public symbol names.
+// Keep them out of Rust's unit-test executable, which links rusqlite's bundled
+// SQLite and would otherwise define the same symbols twice. Production builds
+// with the `interpose` feature still include the wrappers.
+#[cfg(all(feature = "interpose", not(test)))]
 mod ld_preload_wrappers {
     use super::*;
 
