@@ -87,6 +87,12 @@ unsafe fn write_cached_text_output(
             out_ptr = buf.as_ptr();
             return;
         }
+        if str_len >= TEXT_BUFFER_SIZE {
+            // Longer than the buffer: the cached row's own copy, which lives
+            // as long as SQLite keeps a column_text pointer (the row).
+            out_ptr = state.source_value as *const c_uchar;
+            return;
+        }
 
         let copy_len = str_len.min(TEXT_BUFFER_SIZE - 1);
         if copy_len > 0 {
