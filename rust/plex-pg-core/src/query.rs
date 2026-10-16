@@ -1255,6 +1255,44 @@ fn should_fix_int_text_mismatch(left: &Expr, right: &Expr) -> bool {
     false
 }
 
+/// An integer column compared with a string literal that is not an integer.
+///
+/// SQLite gives the literal the column's INTEGER affinity, and when it cannot
+/// be converted it stays TEXT, which sorts after every integer: `id = ''` is
+/// false, `id <> ''` true, `id < ''` true. Plex writes `metadata_items.id=''`
+/// for an empty id list (deleting a smart collection, which has no members,
+/// 2026-10-16); the CAST below made PostgreSQL refuse the statement
+/// (`invalid input syntax for type integer: ""`), so the delete answered 500
+/// after five retries. The comparison's constant value is returned instead.
+fn non_integer_literal_comparison(
+    lit: &Expr,
+    op: &BinaryOperator,
+    literal_on_left: bool,
+) -> Option<Expr> {
+    let Expr::Value(ValueWithSpan {
+        value: Value::SingleQuotedString(s),
+        span,
+    }) = lit
+    else {
+        return None;
+    };
+    if s.trim().parse::<i64>().is_ok() {
+        return None;
+    }
+    // With the literal on the right: integer < text, always.
+    let value = match op {
+        BinaryOperator::Eq => false,
+        BinaryOperator::NotEq => true,
+        BinaryOperator::Lt | BinaryOperator::LtEq => !literal_on_left,
+        BinaryOperator::Gt | BinaryOperator::GtEq => literal_on_left,
+        _ => return None,
+    };
+    Some(Expr::Value(ValueWithSpan {
+        value: Value::Boolean(value),
+        span: *span,
+    }))
+}
+
 /// Fix int/text mismatch by adding appropriate casts.
 /// Takes ownership because the caller already extracted the parts via std::mem::replace.
 fn fix_int_text_mismatch(mut left: Expr, op: BinaryOperator, mut right: Expr) -> Expr {
@@ -1306,6 +1344,9 @@ fn fix_int_text_mismatch(mut left: Expr, op: BinaryOperator, mut right: Expr) ->
         .unwrap_or(false)
         && is_string_literal(&right)
     {
+        if let Some(constant) = non_integer_literal_comparison(&right, &op, false) {
+            return constant;
+        }
         // int_col = '123' → int_col = CAST('123' AS INTEGER)
         Expr::BinaryOp {
             left: Box::new(left),
@@ -1324,6 +1365,9 @@ fn fix_int_text_mismatch(mut left: Expr, op: BinaryOperator, mut right: Expr) ->
         .unwrap_or(false)
         && is_string_literal(&left)
     {
+        if let Some(constant) = non_integer_literal_comparison(&left, &op, true) {
+            return constant;
+        }
         Expr::BinaryOp {
             left: Box::new(Expr::Cast {
                 kind: CastKind::Cast,

@@ -753,3 +753,37 @@ fn function_json_each_value_is_the_elements_text_not_its_json() {
     );
     assert_eq!(t.param_names.len(), 3, "sql={}", t.sql);
 }
+
+// Plex selects a smart collection's members with `metadata_items.id=''` when
+// the id list is empty (its delete, 2026-10-16). SQLite compares the integer
+// column with the unconvertible text and finds nothing; the CAST the shim
+// wrote made PostgreSQL refuse the statement, so the delete answered 500.
+#[test]
+fn an_integer_column_compared_with_an_empty_string_is_the_comparisons_constant() {
+    let t = translate(
+        "select distinct(metadata_items.id) from metadata_items where metadata_items.library_section_id in (1) and (metadata_items.id='' and metadata_items.metadata_type=1)",
+    )
+    .unwrap();
+    let low = t.sql.to_lowercase();
+    assert!(!low.contains("cast('' as integer)"), "sql={}", t.sql);
+    assert!(
+        low.contains("(false and metadata_items.metadata_type = 1)"),
+        "sql={}",
+        t.sql
+    );
+
+    let t = translate(
+        "select id from metadata_items where metadata_items.id<>'' and '' = metadata_items.id",
+    )
+    .unwrap();
+    let low = t.sql.to_lowercase();
+    assert!(low.contains("where true and false"), "sql={}", t.sql);
+
+    // A numeric string still casts, as before.
+    let t = translate("select id from metadata_items where metadata_items.id='123'").unwrap();
+    assert!(
+        t.sql.to_lowercase().contains("cast('123' as integer)"),
+        "sql={}",
+        t.sql
+    );
+}
