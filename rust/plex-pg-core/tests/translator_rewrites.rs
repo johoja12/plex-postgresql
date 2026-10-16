@@ -490,3 +490,25 @@ fn collate_icu_root_is_the_schemas_icu_collation() {
         t.sql
     );
 }
+
+// sqlparser parses `col MATCH 'x' AND a = 1` as `col MATCH ('x' AND a = 1)`;
+// SQLite binds MATCH like LIKE, so only the leftmost leaf is the term and
+// the conjunction stays outside plex.fts_query (2026-10-16: Plex's every
+// search answered 500 with "invalid input syntax for type boolean").
+#[test]
+fn a_match_followed_by_and_keeps_the_rest_of_the_where_outside_the_query() {
+    let t = translate("select metadata_items.id from metadata_items join fts4_metadata_titles_icu on metadata_items.id=fts4_metadata_titles_icu.rowid where fts4_metadata_titles_icu.title match 'Magnolia*' and metadata_items.library_section_id in (1) and metadata_items.metadata_type=1 limit 5").unwrap();
+    assert!(
+        t.sql.contains("@@ plex.fts_query('Magnolia*') AND metadata_items.library_section_id IN (1) AND metadata_items.metadata_type = 1 LIMIT 5"),
+        "sql={}",
+        t.sql
+    );
+    let t = translate("select id from metadata_items join fts4_metadata_titles_icu on metadata_items.id=fts4_metadata_titles_icu.rowid where fts4_metadata_titles_icu.title match ? and library_section_id=? or metadata_type=?").unwrap();
+    assert!(
+        t.sql
+            .contains("@@ plex.fts_query($1) AND library_section_id = $2 OR metadata_type = $3"),
+        "sql={}",
+        t.sql
+    );
+    assert_eq!(t.param_names.len(), 3);
+}

@@ -2011,6 +2011,23 @@ const FTS_TABLE_COLUMNS: &[(&str, &[&str])] = &[
 /// Plex bound never matched a row. A match against the view's own name
 /// searches every column it indexes.
 fn transform_fts_match(left: Expr, right: Expr) -> Expr {
+    // sqlparser gives MATCH a lower precedence than SQLite does: it reads
+    // `col MATCH 'x' AND a = 1` as `col MATCH ('x' AND a = 1)`, which put
+    // Plex's whole WHERE inside plex.fts_query and failed as a boolean cast
+    // (2026-10-16). SQLite binds MATCH like LIKE, so the term is the
+    // leftmost leaf of such a conjunction and the rest stays outside.
+    if let Expr::BinaryOp {
+        left: term_side,
+        op: op @ (BinaryOperator::And | BinaryOperator::Or),
+        right: rest,
+    } = right
+    {
+        return Expr::BinaryOp {
+            left: Box::new(transform_fts_match(left, *term_side)),
+            op,
+            right: rest,
+        };
+    }
     let text = match &left {
         Expr::Identifier(ident) => {
             let name = ident.value.to_lowercase();
