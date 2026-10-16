@@ -541,3 +541,21 @@ fn a_case_mixing_a_condition_branch_with_0_1_is_boolean_and_an_integer_case_in_a
             .unwrap();
     assert!(t.sql.contains("THEN 1 ELSE 0 END"), "sql={}", t.sql);
 }
+
+// Plex's tag search: `select distinct(tags.id) ... group by tags.id order
+// by count(*) desc`. The GROUP BY feeds the ORDER BY's aggregate, so it stays
+// and the DISTINCT goes (2026-10-16: the shim dropped the GROUP BY and
+// PostgreSQL refused "tags.id must appear in the GROUP BY clause").
+#[test]
+fn a_distinct_over_a_group_by_with_an_aggregate_keeps_the_group_by() {
+    let t = translate("select distinct(tags.id) from metadata_items join taggings on taggings.metadata_item_id=metadata_items.id join tags on tags.id=taggings.tag_id join fts4_tag_titles_icu on fts4_tag_titles_icu.rowid=tags.id where fts4_tag_titles_icu.tag match 'magnolia*' and tag_type=6 and metadata_items.library_section_id in (2) and metadata_items.metadata_type=1 group by tags.id order by count(*) desc limit 5").unwrap();
+    assert!(t.sql.starts_with("SELECT (tags.id) FROM"), "sql={}", t.sql);
+    assert!(
+        t.sql.contains("GROUP BY tags.id ORDER BY count(*) DESC"),
+        "sql={}",
+        t.sql
+    );
+    // Without an aggregate the DISTINCT makes the GROUP BY redundant, as before.
+    let t = translate("select distinct tags.id from tags group by tags.id").unwrap();
+    assert_eq!(t.sql, "SELECT DISTINCT tags.id FROM tags");
+}

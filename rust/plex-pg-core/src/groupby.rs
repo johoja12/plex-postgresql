@@ -4,6 +4,8 @@
 ///   - All non-aggregate SELECT columns must appear in GROUP BY
 ///   - SELECT DISTINCT → remove GROUP BY entirely
 ///   - ORDER BY col that has an aggregate in SELECT → replace with aggregate expr
+use std::ops::ControlFlow;
+
 use sqlparser::ast::*;
 use sqlparser::tokenizer::Span;
 
@@ -41,6 +43,56 @@ fn transform_query(q: &mut Query) {
     };
 
     let has_group_by = !gb_exprs.is_empty();
+
+    // Plex's tag search is `select distinct(tags.id) ... group by tags.id
+    // order by count(*) desc`: the GROUP BY carries the aggregate the ORDER
+    // BY reads, so it stays, and the DISTINCT goes (the grouping already
+    // makes the rows distinct, and PostgreSQL refuses a DISTINCT whose ORDER
+    // BY is not in the select list). Only a DISTINCT with no aggregate in
+    // sight makes its GROUP BY redundant (2026-10-16).
+    let uses_aggregates = if let SetExpr::Select(sel) = q.body.as_ref() {
+        let mut found = false;
+        let mut see = |e: &Expr| {
+            if let Expr::Function(f) = e {
+                if is_aggregate_name(&func_name_str(f)) {
+                    found = true;
+                }
+            }
+        };
+        for item in &sel.projection {
+            if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+                let _ = visit_expressions(e, |x| {
+                    see(x);
+                    ControlFlow::<()>::Continue(())
+                });
+            }
+        }
+        if let Some(h) = &sel.having {
+            let _ = visit_expressions(h, |x| {
+                see(x);
+                ControlFlow::<()>::Continue(())
+            });
+        }
+        if let Some(ob) = &q.order_by {
+            if let OrderByKind::Expressions(exprs) = &ob.kind {
+                for oe in exprs {
+                    let _ = visit_expressions(&oe.expr, |x| {
+                        see(x);
+                        ControlFlow::<()>::Continue(())
+                    });
+                }
+            }
+        }
+        found
+    } else {
+        false
+    };
+    let has_distinct = has_distinct && !(has_group_by && uses_aggregates);
+    if let SetExpr::Select(sel) = q.body.as_mut() {
+        if has_group_by && uses_aggregates {
+            sel.distinct = None;
+        }
+    }
 
     // Fix ORDER BY: if a bare column appears as arg of aggregate in SELECT,
     // replace the ORDER BY expression with the aggregate call.
