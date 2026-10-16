@@ -6,6 +6,7 @@
 
 use plex_pg_core::translate;
 use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 
 fn t(sql: &str) -> (String, usize) {
@@ -458,7 +459,7 @@ fn numbered(dialect: &dyn sqlparser::dialect::Dialect, sql: &str) -> (String, Ve
 #[test]
 fn placeholder_under_similar_to() {
     let (sql, names) = numbered(
-        &PostgreSqlDialect {},
+        &SQLiteDialect {},
         "SELECT * FROM t WHERE title SIMILAR TO ? AND id = ?",
     );
     assert_eq!(sql, "SELECT * FROM t WHERE title SIMILAR TO $1 AND id = $2");
@@ -468,7 +469,7 @@ fn placeholder_under_similar_to() {
 #[test]
 fn placeholder_under_is_distinct_from_and_is_not_distinct_from() {
     let (sql, names) = numbered(
-        &PostgreSqlDialect {},
+        &SQLiteDialect {},
         "SELECT * FROM t WHERE a IS DISTINCT FROM ? AND ? IS NOT DISTINCT FROM b AND c = ?",
     );
     assert_eq!(
