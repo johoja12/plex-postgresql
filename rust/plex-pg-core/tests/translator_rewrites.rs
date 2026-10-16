@@ -512,3 +512,32 @@ fn a_match_followed_by_and_keeps_the_rest_of_the_where_outside_the_query() {
     );
     assert_eq!(t.param_names.len(), 3);
 }
+
+// Plex's playlists filter: `CASE WHEN "index" = 2 THEN id IN (...) ELSE 1 END`
+// in a WHERE. The IN branch is boolean on PostgreSQL, so the 1 beside it is
+// TRUE (2026-10-16: /playlists answered 500 with "CASE types integer and
+// boolean cannot be matched"); a CASE of integer expressions read as a
+// condition compares with 0 instead.
+#[test]
+fn a_case_mixing_a_condition_branch_with_0_1_is_boolean_and_an_integer_case_in_a_condition_compares_with_zero(
+) {
+    let t = translate("select id from metadata_items where account_id = 1 and (case when metadata_items.\"index\" = 2 then metadata_items.id in (select metadata_item_id from play_queue_generators) else 1 end)").unwrap();
+    assert!(
+        t.sql.contains("THEN metadata_items.id IN (SELECT metadata_item_id FROM play_queue_generators) ELSE true END"),
+        "sql={}",
+        t.sql
+    );
+    let t = translate("select id from metadata_items where (case when metadata_type = 1 then media_item_count else 0 end) and id > 0").unwrap();
+    assert!(
+        t.sql.contains(
+            "WHERE ((CASE WHEN metadata_type = 1 THEN media_item_count ELSE 0 END) <> 0) AND id > 0"
+        ),
+        "sql={}",
+        t.sql
+    );
+    // Not a condition: the integers stay.
+    let t =
+        translate("select sum(case when metadata_type = 1 then 1 else 0 end) from metadata_items")
+            .unwrap();
+    assert!(t.sql.contains("THEN 1 ELSE 0 END"), "sql={}", t.sql);
+}

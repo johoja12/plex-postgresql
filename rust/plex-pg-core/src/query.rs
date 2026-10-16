@@ -672,10 +672,18 @@ fn transform_expr_in(expr: &mut Expr, boolean: bool) {
                 .map(|cw| &cw.result)
                 .chain(else_result.as_deref())
                 .collect();
+            // A branch that is itself a condition (`THEN id IN (...)`,
+            // Plex's playlists filter, 2026-10-16) is boolean on PostgreSQL,
+            // so the 0/1 beside it must be TRUE/FALSE too, or "CASE types
+            // integer and boolean cannot be matched". A CASE read as a
+            // condition whose branches are integer expressions is compared
+            // with 0 instead, as SQLite reads a non-zero integer.
             let all_bool_like = results
                 .iter()
-                .all(|r| is_zero_or_one_literal(r) || is_boolean_literal(r));
-            let any_boolean = results.iter().any(|r| is_boolean_literal(r));
+                .all(|r| is_zero_or_one_literal(r) || is_boolean_literal(r) || is_boolean_typed(r));
+            let any_boolean = results
+                .iter()
+                .any(|r| is_boolean_literal(r) || is_boolean_typed(r));
             if all_bool_like && (boolean || any_boolean) {
                 for cw in conditions.iter_mut() {
                     maybe_bool_value_inplace(&mut cw.result);
@@ -683,6 +691,16 @@ fn transform_expr_in(expr: &mut Expr, boolean: bool) {
                 if let Some(er) = else_result {
                     maybe_bool_value_inplace(er);
                 }
+            } else if boolean && !any_boolean {
+                let case = take_expr(expr);
+                *expr = Expr::BinaryOp {
+                    left: Box::new(Expr::Nested(Box::new(case))),
+                    op: BinaryOperator::NotEq,
+                    right: Box::new(Expr::Value(ValueWithSpan {
+                        value: Value::Number("0".to_string(), false),
+                        span: Span::empty(),
+                    })),
+                };
             }
         }
 
@@ -1692,6 +1710,51 @@ fn rewrite_json_binary_op(mut left: Expr, op: BinaryOperator, mut right: Expr) -
             value: Value::Null,
             span: Span::empty(),
         }))),
+    }
+}
+
+/// An expression PostgreSQL types as boolean: a comparison, a membership or
+/// pattern test, a logical connective, EXISTS, or a boolean literal.
+fn is_boolean_typed(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nested(inner) => is_boolean_typed(inner),
+        Expr::BinaryOp { op, .. } => matches!(
+            op,
+            BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq
+                | BinaryOperator::And
+                | BinaryOperator::Or
+                | BinaryOperator::Xor
+                | BinaryOperator::AtAt
+                | BinaryOperator::PGRegexMatch
+                | BinaryOperator::PGRegexIMatch
+                | BinaryOperator::PGRegexNotMatch
+                | BinaryOperator::PGRegexNotIMatch
+        ),
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            ..
+        }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsNotFalse(_)
+        | Expr::IsDistinctFrom(_, _)
+        | Expr::IsNotDistinctFrom(_, _)
+        | Expr::InList { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Between { .. }
+        | Expr::Like { .. }
+        | Expr::ILike { .. }
+        | Expr::SimilarTo { .. }
+        | Expr::Exists { .. } => true,
+        _ => is_boolean_literal(expr),
     }
 }
 

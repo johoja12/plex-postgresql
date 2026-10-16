@@ -238,5 +238,3 @@ CREATE INDEX "index_metadata_agent_provider_group_items_on_order" ON "metadata_a
 CREATE INDEX "index_metadata_items_on_is_adult" ON "metadata_items" ("is_adult");
 CREATE INDEX "index_library_sections_on_metadata_agent_provider_group_id" ON "library_sections" ("metadata_agent_provider_group_id");
 CREATE INDEX "index_metadata_items_on_metadata_agent_provider_group_id" ON "metadata_items" ("metadata_agent_provider_group_id");
-CREATE VIRTUAL TABLE "locations" USING rtree("id" integer, "lat_min" float, "lat_max" float, "lon_min" float, "lon_max" float)
-/* locations(id,lat_min,lat_max,lon_min,lon_max) */;

@@ -46,52 +46,19 @@ pub(super) fn pool_release_for_db_inner(db_handle: usize) {
     tls_pool_cache_clear();
 }
 
-thread_local! {
-    /// Set on the first slot a thread takes; its drop, at thread exit, gives
-    /// the thread's slots back.
-    static THREAD_SLOT_GUARD: std::cell::Cell<Option<ThreadSlotGuard>> =
-        const { std::cell::Cell::new(None) };
-}
-
-struct ThreadSlotGuard;
-
-impl Drop for ThreadSlotGuard {
-    fn drop(&mut self) {
-        // Only a pool that exists; at process exit there may be none, and a
-        // thread dying then has nothing to give back.
-        if let Some(pm) = super::POOL.get() {
-            release_slots_owned_by(pm, current_thread_id(), "thread exit");
-        }
-    }
-}
-
-/// Note that the current thread owns pool slots, so they are released when
-/// it exits.
-///
-/// Slots are owned by the thread that acquired them, and only that thread's
-/// acquires could use them. Plex's request, webhook and scanner threads are
-/// short-lived, so each left a READY slot behind that no live thread could
-/// ever take; the only way back was the reaper, once the slot had been idle
-/// for `idle_timeout` (300 s) and no handle was recorded on it -- and a
-/// handle Plex keeps open for the life of the process is recorded on it for
-/// good. The pool filled with the slots of dead threads, and a new thread
-/// got "no available slots after 5 retries".
-pub(super) fn note_thread_owns_slots() {
-    let _ = THREAD_SLOT_GUARD.try_with(|g| {
-        // Cell<Option<T>> with a non-Copy T: take, check, put back.
-        let cur = g.take();
-        if cur.is_none() {
-            g.set(Some(ThreadSlotGuard));
-        } else {
-            g.set(cur);
-        }
-    });
-}
+// A thread's slots are NOT given back when the thread exits (tried on
+// 2026-10-16 as clusterplex.31 and reverted the same day): Plex keeps
+// statements prepared on the slot's connection alive past the thread that
+// made them, so a released slot went to another thread while those
+// statements still streamed on it, and /library/sections answered 500 with
+// std::exception. The idle reaper, which checks for open handles, is the
+// only release besides sqlite3_close.
 
 /// Give back every READY slot `thread_id` owns: a stream still open on it is
 /// cancelled and drained, a transaction still open is rolled back (the
 /// thread that began it is gone, so nothing can commit it), and the slot
 /// goes FREE for the next thread. The connection stays, for reuse.
+#[cfg(test)]
 pub(crate) fn release_slots_owned_by(pm: &super::PoolManager, thread_id: u64, why: &str) -> usize {
     let mut released = 0usize;
     for i in 0..pm.pool_size() {

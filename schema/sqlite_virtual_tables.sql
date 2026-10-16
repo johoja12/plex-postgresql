@@ -25,3 +25,9 @@ CREATE VIRTUAL TABLE fts4_tag_titles USING fts4(content="tags", tag)
 /* fts4_tag_titles(tag) */;
 CREATE VIRTUAL TABLE fts4_metadata_titles_icu USING fts4(content="metadata_items", title, title_sort, original_title, tokenize=collating 'root@colStrength=primary;colAlternate=shifted');
 CREATE VIRTUAL TABLE fts4_tag_titles_icu USING fts4(content="tags", tag, tokenize=collating 'root@colStrength=primary;colAlternate=shifted');
+
+-- The rtree builds in the shadow, but Plex's PRAGMA table_info('locations')
+-- then read "undersize RTree blobs in locations_node" (SQLITE_CORRUPT_VTAB,
+-- 2026-10-16): the table's reads are answered by PostgreSQL's plain
+-- locations table, so the shadow keeps no rtree at all.
+CREATE VIRTUAL TABLE "locations" USING rtree("id" integer, "lat_min" float, "lat_max" float, "lon_min" float, "lon_max" float);
