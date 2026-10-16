@@ -23,6 +23,7 @@ use value_binds::{bind_null_impl, bind_value_impl};
 const SQLITE_OK: c_int = 0;
 const SQLITE_ERROR: c_int = 1;
 const SQLITE_MISUSE: c_int = 21;
+const SQLITE_RANGE: c_int = 25;
 
 const SQLITE_INTEGER: c_int = 1;
 const SQLITE_FLOAT: c_int = 2;

@@ -2,6 +2,7 @@ use super::*;
 use crate::db_interpose_bind::support::{
     begin_bind, bytes_to_pg_hex, clear_param_value, contains_binary_bytes,
     invoke_destructor_if_custom, is_pg_routed_noncached, mapped_param_index, retry_on_misuse,
+    routed_bind_rc,
 };
 use crate::log_debug_lazy;
 
@@ -207,7 +208,7 @@ pub(super) fn bind_text_impl(
         if !val.is_null() {
             unsafe { invoke_destructor_if_custom(val as *const c_void, destructor) };
         }
-        SQLITE_OK
+        unsafe { routed_bind_rc(pg_stmt, p_stmt, idx) }
     } else {
         let mut rc = get_orig_sqlite3_bind_text()
             .map(|f| unsafe { f(p_stmt, idx, val, n_bytes, destructor) })
@@ -269,7 +270,7 @@ pub(super) fn bind_blob_impl(
         if !val.is_null() {
             unsafe { invoke_destructor_if_custom(val, destructor) };
         }
-        SQLITE_OK
+        unsafe { routed_bind_rc(pg_stmt, p_stmt, idx) }
     } else {
         let mut rc = get_orig_sqlite3_bind_blob()
             .map(|f| unsafe { f(p_stmt, idx, val, n_bytes, destructor) })
@@ -317,7 +318,7 @@ pub(super) fn bind_blob64_impl(
         if !val.is_null() {
             unsafe { invoke_destructor_if_custom(val, destructor) };
         }
-        SQLITE_OK
+        unsafe { routed_bind_rc(pg_stmt, p_stmt, idx) }
     } else {
         let mut rc = get_orig_sqlite3_bind_blob64()
             .map(|f| unsafe { f(p_stmt, idx, val, n_bytes, destructor) })
@@ -413,7 +414,7 @@ pub(super) fn bind_text64_impl(
         if !val.is_null() {
             unsafe { invoke_destructor_if_custom(val as *const c_void, destructor) };
         }
-        SQLITE_OK
+        unsafe { routed_bind_rc(pg_stmt, p_stmt, idx) }
     } else {
         let mut rc = get_orig_sqlite3_bind_text64()
             .map(|f| unsafe { f(p_stmt, idx, val, n_bytes, destructor, encoding) })
