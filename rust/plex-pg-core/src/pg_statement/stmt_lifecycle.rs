@@ -19,10 +19,19 @@ unsafe fn clear_streaming_state(stmt_ptr: *mut PgStmt, stmt: &mut PgStmt, op_nam
     }
 
     if pg_pool_validate_connection(stmt.streaming_conn()) == 0 {
-        log_error(&format!(
-            "{}: streaming_conn invalid, skipping cancel/drain (stmt={:p})",
-            op_name, stmt_ptr
-        ));
+        // Handled below (the flag is cleared and the statement lets go), so
+        // this is information, not an error: what it says is where the
+        // connection went, which is what a burst of these on talos
+        // (2026-10-16, during collection writes) could not tell.
+        log_info_lazy!(
+            "{}: streaming_conn not in a READY slot ({}), skipping cancel/drain (stmt={:p})",
+            op_name,
+            crate::pg_client::pool().describe_connection(
+                stmt.streaming_conn() as *const c_void,
+                crate::pg_client::current_thread_id_for_log()
+            ),
+            stmt_ptr
+        );
         // The connection is no longer in a READY slot, but this statement
         // still holds a reference to the struct, and the flag this statement
         // set on it was never cleared here: the next thread to be handed the

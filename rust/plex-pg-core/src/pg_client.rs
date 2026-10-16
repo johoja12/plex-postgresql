@@ -65,6 +65,7 @@ use registry::{ConnectionRegistry, DbToPool};
 pub use registry_api::*;
 use support::{cbuf_to_string, conn_config, write_str_to_cbuf};
 pub(crate) use support::{ConnConfig, CLIENT_INIT};
+pub(crate) use threading::current_thread_id as current_thread_id_for_log;
 
 // ─── Pool algorithm helpers ──────────────────────────────────────────────────
 

@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `pg_stmt_clear_result`'s "streaming_conn invalid" line, a burst of which followed every collection write on talos under clusterplex.33, is INFO rather than ERROR (the flag is cleared and the statement lets go either way) and now says where the connection is: its pool slot, the slot's state, whether this thread owns it and the handle references on it, or "not pooled".
+
 ### v1.3.17-clusterplex.33 (2026-10-16)
 
 The clusterplex.31 regressions seen on talos, each reproduced on the standalone rig (`docker-compose.standalone.yml`) and fixed: a MATCH followed by AND or OR keeps the conjunction outside `plex.fts_query`; no pool slot is given back at thread exit; a CASE whose branch is a condition makes its 0/1 booleans and an integer CASE read as a condition compares with 0; the rtree stays out of the shadow schema; a DISTINCT keeps a GROUP BY an aggregate reads; `errcode`/`errmsg` on a redirected handle never read the shadow SQLite's stale error, and a successful step clears the connection's last error (Plex polls errcode on its error path, and one failed statement used to make every later request throw). The migration hands its objects to the `plex` role when applied as a superuser.

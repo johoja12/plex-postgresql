@@ -228,6 +228,37 @@ impl PoolManager {
         None
     }
 
+    /// Where a connection pointer sits in the pool, for a log line: its slot,
+    /// the slot's state, whether this thread owns it and whether a handle is
+    /// still recorded on it; "not pooled" when no slot holds it.
+    pub fn describe_connection(&self, conn_ptr: *const c_void, this_thread: u64) -> String {
+        match self.find_connection_slot(conn_ptr) {
+            None => "not pooled".to_string(),
+            Some((i, state)) => {
+                let state = match state {
+                    SLOT_FREE => "FREE",
+                    SLOT_RESERVED => "RESERVED",
+                    SLOT_READY => "READY",
+                    SLOT_RECONNECTING => "RECONNECTING",
+                    SLOT_ERROR => "ERROR",
+                    _ => "?",
+                };
+                let owner = self.slots[i].owner_thread.load(Ordering::Acquire);
+                format!(
+                    "slot {} {} owner={} refs={}",
+                    i,
+                    state,
+                    if owner == this_thread {
+                        "this thread"
+                    } else {
+                        "another thread"
+                    },
+                    self.db_to_pool.references(i)
+                )
+            }
+        }
+    }
+
     /// Check if a connection pointer is in any READY pool slot.
     pub fn validate_connection(&self, conn_ptr: *const c_void) -> bool {
         matches!(self.find_connection_slot(conn_ptr), Some((_, SLOT_READY)))

@@ -26,7 +26,7 @@ pub(super) fn u64_to_pthread(id: u64) -> libc::pthread_t {
     t
 }
 
-pub(super) fn current_thread_id() -> u64 {
+pub(crate) fn current_thread_id() -> u64 {
     pthread_to_u64(unsafe { libc::pthread_self() })
 }
 
