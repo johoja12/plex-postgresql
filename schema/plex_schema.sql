@@ -26,6 +26,306 @@ CREATE SCHEMA plex;
 
 
 --
+-- Name: pg_trgm; Type: EXTENSION; Schema: -; Owner: -
+--
+
+-- The entrypoints create pg_trgm before loading this file, in the first
+-- schema of their search_path (plex under PGUSER=plex, where
+-- plex.gin_trgm_ops below comes from); both are trusted extensions, so
+-- the database owner may install them. Every new object below resolves
+-- the extensions' schema from pg_extension rather than assuming one.
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA plex;
+
+
+--
+-- Name: unaccent; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA plex;
+
+
+--
+-- Name: nocase, icu_root; Type: COLLATION; Schema: plex; Owner: -
+--
+
+-- Stock Plex declares tags.tag, metadata_items.title_sort and
+-- library_sections.name_sort COLLATE NOCASE and sorts with its ICU
+-- `icu_root` collation. plex.nocase is ICU root at strength 2 (case folds,
+-- accents still count) and non-deterministic, so `=`, IN, GROUP BY, DISTINCT
+-- and btree lookups on those columns are case-insensitive as under SQLite.
+-- plex.icu_root is ICU root at default strength, for ORDER BY ... COLLATE.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_collation c JOIN pg_namespace n ON n.oid = c.collnamespace
+                   WHERE n.nspname = 'plex' AND c.collname = 'nocase') THEN
+        BEGIN
+            CREATE COLLATION plex.nocase (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'plex.nocase not created (%: %); tags.tag, metadata_items.title_sort and library_sections.name_sort stay case-sensitive', SQLSTATE, SQLERRM;
+        END;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_collation c JOIN pg_namespace n ON n.oid = c.collnamespace
+                   WHERE n.nspname = 'plex' AND c.collname = 'icu_root') THEN
+        BEGIN
+            CREATE COLLATION plex.icu_root (provider = icu, locale = 'und');
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'plex.icu_root not created (%: %)', SQLSTATE, SQLERRM;
+        END;
+    END IF;
+END $$;
+
+--
+-- Name: fold(text); Type: FUNCTION; Schema: plex; Owner: -
+--
+
+-- plex.fold(text): unaccent(lower(x)), the one normalisation both sides of a
+-- MATCH go through. unaccent() itself is STABLE (its dictionary can be
+-- reloaded), so it is wrapped in an IMMUTABLE SQL function naming the
+-- dictionary explicitly, which lets the GIN indexes below be built over it.
+-- If the unaccent rules file ever changes, REINDEX those four indexes.
+-- The result is COLLATE "C": a non-deterministic collation (plex.nocase on
+-- tags.tag and title_sort) would otherwise ride through lower() into the
+-- result and refuse LIKE, ~ and regexp_* on it; folded text is compared
+-- byte for byte, which is what a normalisation is for.
+DO $$
+DECLARE
+    ns text;
+BEGIN
+    SELECT n.nspname INTO ns FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+     WHERE e.extname = 'unaccent';
+    IF ns IS NULL THEN
+        RAISE EXCEPTION 'extension unaccent is not installed';
+    END IF;
+    EXECUTE format(
+        'CREATE OR REPLACE FUNCTION plex.fold(text) RETURNS text LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS %L',
+        format('SELECT %I.unaccent(%L::regdictionary, lower($1)) COLLATE "C"', ns, ns || '.unaccent'));
+END $$;
+
+--
+-- Name: fts_lexemes(text, boolean), fts_phrase(text, boolean), fts_term(text, boolean), fts_query(text); Type: FUNCTION; Schema: plex; Owner: -
+--
+
+-- plex.fts_lexemes(text, boolean): the lexemes to_tsvector('simple', plex.fold(x))
+-- would make of x, in order of position, as one tsquery fragment joined by &
+-- (with :* on each when prefix is true). Using the parser itself keeps a
+-- query's tokens identical to the indexed text's, hyphens, numbers and all.
+CREATE OR REPLACE FUNCTION plex.fts_lexemes(src text, prefix boolean)
+RETURNS text
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+AS $$
+    SELECT string_agg(
+               '''' || replace(replace(l.lexeme, '\', '\\'), '''', '''''') || ''''
+               || CASE WHEN prefix THEN ':*' ELSE '' END,
+               ' & ' ORDER BY l.positions[1])
+      FROM unnest(to_tsvector('simple', plex.fold(src))) AS l
+$$;
+
+-- plex.fts_phrase(text): the same lexemes chained as a phrase, <N> carrying
+-- the parser's own position gaps so a hyphenated word (which the parser
+-- emits whole and in parts) still matches the vector it produced.
+CREATE OR REPLACE FUNCTION plex.fts_phrase(src text, prefix boolean)
+RETURNS text
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+AS $$
+    WITH w AS (
+        SELECT l.lexeme, p.pos
+          FROM unnest(to_tsvector('simple', plex.fold(src))) AS l,
+               unnest(l.positions) AS p(pos)
+    ), o AS (
+        SELECT lexeme, pos,
+               pos - lag(pos) OVER (ORDER BY pos, lexeme) AS gap,
+               row_number() OVER (ORDER BY pos DESC, lexeme DESC) AS from_end
+          FROM w
+    )
+    SELECT string_agg(
+               CASE WHEN gap IS NULL THEN '' ELSE ' <' || gap || '> ' END
+               || '''' || replace(replace(lexeme, '\', '\\'), '''', '''''') || ''''
+               || CASE WHEN prefix AND from_end = 1 THEN ':*' ELSE '' END,
+               '' ORDER BY pos, lexeme)
+      FROM o
+$$;
+
+-- plex.fts_term(text, boolean): one term of an FTS4 query as a tsquery
+-- fragment, or NULL when nothing is left of it. A leading - negates a
+-- plain term; a column filter (title:, title_sort:, original_title:, tag:)
+-- is dropped, the column being whatever the caller matches against; a
+-- trailing * makes a prefix match. A phrase chains its lexemes.
+CREATE OR REPLACE FUNCTION plex.fts_term(tok text, is_phrase boolean)
+RETURNS text
+LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE
+AS $$
+DECLARE
+    neg    boolean := false;
+    prefix boolean;
+    piece  text;
+BEGIN
+    IF NOT is_phrase THEN
+        IF left(tok, 1) = '-' THEN
+            neg := true;
+            tok := substr(tok, 2);
+        END IF;
+        tok := regexp_replace(tok, '^(title|title_sort|original_title|tag):', '');
+    END IF;
+    prefix := right(tok, 1) = '*';
+    tok := rtrim(tok, '*');
+    piece := CASE WHEN is_phrase THEN plex.fts_phrase(tok, prefix)
+                  ELSE plex.fts_lexemes(tok, prefix) END;
+    IF piece IS NULL OR piece = '' THEN
+        RETURN NULL;
+    END IF;
+    IF position(' ' IN piece) > 0 THEN
+        piece := '(' || piece || ')';
+    END IF;
+    IF neg THEN
+        piece := '!' || piece;
+    END IF;
+    RETURN piece;
+END
+$$;
+
+-- plex.fts_query(text): FTS4's query syntax, as Plex writes it, to a tsquery.
+--   * surrounding whitespace and any enclosing (...) pairs are stripped;
+--   * "quoted words" are a phrase (<-> chained; a trailing * prefixes its
+--     last word); ( and ) elsewhere only separate terms;
+--   * terms are split on whitespace, each folded through plex.fold and
+--     tokenised by the 'simple' parser (plex.fts_lexemes), so punctuation
+--     never breaks the query; a term ending in * is a prefix match (token:*);
+--   * OR (upper case, as FTS4 requires) is |, and binds tighter than the
+--     implicit AND between terms, as in FTS4: a b OR c is a & (b | c);
+--   * a leading - negates the term (!);
+--   * nothing left yields a query no row matches.
+-- The assembled string, every lexeme single-quoted, is cast with ::tsquery
+-- rather than passed to to_tsquery(): to_tsquery() re-parses a quoted
+-- token, which would split a lexeme the parser already produced
+-- ('foo-bar':* becomes 'foo-bar':* <-> 'foo':* <-> 'bar':*); the cast takes
+-- the lexemes as they are.
+CREATE OR REPLACE FUNCTION plex.fts_query(term text)
+RETURNS tsquery
+LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE
+AS $$
+DECLARE
+    s            text := btrim(term);
+    n            int;
+    i            int := 1;
+    c            text;
+    tok          text := '';
+    in_phrase    boolean := false;
+    do_flush     boolean;
+    flush_phrase boolean := false;
+    pending_or   boolean := false;
+    piece        text;
+    cur          text := NULL;      -- the OR group being built
+    groups       text[] := '{}';    -- finished OR groups, joined by &
+    q            text;
+BEGIN
+    WHILE length(s) >= 2 AND left(s, 1) = '(' AND right(s, 1) = ')' LOOP
+        s := btrim(substr(s, 2, length(s) - 2));
+    END LOOP;
+    n := length(s);
+
+    -- one past the end closes an open phrase, or ends the last term
+    WHILE i <= n + 1 LOOP
+        c := CASE WHEN i <= n THEN substr(s, i, 1)
+                  WHEN in_phrase THEN '"'
+                  ELSE ' ' END;
+        do_flush := false;
+        IF in_phrase THEN
+            IF c = '"' THEN
+                do_flush := true;
+                flush_phrase := true;
+                in_phrase := false;
+            ELSE
+                tok := tok || c;
+            END IF;
+        ELSIF c = '"' THEN
+            do_flush := true;
+            flush_phrase := false;
+            in_phrase := true;
+        ELSIF c ~ '^\s$' OR c IN ('(', ')') THEN
+            do_flush := true;
+            flush_phrase := false;
+        ELSE
+            tok := tok || c;
+        END IF;
+
+        IF do_flush AND tok <> '' THEN
+            IF tok = 'OR' AND NOT flush_phrase THEN
+                pending_or := cur IS NOT NULL;
+            ELSE
+                piece := plex.fts_term(tok, flush_phrase);
+                IF piece IS NOT NULL THEN
+                    IF cur IS NULL THEN
+                        cur := piece;
+                    ELSIF pending_or THEN
+                        cur := cur || ' | ' || piece;
+                    ELSE
+                        groups := groups || cur;
+                        cur := piece;
+                    END IF;
+                END IF;
+                pending_or := false;
+            END IF;
+        END IF;
+        IF do_flush THEN
+            tok := '';
+        END IF;
+        i := i + 1;
+    END LOOP;
+
+    IF cur IS NOT NULL THEN
+        groups := groups || cur;
+    END IF;
+    IF cardinality(groups) = 0 THEN
+        -- a query no row matches, without the empty-tsquery notice
+        RETURN '''plex.fts_query.nothing'' & !''plex.fts_query.nothing'''::tsquery;
+    END IF;
+    SELECT string_agg(CASE WHEN position(' | ' IN g) > 0 THEN '(' || g || ')' ELSE g END, ' & ')
+      INTO q
+      FROM unnest(groups) AS g;
+    RETURN q::tsquery;
+END
+$$;
+
+
+--
+-- Name: spellfix_words(text), spellfix_vocab_add(); Type: FUNCTION; Schema: plex; Owner: -
+--
+
+-- The words of one title or tag: folded, split on whitespace and
+-- punctuation, two characters or longer.
+CREATE OR REPLACE FUNCTION plex.spellfix_words(src text)
+RETURNS SETOF text
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+AS $$
+    SELECT DISTINCT w
+      FROM regexp_split_to_table(plex.fold(src) COLLATE "C", '[\s[:punct:]]+') AS w
+     WHERE length(w) >= 2
+$$;
+
+CREATE OR REPLACE FUNCTION plex.spellfix_vocab_add()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    src text;
+BEGIN
+    IF TG_TABLE_NAME = 'tags' THEN
+        src := NEW.tag;
+    ELSE
+        src := NEW.title;
+    END IF;
+    IF src IS NOT NULL AND src <> '' THEN
+        INSERT INTO plex.spellfix_vocab (word)
+        SELECT w FROM plex.spellfix_words(src) AS w
+        ON CONFLICT DO NOTHING;
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+
+
+--
 -- Name: clean_old_statistics_bandwidth(); Type: FUNCTION; Schema: plex; Owner: -
 --
 
@@ -125,137 +425,6 @@ BEGIN
     END LOOP;
     
     RETURN total_deleted;
-END;
-$$;
-
-
---
--- Name: fix_orphan_season_on_episode_insert(); Type: FUNCTION; Schema: plex; Owner: -
---
-
-CREATE FUNCTION plex.fix_orphan_season_on_episode_insert() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-DECLARE
-    season_parent_id INTEGER;
-    episode_file TEXT;
-    show_name TEXT;
-    found_show_id INTEGER;
-    season_library_id INTEGER;
-BEGIN
-    IF NEW.metadata_type != 4 OR NEW.parent_id IS NULL THEN
-        RETURN NEW;
-    END IF;
-    
-    SELECT parent_id, library_section_id 
-    INTO season_parent_id, season_library_id
-    FROM plex.metadata_items 
-    WHERE id = NEW.parent_id AND metadata_type = 3;
-    
-    IF season_parent_id IS NOT NULL THEN
-        RETURN NEW;
-    END IF;
-    
-    SELECT mp.file INTO episode_file
-    FROM plex.media_items med
-    JOIN plex.media_parts mp ON mp.media_item_id = med.id
-    WHERE med.metadata_item_id = NEW.id
-    LIMIT 1;
-    
-    IF episode_file IS NULL THEN
-        RETURN NEW;
-    END IF;
-    
-    show_name := TRIM((regexp_match(episode_file, '/([^/]+)\s*\(\d{4}\)'))[1]);
-    
-    IF show_name IS NULL THEN
-        RETURN NEW;
-    END IF;
-    
-    -- ALLEEN dezelfde library
-    SELECT id INTO found_show_id
-    FROM plex.metadata_items
-    WHERE metadata_type = 2
-      AND library_section_id = season_library_id
-      AND title ILIKE show_name
-    LIMIT 1;
-    
-    IF found_show_id IS NOT NULL THEN
-        UPDATE plex.metadata_items 
-        SET parent_id = found_show_id 
-        WHERE id = NEW.parent_id AND parent_id IS NULL;
-        
-        RAISE NOTICE 'Fixed orphan season % -> show %', NEW.parent_id, found_show_id;
-    END IF;
-    
-    RETURN NEW;
-END;
-$$;
-
-
---
--- Name: fix_orphan_season_on_media_part_insert(); Type: FUNCTION; Schema: plex; Owner: -
---
-
-CREATE FUNCTION plex.fix_orphan_season_on_media_part_insert() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-DECLARE
-    episode_id INTEGER;
-    season_id INTEGER;
-    season_parent_id INTEGER;
-    season_library_id INTEGER;
-    show_name TEXT;
-    found_show_id INTEGER;
-BEGIN
-    SELECT med.metadata_item_id INTO episode_id
-    FROM plex.media_items med
-    WHERE med.id = NEW.media_item_id;
-    
-    IF episode_id IS NULL THEN
-        RETURN NEW;
-    END IF;
-    
-    SELECT mi.parent_id INTO season_id
-    FROM plex.metadata_items mi
-    WHERE mi.id = episode_id AND mi.metadata_type = 4;
-    
-    IF season_id IS NULL THEN
-        RETURN NEW;
-    END IF;
-    
-    SELECT parent_id, library_section_id 
-    INTO season_parent_id, season_library_id
-    FROM plex.metadata_items 
-    WHERE id = season_id AND metadata_type = 3;
-    
-    IF season_parent_id IS NOT NULL THEN
-        RETURN NEW;
-    END IF;
-    
-    show_name := TRIM((regexp_match(NEW.file, '/([^/]+)\s*\(\d{4}\)'))[1]);
-    
-    IF show_name IS NULL THEN
-        RETURN NEW;
-    END IF;
-    
-    -- ALLEEN dezelfde library
-    SELECT id INTO found_show_id
-    FROM plex.metadata_items
-    WHERE metadata_type = 2
-      AND library_section_id = season_library_id
-      AND title ILIKE show_name
-    LIMIT 1;
-    
-    IF found_show_id IS NOT NULL THEN
-        UPDATE plex.metadata_items 
-        SET parent_id = found_show_id 
-        WHERE id = season_id AND parent_id IS NULL;
-        
-        RAISE NOTICE 'Fixed orphan season % -> show %', season_id, found_show_id;
-    END IF;
-    
-    RETURN NEW;
 END;
 $$;
 
@@ -395,138 +564,6 @@ $$;
 
 
 --
--- Name: metadata_items_search_trigger(); Type: FUNCTION; Schema: plex; Owner: -
---
-
-CREATE FUNCTION plex.metadata_items_search_trigger() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-    NEW.search_vector :=
-        setweight(to_tsvector('simple', COALESCE(NEW.title, '')), 'A') ||
-        setweight(to_tsvector('simple', COALESCE(NEW.title_sort, '')), 'B') ||
-        setweight(to_tsvector('simple', COALESCE(NEW.original_title, '')), 'B');
-    RETURN NEW;
-END;
-$$;
-
-
---
--- Name: prevent_cross_section_parent(); Type: FUNCTION; Schema: plex; Owner: -
---
-
-CREATE FUNCTION plex.prevent_cross_section_parent() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-DECLARE
-    parent_section_id INTEGER;
-BEGIN
-    -- If parent_id is NULL, allow it
-    IF NEW.parent_id IS NULL THEN
-        RETURN NEW;
-    END IF;
-    
-    -- Get parent's library_section_id
-    SELECT library_section_id INTO parent_section_id
-    FROM plex.metadata_items
-    WHERE id = NEW.parent_id;
-    
-    -- If parent not found, allow (will fail on FK constraint anyway)
-    IF parent_section_id IS NULL THEN
-        RETURN NEW;
-    END IF;
-    
-    -- Check if sections match
-    IF NEW.library_section_id != parent_section_id THEN
-        RAISE EXCEPTION 'Cross-section parent link prevented: child section % cannot have parent in section %', 
-            NEW.library_section_id, parent_section_id
-            USING HINT = 'Parent and child must be in the same library section',
-                  ERRCODE = '23514';  -- check_violation
-    END IF;
-    
-    RETURN NEW;
-END;
-$$;
-
-
---
--- Name: prevent_self_referential_parent(); Type: FUNCTION; Schema: plex; Owner: -
---
-
-CREATE FUNCTION plex.prevent_self_referential_parent() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-DECLARE
-    current_id INTEGER;
-    parent_type INTEGER;
-    depth INTEGER := 0;
-    max_depth INTEGER := 20;
-BEGIN
-    -- Skip if no parent_id
-    IF NEW.parent_id IS NULL THEN
-        RETURN NEW;
-    END IF;
-
-    -- Rule 1: Item cannot be its own parent
-    IF NEW.parent_id = NEW.id THEN
-        NEW.parent_id := NULL;
-        RAISE WARNING 'Prevented self-referential parent for item %', NEW.id;
-        RETURN NEW;
-    END IF;
-    
-    -- Get parent's metadata_type
-    SELECT metadata_type INTO parent_type FROM metadata_items WHERE id = NEW.parent_id;
-    
-    -- Rule 2: Validate parent-child type relationships
-    -- Valid: season(3)->show(2), episode(4)->season(3), episode(4)->episode(4), any->collection(18)
-    IF parent_type IS NOT NULL AND parent_type != 18 THEN  -- 18 = collection, always allowed as parent
-        CASE NEW.metadata_type
-            WHEN 2 THEN  -- show: should NOT have a parent (except collection)
-                RAISE WARNING 'Prevented: Show % cannot have non-collection parent (type %)', NEW.id, parent_type;
-                NEW.parent_id := NULL;
-                RETURN NEW;
-            WHEN 3 THEN  -- season: parent must be show(2)
-                IF parent_type != 2 THEN
-                    RAISE WARNING 'Prevented: Season % must have show as parent, not type %', NEW.id, parent_type;
-                    NEW.parent_id := NULL;
-                    RETURN NEW;
-                END IF;
-            WHEN 4 THEN  -- episode: parent must be season(3) or episode(4)
-                IF parent_type NOT IN (3, 4) THEN
-                    RAISE WARNING 'Prevented: Episode % must have season/episode as parent, not type %', NEW.id, parent_type;
-                    NEW.parent_id := NULL;
-                    RETURN NEW;
-                END IF;
-            ELSE
-                NULL;  -- Other types: no restriction
-        END CASE;
-    END IF;
-    
-    -- Rule 3: Prevent direct circular reference (A -> B -> A)
-    IF EXISTS (SELECT 1 FROM metadata_items WHERE id = NEW.parent_id AND parent_id = NEW.id) THEN
-        RAISE WARNING 'Prevented circular reference: % <-> %', NEW.id, NEW.parent_id;
-        NEW.parent_id := NULL;
-        RETURN NEW;
-    END IF;
-    
-    -- Rule 4: Prevent deeper circular references
-    current_id := NEW.parent_id;
-    WHILE current_id IS NOT NULL AND depth < max_depth LOOP
-        IF current_id = NEW.id THEN
-            RAISE WARNING 'Prevented circular chain at depth %: id=%', depth, NEW.id;
-            NEW.parent_id := NULL;
-            RETURN NEW;
-        END IF;
-        SELECT parent_id INTO current_id FROM metadata_items WHERE id = current_id;
-        depth := depth + 1;
-    END LOOP;
-    
-    RETURN NEW;
-END;
-$$;
-
-
---
 -- Name: reject_empty_statistics(); Type: FUNCTION; Schema: plex; Owner: -
 --
 
@@ -611,20 +648,6 @@ BEGIN
         WHEN 'bytea' THEN RETURN 'blob';
         ELSE RETURN 'text';
     END CASE;
-END;
-$$;
-
-
---
--- Name: tags_search_trigger(); Type: FUNCTION; Schema: plex; Owner: -
---
-
-CREATE FUNCTION plex.tags_search_trigger() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-    NEW.search_vector := to_tsvector('simple', COALESCE(NEW.tag, ''));
-    RETURN NEW;
 END;
 $$;
 
@@ -1075,7 +1098,7 @@ CREATE TABLE plex.metadata_items (
     guid text,
     media_item_count integer,
     title text,
-    title_sort text,
+    title_sort text COLLATE plex.nocase,
     original_title text,
     studio text,
     rating double precision,
@@ -1120,10 +1143,7 @@ CREATE TABLE plex.metadata_items (
     user_clear_logo_url text,
     user_square_art_url text,
     is_adult integer,
-    metadata_agent_provider_group_id integer,
-    search_vector tsvector,
-    subtype integer GENERATED ALWAYS AS ((rating_count - ((rating_count / 100) * 100))) STORED,
-    title_fts tsvector
+    metadata_agent_provider_group_id integer
 );
 ALTER TABLE ONLY plex.metadata_items ALTER COLUMN library_section_id SET STATISTICS 200;
 ALTER TABLE ONLY plex.metadata_items ALTER COLUMN metadata_type SET STATISTICS 200;
@@ -1133,10 +1153,19 @@ ALTER TABLE ONLY plex.metadata_items ALTER COLUMN metadata_type SET STATISTICS 2
 -- Name: fts4_metadata_titles; Type: VIEW; Schema: plex; Owner: -
 --
 
+-- The views are what Plex's `fts4_metadata_titles[_icu]` and
+-- `fts4_tag_titles[_icu]` resolve to. Every column Plex names exists:
+-- rowid (and FTS4's docid alias), title, title_sort, original_title for the
+-- metadata views, rowid, docid, tag (and tag AS title, which the old views
+-- exposed) for the tag views. A MATCH is rewritten to
+-- to_tsvector('simple', plex.fold(<col>)) @@ plex.fts_query(<term>), which
+-- the planner serves from the expression indexes on the base tables.
 CREATE VIEW plex.fts4_metadata_titles AS
  SELECT metadata_items.id AS rowid,
+    metadata_items.id AS docid,
     metadata_items.title,
-    metadata_items.title_fts
+    metadata_items.title_sort,
+    metadata_items.original_title
    FROM plex.metadata_items;
 
 
@@ -1146,8 +1175,10 @@ CREATE VIEW plex.fts4_metadata_titles AS
 
 CREATE VIEW plex.fts4_metadata_titles_icu AS
  SELECT metadata_items.id AS rowid,
+    metadata_items.id AS docid,
     metadata_items.title,
-    metadata_items.title_fts
+    metadata_items.title_sort,
+    metadata_items.original_title
    FROM plex.metadata_items;
 
 
@@ -1158,7 +1189,7 @@ CREATE VIEW plex.fts4_metadata_titles_icu AS
 CREATE TABLE plex.tags (
     id integer NOT NULL,
     metadata_item_id integer,
-    tag text,
+    tag text COLLATE plex.nocase,
     tag_type integer,
     user_thumb_url text,
     user_art_url text,
@@ -1168,8 +1199,7 @@ CREATE TABLE plex.tags (
     tag_value integer,
     extra_data text,
     key text,
-    parent_id integer,
-    search_vector tsvector
+    parent_id integer
 );
 
 
@@ -1179,8 +1209,9 @@ CREATE TABLE plex.tags (
 
 CREATE VIEW plex.fts4_tag_titles AS
  SELECT tags.id AS rowid,
-    tags.tag AS title,
-    tags.search_vector AS title_fts
+    tags.id AS docid,
+    tags.tag,
+    tags.tag AS title
    FROM plex.tags;
 
 
@@ -1190,9 +1221,61 @@ CREATE VIEW plex.fts4_tag_titles AS
 
 CREATE VIEW plex.fts4_tag_titles_icu AS
  SELECT tags.id AS rowid,
-    tags.tag AS title,
-    tags.search_vector AS title_fts
+    tags.id AS docid,
+    tags.tag,
+    tags.tag AS title
    FROM plex.tags;
+
+
+--
+-- Name: spellfix_vocab; Type: TABLE; Schema: plex; Owner: -
+--
+
+-- spellfix1's job -- the closest known words to a misspelt one -- is
+-- answered by pg_trgm similarity over plex.spellfix_vocab, the distinct
+-- folded words of metadata_items.title and tags.tag, kept by triggers.
+-- Words are only ever added (a deleted title's words stay), which keeps the
+-- triggers to one INSERT ... ON CONFLICT DO NOTHING per new or retitled row.
+CREATE TABLE plex.spellfix_vocab (
+    word text NOT NULL,
+    CONSTRAINT spellfix_vocab_pkey PRIMARY KEY (word)
+);
+
+
+--
+-- Name: idx_spellfix_vocab_trgm, spellfix_suggest(text, integer); Type: INDEX; Schema: plex; Owner: -
+--
+
+DO $$
+DECLARE
+    ns text;
+BEGIN
+    SELECT n.nspname INTO ns FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+     WHERE e.extname = 'pg_trgm';
+    IF ns IS NULL THEN
+        RAISE EXCEPTION 'extension pg_trgm is not installed';
+    END IF;
+    EXECUTE format('CREATE INDEX IF NOT EXISTS idx_spellfix_vocab_trgm ON plex.spellfix_vocab USING gin (word %I.gin_trgm_ops)', ns);
+    -- plex.spellfix_suggest(term, n): the n vocabulary words most similar
+    -- to term, as spellfix1's (word, distance, score): distance and score
+    -- are 100 * (1 - trigram similarity), 0 for the word itself. The %
+    -- operator keeps the lookup on the trigram index and under
+    -- pg_trgm.similarity_threshold.
+    EXECUTE format($f$
+        CREATE OR REPLACE FUNCTION plex.spellfix_suggest(term text, n integer DEFAULT 5)
+        RETURNS TABLE(word text, distance integer, score integer)
+        LANGUAGE sql STABLE STRICT PARALLEL SAFE
+        AS $b$
+            SELECT v.word,
+                   (100 * (1 - %I.similarity(v.word, q.w)))::integer,
+                   (100 * (1 - %I.similarity(v.word, q.w)))::integer
+              FROM (SELECT plex.fold(term) AS w) AS q
+              JOIN plex.spellfix_vocab AS v ON v.word OPERATOR(%I.%%) q.w
+             WHERE q.w <> ''
+             ORDER BY %I.similarity(v.word, q.w) DESC, v.word
+             LIMIT n
+        $b$ $f$, ns, ns, ns, ns);
+END $$;
 
 
 --
@@ -1271,7 +1354,7 @@ CREATE TABLE plex.library_sections (
     id integer NOT NULL,
     library_id bigint,
     name text,
-    name_sort text,
+    name_sort text COLLATE plex.nocase,
     section_type integer,
     language text,
     agent text,
@@ -3431,14 +3514,6 @@ ALTER TABLE ONLY plex.metadata_items
 
 
 --
--- Name: metadata_items chk_not_orphan; Type: CONSTRAINT; Schema: plex; Owner: -
---
-
-ALTER TABLE plex.metadata_items
-    ADD CONSTRAINT chk_not_orphan CHECK (metadata_type IS NOT NULL OR library_section_id IS NOT NULL);
-
-
---
 -- Name: metadata_relations metadata_relations_pkey; Type: CONSTRAINT; Schema: plex; Owner: -
 --
 
@@ -3580,14 +3655,6 @@ ALTER TABLE ONLY plex.taggings
 
 ALTER TABLE ONLY plex.tags
     ADD CONSTRAINT tags_pkey PRIMARY KEY (id);
-
-
---
--- Name: test test_pkey; Type: CONSTRAINT; Schema: plex; Owner: -
---
-
-ALTER TABLE ONLY plex.test
-    ADD CONSTRAINT test_pkey PRIMARY KEY (id);
 
 
 --
@@ -3908,13 +3975,6 @@ CREATE INDEX idx_metadata_items_changed_at ON plex.metadata_items USING btree (c
 
 
 --
--- Name: idx_metadata_items_fts; Type: INDEX; Schema: plex; Owner: -
---
-
-CREATE INDEX idx_metadata_items_fts ON plex.metadata_items USING gin (title_fts);
-
-
---
 -- Name: idx_metadata_items_guid; Type: INDEX; Schema: plex; Owner: -
 --
 
@@ -3982,13 +4042,6 @@ CREATE INDEX idx_metadata_items_parent_id ON plex.metadata_items USING btree (pa
 --
 
 CREATE INDEX idx_metadata_items_parent_type ON plex.metadata_items USING btree (parent_id, metadata_type);
-
-
---
--- Name: idx_metadata_items_search; Type: INDEX; Schema: plex; Owner: -
---
-
-CREATE INDEX idx_metadata_items_search ON plex.metadata_items USING gin (search_vector);
 
 
 --
@@ -4174,13 +4227,6 @@ CREATE INDEX idx_taggings_tag_metadata ON plex.taggings USING btree (tag_id, met
 
 
 --
--- Name: idx_tags_fts; Type: INDEX; Schema: plex; Owner: -
---
-
-CREATE INDEX idx_tags_fts ON plex.tags USING gin (search_vector);
-
-
---
 -- Name: idx_tags_key; Type: INDEX; Schema: plex; Owner: -
 --
 
@@ -4209,31 +4255,10 @@ CREATE INDEX idx_tags_tag_type ON plex.tags USING btree (tag_type);
 
 
 --
--- Name: metadata_items check_cross_section_parent; Type: TRIGGER; Schema: plex; Owner: -
---
-
-CREATE TRIGGER check_cross_section_parent BEFORE INSERT OR UPDATE OF parent_id, library_section_id ON plex.metadata_items FOR EACH ROW WHEN ((new.parent_id IS NOT NULL)) EXECUTE FUNCTION plex.prevent_cross_section_parent();
-
-
---
--- Name: metadata_items metadata_items_search_update; Type: TRIGGER; Schema: plex; Owner: -
---
-
-CREATE TRIGGER metadata_items_search_update BEFORE INSERT OR UPDATE ON plex.metadata_items FOR EACH ROW EXECUTE FUNCTION plex.metadata_items_search_trigger();
-
-
---
 -- Name: metadata_items metadata_items_set_available_at; Type: TRIGGER; Schema: plex; Owner: -
 --
 
 CREATE TRIGGER metadata_items_set_available_at BEFORE INSERT ON plex.metadata_items FOR EACH ROW EXECUTE FUNCTION plex.set_available_at();
-
-
---
--- Name: metadata_items prevent_self_ref_parent; Type: TRIGGER; Schema: plex; Owner: -
---
-
-CREATE TRIGGER prevent_self_ref_parent BEFORE INSERT OR UPDATE ON plex.metadata_items FOR EACH ROW EXECUTE FUNCTION plex.prevent_self_referential_parent();
 
 
 --
@@ -4244,36 +4269,104 @@ CREATE TRIGGER statistics_media_reject_empty BEFORE INSERT ON plex.statistics_me
 
 
 --
--- Name: tags tags_search_update; Type: TRIGGER; Schema: plex; Owner: -
---
-
-CREATE TRIGGER tags_search_update BEFORE INSERT OR UPDATE ON plex.tags FOR EACH ROW EXECUTE FUNCTION plex.tags_search_trigger();
-
-
---
 -- Name: statistics_resources trg_clean_statistics_resources; Type: TRIGGER; Schema: plex; Owner: -
 --
 
 CREATE TRIGGER trg_clean_statistics_resources AFTER INSERT ON plex.statistics_resources FOR EACH STATEMENT EXECUTE FUNCTION plex.maybe_cleanup_statistics();
 
 
---
--- Name: metadata_items trg_fix_orphan_season; Type: TRIGGER; Schema: plex; Owner: -
---
-
-CREATE TRIGGER trg_fix_orphan_season AFTER INSERT ON plex.metadata_items FOR EACH ROW EXECUTE FUNCTION plex.fix_orphan_season_on_episode_insert();
-
 
 --
--- Name: media_parts trg_fix_orphan_season_media; Type: TRIGGER; Schema: plex; Owner: -
+-- Name: idx_metadata_items_title_fts, idx_metadata_items_title_sort_fts, idx_metadata_items_original_title_fts, idx_tags_tag_fts; Type: INDEX; Schema: plex; Owner: -
 --
 
-CREATE TRIGGER trg_fix_orphan_season_media AFTER INSERT ON plex.media_parts FOR EACH ROW EXECUTE FUNCTION plex.fix_orphan_season_on_media_part_insert();
+-- Full-text search: a MATCH on an fts4_* view is rewritten to
+-- to_tsvector('simple', plex.fold(<col>)) @@ plex.fts_query(<term>), which
+-- the planner serves from these expression indexes on the base tables.
+CREATE INDEX idx_metadata_items_title_fts
+    ON plex.metadata_items USING gin (to_tsvector('simple', plex.fold(title)));
+CREATE INDEX idx_metadata_items_title_sort_fts
+    ON plex.metadata_items USING gin (to_tsvector('simple', plex.fold(title_sort)));
+CREATE INDEX idx_metadata_items_original_title_fts
+    ON plex.metadata_items USING gin (to_tsvector('simple', plex.fold(original_title)));
+CREATE INDEX idx_tags_tag_fts
+    ON plex.tags USING gin (to_tsvector('simple', plex.fold(tag)));
 
 
 --
--- PostgreSQL database dump complete
+-- Name: index_media_items_on_channel_id_and_begins_at, ... (the indexes stock Plex has, under their stock names); Type: INDEX; Schema: plex; Owner: -
 --
+
+-- Already covered, so not duplicated: media_items(deleted_at) by
+-- idx_media_items_deleted_at; metadata_items(changed_at) by
+-- idx_metadata_items_changed_at (DESC serves both directions);
+-- metadata_items(library_section_id, metadata_type, added_at) by
+-- idx_metadata_items_section_type_added.
+CREATE INDEX index_media_items_on_channel_id_and_begins_at ON plex.media_items (channel_id, begins_at);
+CREATE INDEX index_media_items_on_begins_at ON plex.media_items (begins_at);
+CREATE INDEX index_media_items_on_ends_at ON plex.media_items (ends_at);
+CREATE INDEX index_media_items_on_channel_id ON plex.media_items (channel_id);
+CREATE INDEX index_media_items_on_media_analysis_version ON plex.media_items (media_analysis_version);
+CREATE INDEX index_metadata_items_on_deleted_at ON plex.metadata_items (deleted_at);
+CREATE INDEX index_metadata_items_on_created_at ON plex.metadata_items (created_at);
+CREATE INDEX index_metadata_items_on_resources_changed_at ON plex.metadata_items (resources_changed_at);
+CREATE INDEX index_metadata_item_views_on_viewed_at ON plex.metadata_item_views (viewed_at);
+CREATE INDEX index_metadata_item_views_on_library_section_id ON plex.metadata_item_views (library_section_id);
+CREATE INDEX index_tags_on_tag_type_and_tag ON plex.tags (tag_type, tag);
+CREATE INDEX index_directories_on_deleted_at ON plex.directories (deleted_at);
+
+
+--
+-- Name: idx_media_items_extra_data_trgm; Type: INDEX; Schema: plex; Owner: -
+--
+
+-- cluster-plex's findMedia looks a file up by
+-- media_items.extra_data LIKE '%"cp:mediaFile":"<uid>"%' (audit #30).
+DO $$
+DECLARE
+    ns text;
+BEGIN
+    SELECT n.nspname INTO ns FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+     WHERE e.extname = 'pg_trgm';
+    EXECUTE format('CREATE INDEX IF NOT EXISTS idx_media_items_extra_data_trgm ON plex.media_items USING gin (extra_data %I.gin_trgm_ops)', ns);
+END $$;
+
+--
+-- Name: index_play_queues_on_client_identifier_account_id_metadata_type, media_grabs_on_uuid, media_provider_resources_on_uuid, index_external_metadata_sources_on_uri; Type: INDEX; Schema: plex; Owner: -
+--
+
+-- ON CONFLICT targets for Plex.
+-- Stock SQLite's name for this one,
+-- index_play_queues_on_client_identifier_and_account_id_and_metadata_type,
+-- is 72 characters; PostgreSQL truncates identifiers at 63, so it is given
+-- a name that fits as it is.
+CREATE UNIQUE INDEX index_play_queues_on_client_identifier_account_id_metadata_type ON plex.play_queues (client_identifier, account_id, metadata_type);
+CREATE UNIQUE INDEX media_grabs_on_uuid ON plex.media_grabs (uuid);
+CREATE UNIQUE INDEX media_provider_resources_on_uuid ON plex.media_provider_resources (uuid);
+CREATE UNIQUE INDEX index_external_metadata_sources_on_uri ON plex.external_metadata_sources (uri);
+
+
+--
+-- Name: metadata_items spellfix_vocab_metadata_items_insert, ... (the spellfix vocabulary triggers); Type: TRIGGER; Schema: plex; Owner: -
+--
+
+CREATE TRIGGER spellfix_vocab_metadata_items_insert
+    AFTER INSERT ON plex.metadata_items
+    FOR EACH ROW WHEN (NEW.title IS NOT NULL)
+    EXECUTE FUNCTION plex.spellfix_vocab_add();
+CREATE TRIGGER spellfix_vocab_metadata_items_update
+    AFTER UPDATE OF title ON plex.metadata_items
+    FOR EACH ROW WHEN (NEW.title IS DISTINCT FROM OLD.title)
+    EXECUTE FUNCTION plex.spellfix_vocab_add();
+CREATE TRIGGER spellfix_vocab_tags_insert
+    AFTER INSERT ON plex.tags
+    FOR EACH ROW WHEN (NEW.tag IS NOT NULL)
+    EXECUTE FUNCTION plex.spellfix_vocab_add();
+CREATE TRIGGER spellfix_vocab_tags_update
+    AFTER UPDATE OF tag ON plex.tags
+    FOR EACH ROW WHEN (NEW.tag IS DISTINCT FROM OLD.tag)
+    EXECUTE FUNCTION plex.spellfix_vocab_add();
+
 
 \unrestrict k1FTTexA8Xe4WPWhJLvkzFfK77e8SGscLqfdbjfaYwEAOAK1wzzj90sahsatJMU
 
