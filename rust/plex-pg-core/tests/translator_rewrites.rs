@@ -429,3 +429,17 @@ fn audit_1_integrity_and_checkpoint_pragmas_answer_a_row() {
         "SELECT 0 AS busy, 0 AS log, 0 AS checkpointed"
     );
 }
+
+// SQLite's two-argument `trim(x, y)` is a parse error for sqlparser, which
+// knows only `TRIM(y FROM x)`; PostgreSQL's btrim takes SQLite's form
+// (2026-10-16). ltrim/rtrim and a literal containing "trim(" are untouched.
+#[test]
+fn audit_leftover_two_argument_trim_is_btrim() {
+    let t = translate("select trim(title, ?) from metadata_items where rtrim(title, 'x') = 'trim(a, b)' and TRIM(guid) <> ''").unwrap();
+    let low = t.sql.to_lowercase();
+    assert!(low.contains("btrim(title, $1)"), "sql={}", t.sql);
+    assert!(low.contains("rtrim(title, 'x')"), "sql={}", t.sql);
+    assert!(low.contains("'trim(a, b)'"), "sql={}", t.sql);
+    assert!(low.contains("btrim(guid)"), "sql={}", t.sql);
+    assert_eq!(t.param_names.len(), 1);
+}

@@ -15,6 +15,7 @@ pub(super) fn preprocess_sql(sql: &str) -> String {
     let sql = rewrite_fts_index_rebuild(&sql);
     let sql = rewrite_virtual_tables(&sql);
     let sql = rewrite_glob(&sql);
+    let sql = rewrite_trim_calls(&sql);
     let sql = rewrite_indexed_by(&sql);
     let sql = rewrite_index_ddl_identifier_quotes(&sql);
     let sql = rewrite_sqlite_collations(&sql);
@@ -2262,6 +2263,58 @@ fn fix_placeholder_spacing(sql: &str) -> String {
     result
 }
 
+/// `trim(x, y)` is SQLite's two-argument trim; sqlparser knows only the
+/// standard `TRIM([BOTH] y FROM x)` and refuses the comma ("Expected: ),
+/// found: ?", 2026-10-16). PostgreSQL's `btrim` takes both forms, so the
+/// name is swapped outside string literals; `ltrim`/`rtrim` already parse.
+fn rewrite_trim_calls(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut result = String::with_capacity(sql.len() + 8);
+    let mut i = 0;
+    let mut in_string = false;
+    let mut string_char: u8 = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            push_utf8_byte(&mut result, sql, i);
+            if b == string_char {
+                if i + 1 < bytes.len() && bytes[i + 1] == string_char {
+                    result.push(bytes[i + 1] as char);
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\'' || b == b'"' || b == b'`' {
+            in_string = true;
+            string_char = b;
+            result.push(b as char);
+            i += 1;
+            continue;
+        }
+        let word_start = i == 0
+            || !(bytes[i - 1].is_ascii_alphanumeric()
+                || bytes[i - 1] == b'_'
+                || bytes[i - 1] == b'.');
+        if word_start && i + 4 <= bytes.len() && bytes[i..i + 4].eq_ignore_ascii_case(b"trim") {
+            let mut j = i + 4;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'(' {
+                result.push_str("btrim");
+                i += 4;
+                continue;
+            }
+        }
+        push_utf8_byte(&mut result, sql, i);
+        i += 1;
+    }
+    result
+}
 /// Spell the GLOB operator `SIMILAR TO`, which sqlparser accepts and SQLite
 /// never writes, so the query rewrite can turn the whole right operand --
 /// a literal, a bound parameter, or `'*' || ? || '*'` -- into an anchored
