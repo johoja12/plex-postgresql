@@ -160,3 +160,40 @@ fn a_registered_library_handle_is_pg_backed() {
     crate::pg_client::rust_pg_unregister_connection(other);
     assert!(crate::ffi_types::conn_unref(other));
 }
+
+// Plex polls errcode on its error path. A redirected library handle whose
+// connection cannot be peeked at (nothing pooled for it, or its slot is not
+// READY right now) used to fall through to the shadow SQLite handle, which
+// kept the SQLITE_ERROR of a failed prepare for good: after one failed search
+// every later request on the server threw std::exception (2026-10-16). Such
+// a handle answers "no error".
+#[test]
+fn a_redirected_handle_without_a_peekable_connection_reports_no_error() {
+    let handle = fake_conn("/x/com.plexapp.plugins.library.db");
+    unsafe { (*handle).is_pg_active = 0 };
+    let db = 0x7a3e_0003usize as *const sqlite3;
+    unsafe { (*handle).shadow_db = db as *mut sqlite3 };
+    crate::pg_client::rust_pg_register_connection(handle);
+    assert!(
+        crate::pg_client::peek_connection(db).is_null(),
+        "the setup: nothing to peek at"
+    );
+
+    assert_eq!(
+        crate::db_interpose_metadata::rust_my_sqlite3_errcode(db as *mut sqlite3),
+        0
+    );
+    assert_eq!(
+        crate::db_interpose_metadata::rust_my_sqlite3_extended_errcode(db as *mut sqlite3),
+        0
+    );
+    let msg = unsafe {
+        std::ffi::CStr::from_ptr(crate::db_interpose_metadata::rust_my_sqlite3_errmsg(
+            db as *mut sqlite3,
+        ))
+    };
+    assert_eq!(msg.to_str().unwrap(), "not an error");
+
+    crate::pg_client::rust_pg_unregister_connection(handle);
+    assert!(crate::ffi_types::conn_unref(handle));
+}
