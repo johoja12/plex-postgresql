@@ -2573,11 +2573,21 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
                 // RTRIM and BINARY parse fine, but PostgreSQL has no matching collation
                 // so they are stripped here too.  NOCASE is intentionally left for the
                 // AST-level handler in query.rs which converts it to LOWER(…).
-                let should_strip = collation_name.starts_with("ICU")
+                // ICU root and the unicode names are the schema's
+                // `plex.icu_root` (a deterministic ICU root collation), so
+                // "Sort by title" orders as stock Plex does instead of by
+                // the database's locale (2026-10-16).
+                let is_icu = collation_name.starts_with("ICU")
                     || collation_name == "UNICODE"
-                    || collation_name == "UNICODE_CI"
-                    || collation_name == "RTRIM"
-                    || collation_name == "BINARY";
+                    || collation_name == "UNICODE_CI";
+                if is_icu {
+                    parenthesize_trailing_qualified_identifier(&mut result);
+                    result.push_str("COLLATE plex.icu_root");
+                    i = j;
+                    continue;
+                }
+
+                let should_strip = collation_name == "RTRIM" || collation_name == "BINARY";
 
                 if should_strip {
                     // Skip the entire `COLLATE <name>` token.

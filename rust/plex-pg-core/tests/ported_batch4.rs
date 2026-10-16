@@ -394,12 +394,11 @@ fn min_single_arg() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn strip_icu_collation() {
+fn icu_collation_is_the_schemas_icu_root() {
     let r = translate("SELECT * FROM t ORDER BY name COLLATE icu_root").unwrap();
-    let sql = r.sql.to_lowercase();
     assert!(
-        !sql.contains("icu_root"),
-        "icu_root collation should be stripped, got: {}",
+        r.sql.contains("ORDER BY name COLLATE plex.icu_root"),
+        "icu_root is the schema's plex.icu_root (2026-10-16), got: {}",
         r.sql
     );
 }

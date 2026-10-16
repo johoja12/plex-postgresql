@@ -443,3 +443,50 @@ fn audit_leftover_two_argument_trim_is_btrim() {
     assert!(low.contains("btrim(guid)"), "sql={}", t.sql);
     assert_eq!(t.param_names.len(), 1);
 }
+
+// tags.tag, metadata_items.title_sort and library_sections.name_sort carry
+// the non-deterministic plex.nocase collation; PostgreSQL refuses a pattern
+// match on them, so the match compares under plex.icu_root (2026-10-16).
+#[test]
+fn a_pattern_match_on_a_nocase_column_compares_under_icu_root() {
+    let t = translate("select id from tags where tags.tag like ? and tag_type = 1").unwrap();
+    assert!(
+        t.sql.contains("(tags.tag COLLATE plex.icu_root) ILIKE $1"),
+        "sql={}",
+        t.sql
+    );
+    let t = translate(
+        "select id from metadata_items where title_sort glob 'M*' and instr(name_sort, 'x') > 0",
+    )
+    .unwrap();
+    assert!(
+        t.sql.contains("(title_sort COLLATE plex.icu_root) ~ "),
+        "sql={}",
+        t.sql
+    );
+    assert!(
+        t.sql
+            .contains("STRPOS((name_sort COLLATE plex.icu_root), 'x')"),
+        "sql={}",
+        t.sql
+    );
+    // Other columns, and equality on the three, are untouched.
+    let t = translate("select id from metadata_items where title like ? and tags.tag = ?").unwrap();
+    assert!(
+        t.sql.contains("title ILIKE $1 AND tags.tag = $2"),
+        "sql={}",
+        t.sql
+    );
+}
+
+// `COLLATE icu_root` used to be stripped, leaving the sort to the database's
+// locale; it is the schema's plex.icu_root now.
+#[test]
+fn collate_icu_root_is_the_schemas_icu_collation() {
+    let t = translate("select id from metadata_items where library_section_id = ? order by metadata_items.title_sort collate icu_root asc, title collate unicode").unwrap();
+    assert!(
+        t.sql.contains("ORDER BY (metadata_items.title_sort) COLLATE plex.icu_root ASC, title COLLATE plex.icu_root"),
+        "sql={}",
+        t.sql
+    );
+}

@@ -2260,9 +2260,13 @@ mod tests {
     }
 
     #[test]
-    fn subset_core__query_strip_icu_collation() {
+    fn subset_core__query_icu_collation_is_the_schemas() {
         let r = translate("SELECT * FROM t ORDER BY name COLLATE icu_root").unwrap();
-        assert!(!r.sql.to_lowercase().contains("icu_root"), "Got: {}", r.sql);
+        assert!(
+            r.sql.contains("ORDER BY name COLLATE plex.icu_root"),
+            "Got: {}",
+            r.sql
+        );
     }
 
     #[test]

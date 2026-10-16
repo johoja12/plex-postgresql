@@ -27,9 +27,8 @@ use crate::db_interpose_common::{
     get_orig_sqlite3_column_decltype, get_orig_sqlite3_column_double, get_orig_sqlite3_column_int,
     get_orig_sqlite3_column_int64, get_orig_sqlite3_column_name, get_orig_sqlite3_column_text,
     get_orig_sqlite3_column_type, get_orig_sqlite3_column_value, get_orig_sqlite3_data_count,
-    get_orig_sqlite3_db_handle, tls_column_type_calls_ptr, tls_in_resolve_tables_ptr,
-    tls_last_query_ptr, PgFakeValue, GLOBAL_COLUMN_TYPE_CALLS, MAX_FAKE_VALUES,
-    PG_FAKE_VALUE_MAGIC,
+    tls_column_type_calls_ptr, tls_in_resolve_tables_ptr, tls_last_query_ptr, PgFakeValue,
+    GLOBAL_COLUMN_TYPE_CALLS, MAX_FAKE_VALUES, PG_FAKE_VALUE_MAGIC,
 };
 use crate::db_interpose_conn_utils::{
     cstr_prefix, cstr_to_string_or, log_debug, log_error, log_info, PthreadMutexGuard,

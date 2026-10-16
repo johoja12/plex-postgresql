@@ -24,6 +24,7 @@
 
 pub mod byte_utils;
 pub mod c_abi;
+pub mod collation;
 pub mod db_interpose_bind;
 pub mod db_interpose_column;
 pub mod db_interpose_common;
@@ -86,12 +87,12 @@ pub mod pms_process_compat;
 pub mod query;
 pub mod quotes;
 pub mod rewriter;
-mod schema_columns;
 pub mod runtime_common;
 #[cfg(target_os = "linux")]
 pub mod runtime_linux;
 #[cfg(target_os = "macos")]
 pub mod runtime_macos;
+mod schema_columns;
 pub mod shim_alloc;
 mod sync_utils;
 #[cfg(test)]
