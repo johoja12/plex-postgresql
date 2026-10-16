@@ -200,7 +200,7 @@ fn builtin_as_like_operand() {
     );
     assert_eq!(
         sql,
-        "SELECT * FROM t WHERE COALESCE(title, '') LIKE $1 AND jsonb_extract_path_text(d::jsonb, 'x') NOT LIKE '%a%'"
+        "SELECT * FROM t WHERE COALESCE(title, '') ILIKE $1 AND jsonb_extract_path_text(d::jsonb, 'x') NOT ILIKE '%a%'"
     );
     assert_eq!(n, 1);
 }

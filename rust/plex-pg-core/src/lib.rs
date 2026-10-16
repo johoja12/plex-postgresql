@@ -68,7 +68,7 @@ pub mod pg_statement;
 /// Pipeline (in order):
 ///   1. dedup         — UPDATE duplicate SET targets (keep last assignment)
 ///   2. placeholders  — ? / :name → $1, $2, ...
-///   3. functions     — IFNULL→COALESCE, iif→CASE, typeof→pg_typeof, etc.
+///   3. functions     — IFNULL→COALESCE, iif→CASE, typeof→plex.sqlite_typeof, etc.
 ///   4. types         — AUTOINCREMENT, BLOB, INTEGER8, etc.
 ///   5. keywords      — GLOB→ILIKE, BEGIN IMMEDIATE, sqlite_master, etc.
 ///   6. upsert        — INSERT OR REPLACE / INSERT OR IGNORE → ON CONFLICT
