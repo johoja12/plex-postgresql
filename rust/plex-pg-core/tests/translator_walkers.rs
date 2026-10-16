@@ -437,3 +437,53 @@ fn json_each_value_and_key_references_resolve_to_the_functions_columns() {
     );
     assert_eq!(n, 1);
 }
+
+// ── 8, the shapes the rewrites branch produces before numbering ─────────────
+//
+// GLOB is spelled SIMILAR TO before parsing, `IS <expr>` becomes IS [NOT]
+// DISTINCT FROM, and `UPDATE ... LIMIT ?` keeps the Update's own `limit`
+// until an AST rewrite after numbering. The preprocessor on this branch
+// still rewrites those forms as text, so the walker is called directly on
+// the parsed statement.
+
+fn numbered(dialect: &dyn sqlparser::dialect::Dialect, sql: &str) -> (String, Vec<Option<String>>) {
+    let mut stmt = Parser::parse_sql(dialect, sql)
+        .unwrap_or_else(|e| panic!("parse failed for `{}`: {}", sql, e))
+        .remove(0);
+    let mut names = Vec::new();
+    plex_pg_core::placeholders::transform(&mut stmt, &mut names);
+    (stmt.to_string(), names)
+}
+
+#[test]
+fn placeholder_under_similar_to() {
+    let (sql, names) = numbered(
+        &PostgreSqlDialect {},
+        "SELECT * FROM t WHERE title SIMILAR TO ? AND id = ?",
+    );
+    assert_eq!(sql, "SELECT * FROM t WHERE title SIMILAR TO $1 AND id = $2");
+    assert_eq!(names, vec![None, None]);
+}
+
+#[test]
+fn placeholder_under_is_distinct_from_and_is_not_distinct_from() {
+    let (sql, names) = numbered(
+        &PostgreSqlDialect {},
+        "SELECT * FROM t WHERE a IS DISTINCT FROM ? AND ? IS NOT DISTINCT FROM b AND c = ?",
+    );
+    assert_eq!(
+        sql,
+        "SELECT * FROM t WHERE a IS DISTINCT FROM $1 AND $2 IS NOT DISTINCT FROM b AND c = $3"
+    );
+    assert_eq!(names, vec![None, None, None]);
+}
+
+#[test]
+fn placeholder_in_an_update_statements_limit() {
+    let (sql, names) = numbered(
+        &sqlparser::dialect::MySqlDialect {},
+        "UPDATE t SET a = ? WHERE b = ? LIMIT ?",
+    );
+    assert_eq!(sql, "UPDATE t SET a = $1 WHERE b = $2 LIMIT $3");
+    assert_eq!(names, vec![None, None, None]);
+}
