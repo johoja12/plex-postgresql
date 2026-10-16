@@ -32,16 +32,14 @@ pub(crate) fn phase2_reuse_existing(ctx: &AcquireCtx<'_>) -> AcquireDecision {
 
         let txn = get_txn_status(conn);
         if txn == PQTRANS_INTRANS || txn == PQTRANS_INERROR {
-            let cmd = if txn == PQTRANS_INTRANS {
-                c"COMMIT"
-            } else {
-                c"ROLLBACK"
-            };
+            // A FREE slot with a transaction open was abandoned by whoever
+            // began it. It used to be COMMITted here; half a write is what a
+            // transaction exists to prevent, so it is rolled back.
             log_info_lazy!(
-                "Pool PHASE 2: slot {} has pending transaction (status={}), sending cleanup before reset",
+                "Pool PHASE 2: slot {} has an abandoned transaction (status={}); rolling it back before reset",
                 i, txn
             );
-            let _ = exec_simple(conn, cmd.as_ptr());
+            let _ = exec_simple(conn, c"ROLLBACK".as_ptr());
         }
 
         rust_stmt_cache_clear(conn);

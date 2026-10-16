@@ -1,21 +1,20 @@
 use super::*;
 
-fn text_decltype() -> *const c_char {
-    DECLTYPE_TEXT.as_ptr() as *const c_char
-}
-
 fn passthrough_decltype(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const c_char {
     get_orig_sqlite3_column_decltype()
         .map(|f| unsafe { f(p_stmt, idx) })
         .unwrap_or(ptr::null())
 }
 
-/// Check whether we have no result or idx is out of bounds.
+/// With no result to read a type from, or an index past the columns, the
+/// answer is NULL, as SQLite's is for an expression column: nothing is
+/// known, and saying TEXT made SOCI build a string holder for a column that
+/// turned out to hold an integer (std::bad_cast).
 /// SAFETY: Must be called while stmt mutex is held. Does NOT log to avoid
 /// deadlock with the LOGGER mutex.
 fn no_result_decltype(pg_stmt: &mut PgStmt, idx: c_int) -> Option<*const c_char> {
     if pg_stmt.result.is_null() || idx < 0 || idx >= pg_stmt.num_cols {
-        return Some(text_decltype());
+        return Some(ptr::null());
     }
     None
 }

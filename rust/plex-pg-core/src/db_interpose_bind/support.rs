@@ -55,11 +55,15 @@ pub(super) unsafe fn pg_map_param_index(
                     return i as c_int;
                 }
             }
+            // A named parameter the translation does not carry cannot be
+            // mapped. Falling through to "the same index" bound the value to
+            // whatever parameter happened to sit there, silently.
             log_debug_lazy!(
                 "Named parameter '{}' not found in translation (sqlite_idx={})",
                 cstr_to_string_or(clean_name, "NULL"),
                 sqlite_idx
             );
+            return -1;
         } else {
             log_debug("  -> No parameter name, using direct mapping");
         }
@@ -251,6 +255,38 @@ pub(super) unsafe fn begin_bind(
     clear_metadata_result_if_needed(pg_stmt);
     ensure_stmt_not_busy(p_stmt, pg_stmt);
     (pg_stmt, guard)
+}
+
+/// What a bind on a PostgreSQL-routed statement answers: SQLITE_OK when
+/// `idx` maps to a parameter the translation carries, SQLITE_RANGE when it
+/// does not -- past the translated count, or a name the translation lost.
+///
+/// SQLite answers SQLITE_RANGE for an index beyond the statement's
+/// parameters. The shim answered SQLITE_OK for every bind and dropped the
+/// ones it could not place, so a translation that lost a placeholder (an
+/// `IS NULL` on a parameter, a dropped duplicate SET) ran with Plex's later
+/// values shifted one slot left, and nobody was told.
+pub(super) unsafe fn routed_bind_rc(
+    pg_stmt: *mut PgStmt,
+    p_stmt: *mut sqlite3_stmt,
+    idx: c_int,
+) -> c_int {
+    if idx <= 0 {
+        return SQLITE_RANGE;
+    }
+    match mapped_param_index(pg_stmt, p_stmt, idx) {
+        Some(_) => SQLITE_OK,
+        None => {
+            let s = &*pg_stmt;
+            crate::db_interpose_conn_utils::log_error(&format!(
+                "BIND: index {} has no parameter in the translation ({} translated) -- SQLITE_RANGE: {}",
+                idx,
+                s.param_count,
+                crate::db_interpose_conn_utils::cstr_prefix(s.sql, 200, "NULL")
+            ));
+            SQLITE_RANGE
+        }
+    }
 }
 
 pub(super) unsafe fn mapped_param_index(

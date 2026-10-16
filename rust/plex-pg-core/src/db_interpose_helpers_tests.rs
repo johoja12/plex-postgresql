@@ -479,19 +479,28 @@ fn bind_helpers_contains_binary_bytes_text_cases() {
 }
 
 #[test]
-fn bind_helpers_contains_binary_bytes_detects_control_and_invalid() {
+fn bind_helpers_contains_binary_bytes_detects_nul_gzip_and_invalid_utf8() {
     assert!(contains_binary_bytes_impl(b"\x00"));
-    assert!(contains_binary_bytes_impl(b"\x01"));
-    assert!(contains_binary_bytes_impl(b"\x07test"));
-    assert!(contains_binary_bytes_impl(b"\x7F"));
+    assert!(contains_binary_bytes_impl(b"abc\x00def"));
     assert!(contains_binary_bytes_impl(b"\xC0"));
     assert!(contains_binary_bytes_impl(b"\xC1"));
     assert!(contains_binary_bytes_impl(b"\xF5"));
+    assert!(contains_binary_bytes_impl(b"\xFF\xFE"));
     assert!(contains_binary_bytes_impl(&[0x1f, 0x8b, 0x08, 0x00]));
+}
+
+// A control byte is text to PostgreSQL and to SQLite; sent as bytea hex, a
+// summary with a \x01 in it reached the column as the literal `\x5c78...`.
+#[test]
+fn bind_helpers_control_bytes_in_text_stay_text() {
+    assert!(!contains_binary_bytes_impl(b"\x01"));
+    assert!(!contains_binary_bytes_impl(b"\x07test"));
+    assert!(!contains_binary_bytes_impl(b"\x7F"));
+    assert!(!contains_binary_bytes_impl(b"\x1b[0m"));
     let mixed = [b'H', b'e', b'l', b'l', b'o', 0x01, b'W'];
-    assert!(contains_binary_bytes_impl(&mixed));
-    let late_binary = [b'A', b'B', b'C', b'D', b'E', 0x02];
-    assert!(contains_binary_bytes_impl(&late_binary));
+    assert!(!contains_binary_bytes_impl(&mixed));
+    let late_control = [b'A', b'B', b'C', b'D', b'E', 0x02];
+    assert!(!contains_binary_bytes_impl(&late_control));
 }
 
 #[test]

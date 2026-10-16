@@ -183,11 +183,14 @@ pub(super) unsafe fn maybe_register_pg_stmt(
     // Maintenance joins the routed statements even though it is neither a read
     // nor a write: it has to reach the `is_pg = 3` no-op below rather than run
     // against the shadow, where VACUUM fails inside an open transaction.
+    // Transaction control joins too: registered `is_pg = 3`, the step
+    // forwards it to PostgreSQL (pg_client::txn) instead of running BEGIN on
+    // the shadow, where it did nothing for the library.
+    let sql_text = crate::db_interpose_helpers::cstr_to_str_or_empty(z_sql);
     let routed = should_route_via_pg(pg_conn, is_read, is_write)
         || (pg_connection_serves_library(pg_conn)
-            && crate::pg_config::is_maintenance_noop_str(
-                crate::db_interpose_helpers::cstr_to_str_or_empty(z_sql),
-            ));
+            && (crate::pg_config::is_maintenance_noop_str(sql_text)
+                || crate::pg_client::txn::classify_sql(sql_text).is_some()));
     if !routed || pp_stmt.is_null() || (*pp_stmt).is_null() {
         return;
     }

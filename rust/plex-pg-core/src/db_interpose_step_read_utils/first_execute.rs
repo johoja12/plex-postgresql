@@ -75,10 +75,17 @@ pub(super) fn first_execute_impl(
             crate::pg_client::current_thread_has_other_streaming_connection(
                 exec_conn as *const c_void,
             );
-        let mut use_streaming =
-            should_use_streaming(pg_stmt, disable_streaming) && !thread_has_other_streaming;
+        // A stream in flight and the transaction's next statement cannot
+        // share the connection, and inside a transaction they must: fetch
+        // eagerly.
+        let in_transaction = crate::pg_client::txn::in_transaction(exec_conn);
+        let mut use_streaming = should_use_streaming(pg_stmt, disable_streaming)
+            && !thread_has_other_streaming
+            && !in_transaction;
         if disable_streaming {
             log_info("STREAM: disabled via PLEX_PG_DISABLE_STREAMING, using eager fetch");
+        } else if in_transaction {
+            log_debug("STREAM: disabled inside a transaction, using eager fetch");
         } else if thread_has_other_streaming {
             log_debug(
                 "STREAM: disabled because current thread already owns another active streaming connection, using eager fetch",
@@ -113,6 +120,7 @@ pub(super) fn first_execute_impl(
             exec_conn,
             &mut stmt_guard,
             &mut conn_guard,
+            pg_conn_error_out,
         )
     }
 }

@@ -148,6 +148,7 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
                     let rowid = crate::db_interpose_helpers::rust_pg_text_to_int64(id_str);
                     if rowid > 0 {
                         ec.last_insert_rowid = rowid;
+                        ec.last_insert_failed.store(0, Ordering::Release);
                         crate::pg_client::rust_set_global_last_insert_rowid(rowid);
                     }
 
@@ -168,15 +169,12 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
                 }
             }
         } else {
-            let err = if !exec_conn.is_null() && !ec.conn.is_null() {
-                crate::libpq_helpers::rust_pq_error_message(ec.conn)
-            } else {
-                b"NULL connection\0".as_ptr() as *const c_char
-            };
-            log_error(&format!(
-                "STEP PG write error: {}",
-                cstr_to_string_or(err, "NULL connection")
-            ));
+            // A write PostgreSQL refused used to read as SQLITE_DONE, with the
+            // previous statement's changes() and last_insert_rowid: a
+            // constraint violation was a success to Plex. It is an error now,
+            // reported the way SQLite reports one.
+            let (class, message) = crate::pg_client::classify_result(ec.conn, res);
+            log_error(&format!("STEP PG write error ({:?}): {}", class, message));
             log_error(&format!(
                 "  Original SQL: {}",
                 cstr_prefix(stmt.sql, 300, "(null)")
@@ -185,18 +183,28 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
                 "  Translated SQL: {}",
                 cstr_prefix(stmt.pg_sql, 300, "(null)")
             ));
-            if is_stale_prepared_stmt(res) {
-                crate::pg_client::rust_stmt_cache_clear_local(exec_conn as *mut c_void);
-                if !res.is_null() {
-                    crate::libpq_helpers::rust_pq_clear(res);
-                }
-                if !pg_conn_error_out.is_null() {
-                    *pg_conn_error_out = 1;
-                }
-                stmt.write_executed = 1;
-                return STEP_RESULT_ERROR;
+            if !res.is_null() {
+                crate::libpq_helpers::rust_pq_clear(res);
             }
-            crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
+            stmt.write_executed = 1;
+            match class {
+                PgErrorClass::StalePlan => {
+                    crate::pg_client::rust_stmt_cache_clear_local(exec_conn as *mut c_void);
+                    if !pg_conn_error_out.is_null() {
+                        *pg_conn_error_out = 1;
+                    }
+                }
+                PgErrorClass::Retry => {
+                    crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
+                    if !pg_conn_error_out.is_null() {
+                        *pg_conn_error_out = 1;
+                    }
+                }
+                PgErrorClass::Fail => {
+                    note_failed_write(ec, stmt.sql, &message);
+                }
+            }
+            return STEP_RESULT_ERROR;
         }
 
         stmt.write_executed = 1;
@@ -204,5 +212,17 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
             crate::libpq_helpers::rust_pq_clear(res);
         }
         STEP_RESULT_DONE
+    }
+}
+
+/// Record a write that PostgreSQL refused on the connection Plex will ask:
+/// the message for `sqlite3_errmsg`, `changes()` of 0, and -- for an INSERT
+/// -- the flag that makes `sqlite3_last_insert_rowid` answer 0 rather than
+/// the previous row's id (see `PgConnection::last_insert_failed`).
+pub(crate) unsafe fn note_failed_write(conn: &mut PgConnection, sql: *const c_char, message: &str) {
+    conn.set_last_error(SQLITE_ERROR, message);
+    conn.last_changes = 0;
+    if starts_with_icase_bytes(cstr_bytes(sql), b"INSERT") {
+        conn.last_insert_failed.store(1, Ordering::Release);
     }
 }

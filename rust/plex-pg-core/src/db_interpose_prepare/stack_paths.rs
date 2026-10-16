@@ -124,6 +124,14 @@ pub(super) unsafe fn maybe_handle_ondeck_low_stack(
         }
     }
 
+    // A library handle with no pool connection is refused, never answered
+    // from the shadow as an empty result (internal_flow).
+    if let Some(rc) =
+        super::internal_flow::refuse_without_pool_connection(db, pg_conn, z_sql, pp_stmt, pz_tail)
+    {
+        log_error("STACK CRITICAL OnDeck: no PG connection, refusing with SQLITE_BUSY");
+        return Some(rc);
+    }
     log_error("STACK CRITICAL OnDeck: no PG connection, returning empty");
     Some(prepare_shadow_stmt(
         db,

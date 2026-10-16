@@ -162,22 +162,24 @@ pub(super) fn is_blobs_db_path_impl(path: &str) -> bool {
     contains_ascii_icase(path.as_bytes(), b"com.plexapp.plugins.library.blobs.db")
 }
 
+/// Whether a value bound as text is really bytes: a NUL (a text parameter
+/// ends at one), a gzip header, or anything that is not UTF-8.
+///
+/// A control byte other than tab, newline and return used to make the whole
+/// value binary, sent as bytea hex, so a title or a summary with a stray
+/// \x01 or \x7f in it reached PostgreSQL as `\x5c78...` text. PostgreSQL
+/// takes any UTF-8 but NUL in a text parameter, and so does SQLite.
 pub(super) fn contains_binary_bytes_impl(data: &[u8]) -> bool {
     if data.is_empty() {
         return false;
     }
-    for (i, c) in data.iter().copied().enumerate() {
-        if c < 0x20 && c != 0x09 && c != 0x0A && c != 0x0D {
-            return true;
-        }
-        if c == 0x7F || c == 0xC0 || c == 0xC1 || c >= 0xF5 {
-            return true;
-        }
-        if i == 0 && data.len() >= 2 && c == 0x1F && data[1] == 0x8B {
-            return true;
-        }
+    if data.len() >= 2 && data[0] == 0x1F && data[1] == 0x8B {
+        return true;
     }
-    false
+    if data.contains(&0) {
+        return true;
+    }
+    std::str::from_utf8(data).is_err()
 }
 
 pub(super) fn bytes_to_pg_hex_impl(data: &[u8]) -> String {

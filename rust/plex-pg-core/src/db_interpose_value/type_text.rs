@@ -136,17 +136,18 @@ pub(super) fn value_text_impl(p_val: *mut sqlite3_value) -> *const c_uchar {
     }
 
     let result_ptr = pg_stmt_ref.result;
-    let buf = VALUE_TEXT_IDX.fetch_add(1, Ordering::Relaxed) & 0xFF;
-    let len = unsafe {
-        crate::db_interpose_helpers::rust_pg_result_text_copy(
-            helpers_result_ptr(result_ptr),
-            ctx.row,
-            ctx.col,
-            VALUE_TEXT_BUFFERS[buf].as_mut_ptr() as *mut c_char,
-            VALUE_TEXT_BUFFERS[buf].len(),
-        )
-    };
-    if len < 0 {
+    let mut value: *const c_char = ptr::null();
+    let mut len: c_int = 0;
+    let mut is_null: c_int = 0;
+    crate::db_interpose_helpers::rust_pg_result_value_ptr_len(
+        helpers_result_ptr(result_ptr),
+        ctx.row,
+        ctx.col,
+        &mut value,
+        &mut len,
+        &mut is_null,
+    );
+    if is_null != 0 || value.is_null() || len < 0 {
         if call_num % 100 == 0 {
             log_info_lazy!(
                 "VALUE_TEXT[{}]: col={} row={} -> NULL (is_null)",
@@ -156,6 +157,16 @@ pub(super) fn value_text_impl(p_val: *mut sqlite3_value) -> *const c_uchar {
             );
         }
         return ptr::null();
+    }
+
+    // The whole value, into this thread's own ring: a 16 KiB static used to
+    // cut it, and every thread shared the ring.
+    let bytes = unsafe { std::slice::from_raw_parts(value as *const u8, len as usize) };
+    let out = value_text_ring_put(bytes);
+    if out.is_null() {
+        // The thread is tearing down its locals: libpq's own copy, valid
+        // while the result is.
+        return value as *const c_uchar;
     }
 
     if call_num % 100 == 0 {
@@ -169,8 +180,7 @@ pub(super) fn value_text_impl(p_val: *mut sqlite3_value) -> *const c_uchar {
             call_num,
             cstr_to_string_or(col_name, "?"),
             ctx.row,
-            unsafe { CStr::from_ptr(VALUE_TEXT_BUFFERS[buf].as_ptr() as *const c_char) }
-                .to_string_lossy(),
+            String::from_utf8_lossy(bytes),
             suffix
         );
     }
@@ -178,12 +188,11 @@ pub(super) fn value_text_impl(p_val: *mut sqlite3_value) -> *const c_uchar {
     // Every call, not every hundredth: a value that comes back wrong is read
     // once, and the sampled line is almost never the one that mattered.
     log_debug_lazy!(
-        "VALUE_TEXT_TRACE: col={} row={} copied={} buf={}",
+        "VALUE_TEXT_TRACE: col={} row={} copied={}",
         ctx.col,
         ctx.row,
-        len,
-        buf
+        len
     );
 
-    (unsafe { VALUE_TEXT_BUFFERS[buf].as_ptr() }) as *const c_uchar
+    out as *const c_uchar
 }

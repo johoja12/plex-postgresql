@@ -254,26 +254,44 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
                 }
             }
         } else {
-            let err = if !changes_conn.is_null() && !(&*changes_conn).conn.is_null() {
-                crate::libpq_helpers::rust_pq_error_message((&*changes_conn).conn)
-            } else {
-                b"NULL connection\0".as_ptr() as *const c_char
-            };
+            // Refused: SQLITE_ERROR with the reason, never DONE (see
+            // write_exec::note_failed_write).
+            let (class, message) = crate::pg_client::classify_result(ec.conn, res);
+            let message_c = CString::new(message.clone()).unwrap_or_default();
             log_sql_fallback(
                 orig_sql,
                 exec_sql,
-                err,
+                message_c.as_ptr(),
                 b"CACHED WRITE\0".as_ptr() as *const c_char,
             );
-            if is_stale_prepared_stmt(res) {
-                crate::pg_client::rust_stmt_cache_clear_local(exec_conn as *mut c_void);
+            if !res.is_null() {
                 crate::libpq_helpers::rust_pq_clear(res);
-                if !pg_conn_error_out.is_null() {
-                    *pg_conn_error_out = 1;
-                }
-                return STEP_RESULT_ERROR;
             }
-            crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
+            match class {
+                PgErrorClass::StalePlan => {
+                    crate::pg_client::rust_stmt_cache_clear_local(exec_conn as *mut c_void);
+                    if !pg_conn_error_out.is_null() {
+                        *pg_conn_error_out = 1;
+                    }
+                }
+                PgErrorClass::Retry => {
+                    crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
+                    if !pg_conn_error_out.is_null() {
+                        *pg_conn_error_out = 1;
+                    }
+                }
+                PgErrorClass::Fail => {
+                    super::write_exec::note_failed_write(ec, orig_sql, &message);
+                    if !changes_conn.is_null() && changes_conn != exec_conn {
+                        super::write_exec::note_failed_write(
+                            &mut *changes_conn,
+                            orig_sql,
+                            &message,
+                        );
+                    }
+                }
+            }
+            return STEP_RESULT_ERROR;
         }
 
         if !res.is_null() {

@@ -1,13 +1,14 @@
 use super::*;
 use crate::db_interpose_bind::support::{
     begin_bind, clear_param_value, is_pg_routed_noncached, mapped_param_index, retry_on_misuse,
+    routed_bind_rc,
 };
 
 pub(super) fn bind_int_impl(p_stmt: *mut sqlite3_stmt, idx: c_int, val: c_int) -> c_int {
     let (pg_stmt, guard) = unsafe { begin_bind(PHASE_BIND_INT, p_stmt) };
 
     let rc = if is_pg_routed_noncached(pg_stmt) {
-        SQLITE_OK
+        unsafe { routed_bind_rc(pg_stmt, p_stmt, idx) }
     } else {
         let mut rc = get_orig_sqlite3_bind_int()
             .map(|f| unsafe { f(p_stmt, idx, val) })
@@ -44,7 +45,7 @@ pub(super) fn bind_int64_impl(p_stmt: *mut sqlite3_stmt, idx: c_int, val: i64) -
     let (pg_stmt, guard) = unsafe { begin_bind(PHASE_BIND_INT64, p_stmt) };
 
     let rc = if is_pg_routed_noncached(pg_stmt) {
-        SQLITE_OK
+        unsafe { routed_bind_rc(pg_stmt, p_stmt, idx) }
     } else {
         let mut rc = get_orig_sqlite3_bind_int64()
             .map(|f| unsafe { f(p_stmt, idx, val) })
@@ -81,7 +82,7 @@ pub(super) fn bind_double_impl(p_stmt: *mut sqlite3_stmt, idx: c_int, val: f64) 
     let (pg_stmt, guard) = unsafe { begin_bind(PHASE_BIND_DOUBLE, p_stmt) };
 
     let rc = if is_pg_routed_noncached(pg_stmt) {
-        SQLITE_OK
+        unsafe { routed_bind_rc(pg_stmt, p_stmt, idx) }
     } else {
         let mut rc = get_orig_sqlite3_bind_double()
             .map(|f| unsafe { f(p_stmt, idx, val) })

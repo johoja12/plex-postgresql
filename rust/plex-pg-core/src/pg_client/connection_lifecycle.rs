@@ -220,6 +220,10 @@ pub(super) fn reset_conn(conn: *mut c_void) -> bool {
         return false;
     }
     rust_pq_reset(conn.conn);
+    // A reset backend has no stream and no transaction, whatever the flags
+    // said; a streaming_active left set here kept the slot unusable.
+    conn.streaming_active.store(0, Ordering::Release);
+    super::txn::forget_connection(conn_ptr);
     if rust_pq_status(conn.conn) != CONNECTION_OK {
         return false;
     }
@@ -247,6 +251,8 @@ pub(super) fn reconnect_conn(raw_conn: *mut c_void) -> bool {
         rust_pq_finish(conn.conn);
         conn.conn = std::ptr::null_mut();
     }
+    conn.streaming_active.store(0, Ordering::Release);
+    super::txn::forget_connection(conn_ptr);
 
     let new_pg = rust_pq_connectdb(conninfo_c.as_ptr());
     if rust_pq_status(new_pg) == CONNECTION_OK {

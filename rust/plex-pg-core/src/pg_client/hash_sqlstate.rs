@@ -17,8 +17,12 @@ pub(crate) fn fnv1a_str(s: &str) -> u64 {
 }
 
 /// Returns `true` when `sqlstate` is exactly `"26000"`.
+///
+/// The whole stale-plan test, which also takes `0A000` "cached plan must not
+/// change result type", is `error_class::is_stale_plan`; this is the
+/// SQLSTATE-only half for callers that have no message.
 pub(crate) fn is_stale_sqlstate(sqlstate: &str) -> bool {
-    sqlstate == "26000"
+    super::error_class::is_stale_plan(sqlstate, "")
 }
 
 /// Returns `true` when `sqlstate` is exactly `"42P05"`.

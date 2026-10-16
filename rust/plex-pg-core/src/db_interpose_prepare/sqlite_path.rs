@@ -1,4 +1,5 @@
 use super::*;
+use crate::db_interpose_prepare_utils::count_bare_question_marks;
 use crate::log_debug_lazy;
 use crate::log_info_lazy;
 
@@ -37,11 +38,11 @@ pub(super) unsafe fn prepare_dummy_shadow_stmt(
     if contains_icase_ptr(z_sql, "metadata_item_settings")
         && contains_icase_ptr(z_sql, "metadata_items")
     {
-        let q_count = bytes.iter().filter(|b| **b == b'?').count();
+        let q_count = count_bare_question_marks(bytes);
         let mut out_q_count = 0usize;
         if !pre_trans.sql.is_null() {
             let out_bytes = CStr::from_ptr(pre_trans.sql).to_bytes();
-            out_q_count = out_bytes.iter().filter(|b| **b == b'?').count();
+            out_q_count = count_bare_question_marks(out_bytes);
         }
         log_info_lazy!("MIS_TRANSLATE: orig={}", cstr_prefix(z_sql, 1000, "NULL"));
         log_info_lazy!(
@@ -55,7 +56,7 @@ pub(super) unsafe fn prepare_dummy_shadow_stmt(
     }
 
     if !pre_trans.sql.is_null() {
-        let orig_q = bytes.iter().filter(|b| **b == b'?').count() as i32;
+        let orig_q = count_bare_question_marks(bytes) as i32;
         if orig_q > pre_trans.param_count {
             let mut pos = None;
             for (i, b) in bytes.iter().enumerate() {

@@ -173,6 +173,7 @@ pub extern "C" fn rust_step_write_prepare_connection(
             log_error("=== END DIAGNOSTIC ===");
             log_error("STEP WRITE: Attempting PQreset...");
             crate::libpq_helpers::rust_pq_reset(ec.conn);
+            crate::pg_client::txn::forget_connection(exec_conn);
             if crate::libpq_helpers::rust_pq_status(ec.conn) != CONNECTION_OK {
                 log_error("STEP WRITE: PQreset failed, trying fresh PQconnectdb...");
                 crate::pg_client::rust_stmt_cache_clear(exec_conn as *mut c_void);

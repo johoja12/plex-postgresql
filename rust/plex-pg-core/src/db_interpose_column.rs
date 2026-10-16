@@ -83,7 +83,6 @@ const PG_DECLTYPE_CASE_DT_INTEGER_8: c_int = 2;
 const PMT_COLUMN_CACHED_BLOB_ALLOC: c_int = 3;
 const PMT_COLUMN_DECODED_BLOB_ALLOC: c_int = 4;
 
-static DECLTYPE_TEXT: &[u8] = b"TEXT\0";
 static DECLTYPE_DT_INTEGER_8: &[u8] = b"dt_integer(8)\0";
 static _DECLTYPE_INTEGER: &[u8] = b"INTEGER\0";
 static _DECLTYPE_BIGINT: &[u8] = b"BIGINT\0";
@@ -382,6 +381,90 @@ mod tests {
         rust_stmt_free(stmt);
     }
 
+    // sqlite3_column_text's pointer lives until the statement's next step,
+    // reset or finalize. The shim's lived until its 64-slot thread ring came
+    // round, so a statement with many columns, or Plex re-reading a column
+    // after sixty others, found the first one overwritten.
+    #[test]
+    fn column_text_pointer_survives_the_ring_going_round() {
+        let stmt = make_stmt();
+        let shadow_stmt = 0x50000usize as *mut sqlite3_stmt;
+        let a = CString::new("first column").unwrap();
+        let b = CString::new("second column").unwrap();
+        let col_a = CString::new("a").unwrap();
+        let col_b = CString::new("b").unwrap();
+        let res = unsafe { PQmakeEmptyPGresult(std::ptr::null_mut(), 2) };
+        assert!(!res.is_null());
+        let mut descs = [
+            PgResAttDesc {
+                name: col_a.as_ptr(),
+                tableid: 0,
+                columnid: 0,
+                format: 0,
+                typid: 25,
+                typlen: -1,
+                atttypmod: -1,
+            },
+            PgResAttDesc {
+                name: col_b.as_ptr(),
+                tableid: 0,
+                columnid: 0,
+                format: 0,
+                typid: 25,
+                typlen: -1,
+                atttypmod: -1,
+            },
+        ];
+        unsafe {
+            assert_eq!(PQsetResultAttrs(res, 2, descs.as_mut_ptr()), 1);
+            assert_eq!(PQsetvalue(res, 0, 0, a.as_ptr(), 12), 1);
+            assert_eq!(PQsetvalue(res, 0, 1, b.as_ptr(), 13), 1);
+            let s = &mut *stmt;
+            s.is_pg = 2;
+            s.result = res;
+            s.num_cols = 2;
+            s.num_rows = 1;
+            s.current_row = 0;
+        }
+        rust_stmt_register(shadow_stmt as usize, stmt as usize);
+
+        let first = rust_my_sqlite3_column_text(shadow_stmt, 0);
+        for _ in 0..(NUM_TEXT_BUFFERS * 2) {
+            rust_my_sqlite3_column_text(shadow_stmt, 1);
+        }
+        let text = unsafe { CStr::from_ptr(first as *const c_char) }
+            .to_str()
+            .unwrap();
+        assert_eq!(text, "first column", "overwritten by the ring");
+        assert_eq!(
+            rust_my_sqlite3_column_text(shadow_stmt, 0),
+            first,
+            "the same pointer for the same row, as SQLite gives"
+        );
+
+        // The next row (as a step leaves it) lets the copies go.
+        unsafe {
+            (&mut *stmt).current_row = 1;
+            (&mut *stmt).num_rows = 2;
+            assert_eq!(PQsetvalue(res, 1, 0, b.as_ptr(), 13), 1);
+            assert_eq!(PQsetvalue(res, 1, 1, a.as_ptr(), 12), 1);
+        }
+        let next = rust_my_sqlite3_column_text(shadow_stmt, 0);
+        assert_eq!(
+            unsafe { CStr::from_ptr(next as *const c_char) }
+                .to_str()
+                .unwrap(),
+            "second column"
+        );
+
+        rust_stmt_unregister(shadow_stmt as usize);
+        unsafe {
+            (&mut *stmt).result = std::ptr::null_mut();
+            PQclear(res);
+        }
+        rust_stmt_free(stmt);
+    }
+
     #[test]
     fn column_text_buffer_wraps_after_num_buffers() {
         reset_text_buffer_idx();
@@ -481,8 +564,10 @@ mod tests {
         rust_stmt_free(stmt);
     }
 
+    // Nothing is known about a column with no result: SQLite answers NULL
+    // for an expression column, and SOCI then types it from the value.
     #[test]
-    fn pg_column_decltype_without_metadata_does_not_use_shadow_decltype() {
+    fn pg_column_decltype_without_metadata_is_null_not_the_shadows_or_text() {
         let stmt = make_stmt();
         let shadow_stmt = 0x20000usize as *mut sqlite3_stmt;
         let pg_sql = CString::new(
@@ -502,8 +587,9 @@ mod tests {
         rust_stmt_register(shadow_stmt as usize, stmt as usize);
 
         let decl = rust_my_sqlite3_column_decltype(shadow_stmt, 0);
-        let decl = unsafe { CStr::from_ptr(decl) }.to_str().unwrap();
-        assert_eq!(decl, "TEXT");
+        assert!(decl.is_null(), "answered {:?}", unsafe {
+            CStr::from_ptr(decl)
+        });
 
         rust_stmt_unregister(shadow_stmt as usize);
         unsafe {

@@ -47,6 +47,26 @@ pub(super) unsafe fn step_handle_cached_stmt(p_stmt: *mut sqlite3_stmt) -> c_int
         return STEP_RESULT_FALLBACK;
     }
 
+    // Transaction control prepared before the handle was registered, or
+    // through a prepare the shim did not see: forwarded all the same.
+    let plain_sql = call_sqlite3_sql(p_stmt);
+    if crate::pg_client::txn::enabled() && !plain_sql.is_null() {
+        let sql_str = crate::db_interpose_helpers::cstr_to_str_or_empty(plain_sql);
+        if let Some(cmd) = crate::pg_client::txn::classify_sql(sql_str) {
+            let conn = super::transaction_connection(db);
+            return match crate::pg_client::txn::run(conn, db, &cmd) {
+                Ok(()) => super::STEP_RESULT_DONE,
+                Err(msg) => {
+                    crate::db_interpose_conn_utils::log_error(&format!(
+                        "PG transaction control failed (cached path): {} :: {}",
+                        sql_str, msg
+                    ));
+                    super::STEP_RESULT_ERROR
+                }
+            };
+        }
+    }
+
     let expanded_sql = call_sqlite3_expanded_sql(p_stmt);
     let sql = if !expanded_sql.is_null() {
         expanded_sql as *const c_char
