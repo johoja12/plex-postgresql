@@ -366,9 +366,10 @@ pub(super) fn column_type_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int {
     log_debug_lazy!("COLUMN_TYPE: stmt={:p} idx={}", p_stmt, idx);
     let raw_pg_stmt = pg_find_any_stmt(p_stmt);
     let dbg_sql = unsafe { column_type_debug_sql(raw_pg_stmt) };
-    let dbg_db = get_orig_sqlite3_db_handle()
-        .map(|f| unsafe { f(p_stmt) })
-        .unwrap_or(ptr::null_mut());
+    // The shim's own resolver: a routed statement answers its shadow or
+    // connection handle and never hands the pointer to SQLite, which a
+    // test's fake statement pointer crashed (2026-10-16).
+    let dbg_db = crate::db_interpose_metadata::rust_my_sqlite3_db_handle(p_stmt);
     unsafe {
         pg_exception_note_phase(
             b"column_type\0".as_ptr() as *const c_char,
