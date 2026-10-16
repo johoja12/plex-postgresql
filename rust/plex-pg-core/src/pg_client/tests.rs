@@ -27,6 +27,8 @@ mod pool_slot;
 mod reaper;
 #[path = "tests/registry.rs"]
 mod registry;
+#[path = "tests/slot_leaks.rs"]
+mod slot_leaks;
 #[path = "tests/sqlstate.rs"]
 mod sqlstate;
 #[path = "tests/tls_cache.rs"]

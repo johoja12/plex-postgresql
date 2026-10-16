@@ -10,6 +10,8 @@ pub(super) fn claim_slot_for_thread(ctx: &AcquireCtx<'_>, slot: &PoolSlot) {
         .store(ctx.current_thread, Ordering::Release);
     slot.last_used.store(ctx.now, Ordering::Release);
     slot.generation.fetch_add(1, Ordering::SeqCst);
+    // The slot goes back when this thread exits (pool_runtime).
+    super::super::super::pool_runtime::note_thread_owns_slots();
 }
 
 pub(super) fn cache_existing_ready_slot(
