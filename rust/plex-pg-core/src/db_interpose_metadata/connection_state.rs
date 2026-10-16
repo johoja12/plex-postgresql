@@ -139,6 +139,9 @@ pub(super) fn errmsg_impl(db: *mut sqlite3) -> *const c_char {
         log_debug("ERRMSG: returning 'not an error'");
         return NOT_AN_ERROR.as_ptr() as *const c_char;
     }
+    if redirected_handle(db) {
+        return NOT_AN_ERROR.as_ptr() as *const c_char;
+    }
 
     if let Some(f) = get_shim_sqlite3_errmsg() {
         return unsafe { f(db) };
@@ -147,6 +150,12 @@ pub(super) fn errmsg_impl(db: *mut sqlite3) -> *const c_char {
         return unsafe { f(db) };
     }
     b"unknown error\0".as_ptr() as *const c_char
+}
+
+/// Whether the handle is one the shim serves from PostgreSQL: registered
+/// with a connection, whatever its pool slot's state right now.
+fn redirected_handle(db: *mut sqlite3) -> bool {
+    !crate::pg_client::rust_find_registered_connection(db as *const c_void).is_null()
 }
 
 pub(super) fn errcode_impl(db: *mut sqlite3) -> c_int {
@@ -168,6 +177,15 @@ pub(super) fn errcode_impl(db: *mut sqlite3) -> c_int {
         );
         return conn.last_error_code;
     }
+    if redirected_handle(db) {
+        // A redirected handle with no connection to peek at is idle; its
+        // shadow SQLite handle is never asked, because a failed prepare
+        // leaves SQLITE_ERROR there for good and Plex, which polls errcode
+        // on its error path, then threw on every later request
+        // (2026-10-16, after one failed search).
+        log_debug("ERRCODE: redirected handle without a connection, returning SQLITE_OK");
+        return SQLITE_OK;
+    }
 
     if let Some(f) = get_shim_sqlite3_errcode() {
         return unsafe { f(db) };
@@ -183,6 +201,9 @@ pub(super) fn extended_errcode_impl(db: *mut sqlite3) -> c_int {
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         return conn.last_error_code;
+    }
+    if redirected_handle(db) {
+        return SQLITE_OK;
     }
     if let Some(f) = get_orig_sqlite3_extended_errcode() {
         return unsafe { f(db) };
