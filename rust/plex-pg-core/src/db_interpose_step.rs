@@ -224,11 +224,29 @@ pub extern "C" fn rust_my_sqlite3_step(p_stmt: *mut sqlite3_stmt) -> c_int {
 
     let rc = unsafe { my_sqlite3_step_impl(p_stmt) };
 
-    if let Some(retry_rc) = maybe_retry_step(p_stmt, rc) {
-        return retry_rc;
-    }
-
+    let rc = match maybe_retry_step(p_stmt, rc) {
+        Some(retry_rc) => retry_rc,
+        None => rc,
+    };
+    unsafe { forget_error_after_success(dbg_stmt, rc) };
     rc
+}
+
+/// SQLite's errcode is the result of the most recent call on the handle: a
+/// step that returns a row or finishes clears an earlier failure. The shim
+/// kept the connection's last error until the next prepare, and Plex, which
+/// reads errcode after every step on its error path, threw std::exception
+/// on every request that followed one failed search (2026-10-16).
+unsafe fn forget_error_after_success(pg_stmt: *mut PgStmt, rc: c_int) {
+    if pg_stmt.is_null() || (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        return;
+    }
+    let s = &*pg_stmt;
+    for conn in [s.conn(), s.result_conn()] {
+        if !conn.is_null() {
+            (*conn).clear_last_error();
+        }
+    }
 }
 
 unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
