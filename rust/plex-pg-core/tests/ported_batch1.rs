@@ -351,19 +351,14 @@ fn function_iif_no_match() {
     );
 }
 
+// typeof(x) is plex.sqlite_typeof(x) (schema/plex_schema.sql), which answers
+// SQLite's names -- 'integer' for every integer type, 'real', 'text', 'blob',
+// 'null' -- so a comparison written against them needs no remapping.
 #[test]
 fn function_typeof() {
     let t = translate("SELECT typeof(x) FROM t").unwrap();
-    assert!(
-        t.sql.to_lowercase().contains("pg_typeof"),
-        "expected pg_typeof in: {}",
-        t.sql
-    );
-    assert!(
-        t.sql.to_lowercase().contains("::text"),
-        "expected ::TEXT cast in: {}",
-        t.sql
-    );
+    assert_eq!(t.sql, "SELECT plex.sqlite_typeof(x) FROM t");
+    assert_eq!(t.param_names.len(), 0);
 }
 
 #[test]
@@ -464,28 +459,27 @@ fn function_simplify_typeof() {
     );
 }
 
+// The IN list stays SQLite's: pg_typeof's 'bigint' and 'double precision'
+// were added to it when typeof was pg_typeof, and typeof(x) outside an IN
+// list compared pg_typeof's names against SQLite's.
 #[test]
-fn function_typeof_integer_bigint_expansion() {
-    // C: typeof type remapping — in ('integer') should also match 'bigint'
-    let t = translate("SELECT * FROM t WHERE typeof(x) IN ('integer')").unwrap();
-    let low = t.sql.to_lowercase();
-    assert!(
-        low.contains("'bigint'"),
-        "expected 'bigint' added to IN list, got: {}",
-        t.sql
+fn function_typeof_in_list_keeps_sqlites_type_names() {
+    let t = translate("SELECT * FROM t WHERE typeof(x) IN ('integer', 'real')").unwrap();
+    assert_eq!(
+        t.sql,
+        "SELECT * FROM t WHERE plex.sqlite_typeof(x) IN ('integer', 'real')"
     );
+    assert_eq!(t.param_names.len(), 0);
 }
 
 #[test]
-fn function_typeof_real_to_double_precision() {
-    // C: typeof type remapping — 'real' should also match 'double precision'
-    let t = translate("SELECT * FROM t WHERE typeof(x) IN ('real')").unwrap();
-    let low = t.sql.to_lowercase();
-    assert!(
-        low.contains("'double precision'"),
-        "expected 'double precision' added to IN list, got: {}",
-        t.sql
+fn function_typeof_compared_outside_an_in_list() {
+    let t = translate("SELECT * FROM t WHERE typeof(x) = 'integer' OR typeof(y) <> ?").unwrap();
+    assert_eq!(
+        t.sql,
+        "SELECT * FROM t WHERE plex.sqlite_typeof(x) = 'integer' OR plex.sqlite_typeof(y) <> $1"
     );
+    assert_eq!(t.param_names.len(), 1);
 }
 
 #[test]
