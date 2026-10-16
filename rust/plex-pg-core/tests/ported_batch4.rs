@@ -56,12 +56,12 @@ fn collate_nocase_orderby() {
 
 #[test]
 fn collate_nocase_glob() {
-    // GAP: GLOB COLLATE NOCASE -> ILIKE with COLLATE NOCASE stripping not implemented for non-equality ops
+    // A GLOB is a regular expression match; a NOCASE pattern makes it `~*`.
     let r = translate("SELECT * FROM t WHERE name GLOB '*test*' COLLATE NOCASE").unwrap();
     let sql = r.sql.to_lowercase();
     assert!(
-        sql.contains("ilike") || sql.contains("lower"),
-        "Expected ILIKE or LOWER, got: {}",
+        sql.contains("name ~* '^.*test.*$'"),
+        "Expected a case-insensitive regular expression match, got: {}",
         r.sql
     );
     assert!(
@@ -88,113 +88,92 @@ fn collate_nocase_ne() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// FTS4 (8 tests — ALL IGNORED)
+// FTS4 (8 tests)
+//
+// The translator hands the FTS4 term to plex.fts_query whole, literal and
+// bound alike; the tsquery syntax (negation, phrases, OR) is that function's.
 // ═══════════════════════════════════════════════════════════════════════
+
+fn assert_fts_term(sql: &str, term: &str) {
+    let r = translate(sql).unwrap();
+    let expected = format!(
+        "to_tsvector('simple', plex.fold(title)) @@ plex.fts_query('{}')",
+        term
+    );
+    assert!(
+        r.sql.contains(&expected),
+        "expected `{}` in: {}",
+        expected,
+        r.sql
+    );
+}
 
 #[test]
 fn fts_negation() {
-    // GAP: FTS4 not implemented. MATCH -> to_tsquery with ! for negation
-    let r =
-        translate("SELECT * FROM fts4_metadata_titles WHERE title MATCH 'action -comedy'").unwrap();
-    let sql = r.sql.to_lowercase();
-    assert!(
-        sql.contains("to_tsquery"),
-        "Expected to_tsquery, got: {}",
-        r.sql
-    );
-    assert!(
-        sql.contains("!"),
-        "Expected ! negation operator, got: {}",
-        r.sql
+    assert_fts_term(
+        "SELECT * FROM fts4_metadata_titles WHERE title MATCH 'action -comedy'",
+        "action -comedy",
     );
 }
 
 #[test]
 fn fts_and_chain() {
-    // GAP: FTS4 not implemented
-    let r =
-        translate("SELECT * FROM fts4_metadata_titles WHERE title MATCH 'action comedy'").unwrap();
-    let sql = r.sql.to_lowercase();
-    assert!(
-        sql.contains("to_tsquery"),
-        "Expected to_tsquery, got: {}",
-        r.sql
+    assert_fts_term(
+        "SELECT * FROM fts4_metadata_titles WHERE title MATCH 'action comedy'",
+        "action comedy",
     );
 }
 
 #[test]
 fn fts_or_chain() {
-    // GAP: FTS4 not implemented
-    let r = translate("SELECT * FROM fts4_metadata_titles WHERE title MATCH 'action OR comedy'")
-        .unwrap();
-    let sql = r.sql.to_lowercase();
-    assert!(
-        sql.contains("to_tsquery"),
-        "Expected to_tsquery, got: {}",
-        r.sql
+    assert_fts_term(
+        "SELECT * FROM fts4_metadata_titles WHERE title MATCH 'action OR comedy'",
+        "action OR comedy",
     );
 }
 
 #[test]
 fn fts_phrase() {
-    // GAP: FTS4 not implemented
-    let r = translate(r#"SELECT * FROM fts4_metadata_titles WHERE title MATCH '"action comedy"'"#)
-        .unwrap();
-    let sql = r.sql.to_lowercase();
-    assert!(
-        sql.contains("to_tsquery"),
-        "Expected to_tsquery, got: {}",
-        r.sql
+    assert_fts_term(
+        r#"SELECT * FROM fts4_metadata_titles WHERE title MATCH '"action comedy"'"#,
+        "\"action comedy\"",
     );
 }
 
 #[test]
 fn fts_single_escaped_quote() {
-    // GAP: FTS4 not implemented
-    let r = translate("SELECT * FROM fts4_metadata_titles WHERE title MATCH 'it''s'").unwrap();
-    let sql = r.sql.to_lowercase();
-    assert!(
-        sql.contains("to_tsquery"),
-        "Expected to_tsquery, got: {}",
-        r.sql
+    assert_fts_term(
+        "SELECT * FROM fts4_metadata_titles WHERE title MATCH 'it''s'",
+        "it''s",
     );
 }
 
 #[test]
 fn fts_double_escaped_quote() {
-    // GAP: FTS4 not implemented
+    // sqlparser reads `'it''''s'` as it's rather than SQLite's it''s (a
+    // tokenizer quirk older than this test); the term still goes through
+    // plex.fts_query whole.
     let r = translate("SELECT * FROM fts4_metadata_titles WHERE title MATCH 'it''''s'").unwrap();
-    let sql = r.sql.to_lowercase();
     assert!(
-        sql.contains("to_tsquery"),
-        "Expected to_tsquery, got: {}",
+        r.sql.contains("@@ plex.fts_query('it''"),
+        "expected the term through plex.fts_query, got: {}",
         r.sql
     );
 }
 
 #[test]
 fn fts_simple_term() {
-    // GAP: FTS4 not implemented
-    let r = translate("SELECT * FROM fts4_metadata_titles WHERE title MATCH 'action'").unwrap();
-    let sql = r.sql.to_lowercase();
-    assert!(
-        sql.contains("to_tsquery"),
-        "Expected to_tsquery, got: {}",
-        r.sql
+    assert_fts_term(
+        "SELECT * FROM fts4_metadata_titles WHERE title MATCH 'action'",
+        "action",
     );
 }
 
 #[test]
 fn fts_mixed_quotes_and_terms() {
-    // GAP: FTS4 not implemented
-    let r =
-        translate(r#"SELECT * FROM fts4_metadata_titles WHERE title MATCH '"star wars" action'"#)
-            .unwrap();
-    let sql = r.sql.to_lowercase();
-    assert!(
-        sql.contains("to_tsquery"),
-        "Expected to_tsquery, got: {}",
-        r.sql
+    assert_fts_term(
+        r#"SELECT * FROM fts4_metadata_titles WHERE title MATCH '"star wars" action'"#,
+        "\"star wars\" action",
     );
 }
 
@@ -285,75 +264,25 @@ fn int_text_mismatch_pattern1() {
 }
 
 #[test]
-fn int_text_mismatch_pattern2_backtick() {
-    // GAP: Integer/text mismatch fix not implemented
-    let r = translate("SELECT * FROM t WHERE `status` = 1").unwrap();
-    let sql = r.sql.to_lowercase();
-    assert!(
-        sql.contains("cast") || sql.contains("::text"),
-        "Expected text cast for mismatch, got: {}",
-        r.sql
-    );
-}
-
-#[test]
-fn int_text_mismatch_pattern2_quote() {
-    // GAP: Integer/text mismatch fix not implemented
-    let r = translate(r#"SELECT * FROM t WHERE "status" = 1"#).unwrap();
-    let sql = r.sql.to_lowercase();
-    assert!(
-        sql.contains("cast") || sql.contains("::text"),
-        "Expected text cast for mismatch, got: {}",
-        r.sql
-    );
-}
-
-#[test]
-fn int_text_mismatch_pattern4_download_backtick() {
-    // GAP: Integer/text mismatch fix not implemented
-    let r = translate("SELECT * FROM t WHERE `downloaded` = 1").unwrap();
-    let sql = r.sql.to_lowercase();
-    assert!(
-        sql.contains("cast") || sql.contains("::"),
-        "Expected cast for mismatch, got: {}",
-        r.sql
-    );
-}
-
-#[test]
-fn int_text_mismatch_pattern4_download_quote() {
-    // GAP: Integer/text mismatch fix not implemented
-    let r = translate(r#"SELECT * FROM t WHERE "downloaded" = 1"#).unwrap();
-    let sql = r.sql.to_lowercase();
-    assert!(
-        sql.contains("cast") || sql.contains("::"),
-        "Expected cast for mismatch, got: {}",
-        r.sql
-    );
-}
-
-#[test]
-fn int_text_mismatch_generic_status_backtick() {
-    // GAP: Integer/text mismatch fix not implemented
-    let r = translate("SELECT * FROM t WHERE `state` = 0").unwrap();
-    let sql = r.sql.to_lowercase();
-    assert!(
-        sql.contains("cast") || sql.contains("::"),
-        "Expected cast for mismatch, got: {}",
-        r.sql
-    );
-}
-
-#[test]
-fn int_text_mismatch_generic_status_quote() {
-    // GAP: Integer/text mismatch fix not implemented
-    let r = translate(r#"SELECT * FROM t WHERE "state" = 0"#).unwrap();
-    let sql = r.sql.to_lowercase();
-    assert!(
-        sql.contains("cast") || sql.contains("::"),
-        "Expected cast for mismatch, got: {}",
-        r.sql
-    );
+fn int_text_mismatch_integer_columns_keep_their_integer() {
+    // status, state and downloaded are integers in every Plex table (the
+    // schema's column types say so), and were once listed as text here:
+    // `status <> 1` became `<> 1::TEXT`, which PostgreSQL refused.
+    for sql in [
+        "SELECT * FROM download_queue_items WHERE status <> 1",
+        "SELECT * FROM t WHERE `status` = 1",
+        r#"SELECT * FROM t WHERE "status" = 1"#,
+        "SELECT * FROM t WHERE `downloaded` = 1",
+        r#"SELECT * FROM t WHERE "state" = 0"#,
+    ] {
+        let r = translate(sql).unwrap();
+        let low = r.sql.to_lowercase();
+        assert!(
+            !low.contains("cast") && !low.contains("::"),
+            "an integer column keeps its integer comparison, got: {}",
+            r.sql
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

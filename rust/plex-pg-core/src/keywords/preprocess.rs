@@ -5,9 +5,9 @@ pub(super) fn preprocess_sql(sql: &str) -> String {
     let sql = fix_placeholder_spacing(sql);
     let sql = rewrite_sqlite_utility_statements(&sql);
     let sql = rewrite_regexp_operator(&sql);
+    let sql = rewrite_is_operator(&sql);
     let sql = rewrite_raise_function_calls(&sql);
     let sql = rewrite_or_conflict_prefix_statements(&sql);
-    let sql = rewrite_limit_offset_comma_syntax(&sql);
     let sql = rewrite_update_delete_limit_statements(&sql);
     let sql = rewrite_transaction_control_statements(&sql);
     let sql = rewrite_pragma_statements(&sql);
@@ -69,8 +69,12 @@ fn rewrite_or_conflict_prefix_statements(sql: &str) -> String {
     out.join("; ")
 }
 
-/// Rewrite SQLite `UPDATE/DELETE ... [ORDER BY ...] LIMIT ...` forms to
-/// PostgreSQL-compatible CTE+ctid targeting.
+/// Rewrite SQLite `DELETE ... [ORDER BY ...] LIMIT ...` and
+/// `UPDATE ... ORDER BY ... LIMIT ...` forms to ctid targeting.
+///
+/// A plain `UPDATE ... [WHERE ...] LIMIT n` parses, and the query rewrite
+/// handles it at AST level after placeholder numbering; only the ORDER BY
+/// form, which sqlparser does not accept on an UPDATE, is rewritten here.
 fn rewrite_update_delete_limit_statements(sql: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     for stmt in split_sql_statements(sql) {
@@ -109,6 +113,15 @@ fn rewrite_single_update_limit_stmt(stmt: &str) -> Option<String> {
     let order_pos = find_top_level_keyword_from(stmt, after_set, "order by");
     let limit_pos = find_top_level_keyword_from(stmt, after_set, "limit")?;
     let returning_pos = find_top_level_keyword_from(stmt, after_set, "returning");
+
+    // Without ORDER BY, and without RETURNING after the LIMIT (sqlparser
+    // reads RETURNING first), the statement parses, and the AST rewrite
+    // keeps the SET placeholders ahead of the WHERE's.
+    let has_order_by = order_pos.is_some_and(|op| op < limit_pos);
+    let returning_after_limit = returning_pos.is_some_and(|rp| rp > limit_pos);
+    if !has_order_by && !returning_after_limit {
+        return None;
+    }
 
     let set_end = [where_pos, order_pos, Some(limit_pos), returning_pos]
         .into_iter()
@@ -172,9 +185,12 @@ fn rewrite_single_update_limit_stmt(stmt: &str) -> Option<String> {
     target_sel.push_str(" LIMIT ");
     target_sel.push_str(limit_part);
 
+    // The SET stays first so its placeholders keep their numbers ahead of
+    // the WHERE's: a CTE hoisting the WHERE in front of the SET renumbered
+    // every bind onto the wrong column.
     let mut out = format!(
-        "WITH _plex_target AS ({}) UPDATE {} SET {} WHERE ctid IN (SELECT ctid FROM _plex_target)",
-        target_sel, table_part, set_part
+        "UPDATE {} SET {} WHERE ctid IN ({})",
+        table_part, set_part, target_sel
     );
     if !returning_tail.is_empty() {
         out.push(' ');
@@ -268,103 +284,6 @@ fn rewrite_single_delete_limit_stmt(stmt: &str) -> Option<String> {
     Some(out)
 }
 
-/// Rewrite SQLite `LIMIT <offset>, <count>` to PostgreSQL `LIMIT <count> OFFSET <offset>`.
-fn rewrite_limit_offset_comma_syntax(sql: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
-    for stmt in split_sql_statements(sql) {
-        let t = stmt.trim();
-        if t.is_empty() {
-            continue;
-        }
-        out.push(rewrite_single_limit_offset_comma_stmt(t));
-    }
-    out.join("; ")
-}
-
-fn rewrite_single_limit_offset_comma_stmt(stmt: &str) -> String {
-    let Some(limit_start) = find_top_level_keyword(stmt, "limit") else {
-        return stmt.to_string();
-    };
-    let limit_kw_end = limit_start + "limit".len();
-
-    let mut i = limit_kw_end;
-    let bytes = stmt.as_bytes();
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if i >= bytes.len() {
-        return stmt.to_string();
-    }
-
-    if find_top_level_keyword_from(stmt, i, "offset").is_some() {
-        return stmt.to_string();
-    }
-
-    let clause_end =
-        find_top_level_keyword_after_any(stmt, i, &["fetch", "union", "except", "intersect"])
-            .unwrap_or(stmt.len());
-
-    let mut j = i;
-    let mut depth = 0usize;
-    let mut comma_idx: Option<usize> = None;
-    while j < clause_end {
-        match bytes[j] {
-            b'\'' => {
-                j += 1;
-                while j < clause_end {
-                    if bytes[j] == b'\'' {
-                        j += 1;
-                        if j < clause_end && bytes[j] == b'\'' {
-                            j += 1;
-                            continue;
-                        }
-                        break;
-                    }
-                    j += 1;
-                }
-            }
-            b'(' => {
-                depth += 1;
-                j += 1;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                j += 1;
-            }
-            b',' if depth == 0 => {
-                comma_idx = Some(j);
-                break;
-            }
-            _ => j += 1,
-        }
-    }
-
-    let Some(comma) = comma_idx else {
-        return stmt.to_string();
-    };
-
-    let offset_expr = stmt[i..comma].trim();
-    let count_expr = stmt[comma + 1..clause_end].trim();
-    if offset_expr.is_empty() || count_expr.is_empty() {
-        return stmt.to_string();
-    }
-
-    let mut rewritten = String::with_capacity(stmt.len() + 16);
-    rewritten.push_str(&stmt[..limit_start]);
-    rewritten.push_str("LIMIT ");
-    rewritten.push_str(count_expr);
-    rewritten.push_str(" OFFSET ");
-    rewritten.push_str(offset_expr);
-    if clause_end < stmt.len() {
-        rewritten.push_str(&stmt[clause_end..]);
-    }
-    rewritten
-}
-
-fn find_top_level_keyword(stmt: &str, keyword: &str) -> Option<usize> {
-    find_top_level_keyword_from(stmt, 0, keyword)
-}
-
 fn find_top_level_keyword_from(stmt: &str, start: usize, keyword: &str) -> Option<usize> {
     if start >= stmt.len() {
         return None;
@@ -455,13 +374,6 @@ fn find_top_level_keyword_from(stmt: &str, start: usize, keyword: &str) -> Optio
         }
     }
     None
-}
-
-fn find_top_level_keyword_after_any(stmt: &str, start: usize, keywords: &[&str]) -> Option<usize> {
-    keywords
-        .iter()
-        .filter_map(|kw| find_top_level_keyword_from(stmt, start, kw))
-        .min()
 }
 
 /// Normalize SQLite utility statements that are unsupported or differ in PostgreSQL.
@@ -885,10 +797,34 @@ fn rewrite_single_pragma_stmt(stmt: &str) -> Option<String> {
 
     let (mapped, outcome) = match (name.as_str(), is_set) {
         // Assignment-like pragma calls: safe no-op.
-        ("foreign_keys" | "case_sensitive_like", true) => {
+        ("foreign_keys", true) => {
             let _ = value_opt;
             ("SELECT 1".to_string(), "noop_set")
         }
+
+        // SQLite's LIKE is ASCII case-insensitive until this is turned on;
+        // the query rewrite reads the flag to pick ILIKE or LIKE.
+        ("case_sensitive_like", true) => {
+            let on = matches!(
+                normalized_value.as_deref(),
+                Some("1" | "true" | "yes" | "on")
+            );
+            crate::keywords::set_case_sensitive_like(on);
+            ("SELECT 1".to_string(), "noop_set")
+        }
+
+        // Plex's "Optimize database" runs these and reads the answer: an
+        // integrity check answers one `ok` row, and a checkpoint its three
+        // counters. Stripped to nothing, the command reported no `ok` row.
+        ("integrity_check" | "quick_check", _) => (
+            format!("SELECT 'ok' AS {}", name),
+            "mapped_read",
+        ),
+        ("optimize", _) => ("SELECT 1 AS optimize".to_string(), "mapped_read"),
+        ("wal_checkpoint", _) => (
+            "SELECT 0 AS busy, 0 AS log, 0 AS checkpointed".to_string(),
+            "mapped_read",
+        ),
 
         // busy_timeout maps best to PostgreSQL lock_timeout (session-level).
         ("busy_timeout", true) => {
@@ -2013,48 +1949,34 @@ fn rewrite_metadata_items_self_join(sql: &str) -> String {
 /// 3. Rewriting the ON clauses of subsequent aliased joins: metadata_items.col → mi.col
 /// 4. Replacing all remaining metadata_items.col references in SELECT/WHERE/etc.
 fn reorder_and_alias_self_join(sql: &str) -> String {
-    let lower = sql.to_lowercase();
-
-    // Split into: prefix (everything up to the first JOIN), list of join fragments,
-    // and suffix (WHERE + rest after all JOINs).
-    //
-    // We tokenise by " join " (case-insensitive).
-    // The prefix is the part before the first join.
-    let join_needle = " join ";
-    let first_join = lower.find(join_needle);
-    if first_join.is_none() {
+    // Split into: prefix (everything up to the first join keyword), the list
+    // of join fragments, each with its own keyword sequence (`JOIN`, `LEFT
+    // JOIN`, `LEFT OUTER JOIN`, ...), and suffix (WHERE + rest after all
+    // JOINs). Splitting on the bare word "join" left a LEFT behind in the
+    // previous fragment, so a reordered LEFT JOIN came back as an inner one.
+    let Some(first) = find_join_keyword(sql, 0) else {
         return sql.to_string();
-    }
-    let first_join_pos = first_join.unwrap();
+    };
 
     // prefix: "SELECT ... FROM metadata_item_settings"
-    let prefix = &sql[..first_join_pos];
-
-    // Split the rest into join fragments. Each fragment starts after " join " and
-    // ends just before the next " join " (or at WHERE/end).
-    let rest = &sql[first_join_pos + join_needle.len()..];
-    let rest_lower = &lower[first_join_pos + join_needle.len()..];
+    let prefix = sql[..first.0].trim_end();
 
     // Find WHERE, HAVING, ORDER BY, LIMIT, GROUP BY at top level (not inside parens)
-    let suffix_start = find_top_level_clause(rest_lower);
+    let rest = &sql[first.0..];
+    let suffix_start = find_top_level_clause(&rest.to_lowercase());
     let joins_str = &rest[..suffix_start];
     let suffix = &rest[suffix_start..];
 
-    // Split joins_str into individual join fragments by " join "
-    let mut join_fragments: Vec<String> = Vec::new();
-    let joins_lower = joins_str.to_lowercase();
+    // (keyword sequence, body) per join
+    let mut join_fragments: Vec<(String, String)> = Vec::new();
     let mut pos = 0usize;
-    loop {
-        match joins_lower[pos..].find(join_needle) {
-            None => {
-                join_fragments.push(joins_str[pos..].to_string());
-                break;
-            }
-            Some(rel) => {
-                join_fragments.push(joins_str[pos..pos + rel].to_string());
-                pos += rel + join_needle.len();
-            }
-        }
+    while let Some((kw_start, kw_end)) = find_join_keyword(joins_str, pos) {
+        let keyword = joins_str[kw_start..kw_end].to_string();
+        let body_end = find_join_keyword(joins_str, kw_end)
+            .map(|(s, _)| s)
+            .unwrap_or(joins_str.len());
+        join_fragments.push((keyword, joins_str[kw_end..body_end].trim().to_string()));
+        pos = body_end;
     }
 
     // Identify which fragment(s) are unaliased metadata_items joins.
@@ -2062,10 +1984,15 @@ fn reorder_and_alias_self_join(sql: &str) -> String {
     // but NOT "metadata_items as".
     let mut unaliased_idxs: Vec<usize> = Vec::new();
     let mut aliased_idxs: Vec<usize> = Vec::new();
-    for (idx, frag) in join_fragments.iter().enumerate() {
-        let fl = frag.to_lowercase();
-        let fl = fl.trim_start();
-        if let Some(after) = fl.strip_prefix("metadata_items") {
+    for (idx, (_, body)) in join_fragments.iter().enumerate() {
+        let fl = body.to_lowercase();
+        let names_metadata_items = fl
+            .strip_prefix("metadata_items")
+            .is_some_and(|after| after.is_empty() || after.starts_with(char::is_whitespace));
+        if let Some(after) = fl
+            .strip_prefix("metadata_items")
+            .filter(|_| names_metadata_items)
+        {
             let after = after.trim_start();
             if after.starts_with("as ") || after.starts_with("as\t") {
                 aliased_idxs.push(idx);
@@ -2081,35 +2008,93 @@ fn reorder_and_alias_self_join(sql: &str) -> String {
         return sql.to_string();
     }
 
-    // Build the new join list: unaliased first (as mi), then aliased
+    // Build the new join list: unaliased first (as mi), then aliased, each
+    // under its own join keyword
     let mut new_joins: Vec<String> = Vec::new();
 
     for &idx in &unaliased_idxs {
-        let frag = &join_fragments[idx];
-        let fl = frag.to_lowercase();
-        let fl_trim = fl.trim_start();
+        let (keyword, body) = &join_fragments[idx];
         // Strip leading "metadata_items" and get the rest (ON clause etc.)
-        let rest_of_frag =
-            &frag[frag.to_lowercase().find("metadata_items").unwrap() + "metadata_items".len()..];
+        let rest_of_frag = &body["metadata_items".len()..];
         // Rewrite metadata_items.col → mi.col in the ON clause of this fragment
         let on_fixed = rest_of_frag.replace("metadata_items.", "mi.");
-        let _ = fl_trim; // suppress warning
-        new_joins.push(format!("metadata_items AS mi{}", on_fixed));
+        new_joins.push(format!("{} metadata_items AS mi{}", keyword, on_fixed));
     }
 
     for &idx in &aliased_idxs {
-        let frag = &join_fragments[idx];
+        let (keyword, body) = &join_fragments[idx];
         // In aliased join ON clauses, replace metadata_items.col → mi.col
-        let fixed = frag.replace("metadata_items.", "mi.");
-        new_joins.push(fixed);
+        new_joins.push(format!(
+            "{} {}",
+            keyword,
+            body.replace("metadata_items.", "mi.")
+        ));
     }
 
-    // Reconstruct: prefix + JOIN fragment1 JOIN fragment2 ... + suffix
-    let joins_part = new_joins.join(" JOIN ");
-    let reconstructed = format!("{} JOIN {} {}", prefix, joins_part, suffix);
+    // Reconstruct: prefix + join fragments + suffix
+    let reconstructed = format!("{} {} {}", prefix, new_joins.join(" "), suffix);
 
     // Finally replace remaining metadata_items.col in SELECT/WHERE/etc.
     replace_metadata_items_refs(&reconstructed, "mi")
+}
+
+/// The next join keyword sequence at or after `from`, outside quotes and
+/// parentheses: the byte range of `[NATURAL] [LEFT|RIGHT|FULL|INNER|CROSS]
+/// [OUTER] JOIN`.
+fn find_join_keyword(sql: &str, from: usize) -> Option<(usize, usize)> {
+    let bytes = sql.as_bytes();
+    let mut i = from;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ if depth == 0
+                && !(i > 0 && is_ident_char(bytes[i - 1]))
+                && starts_with_ascii_icase_at(bytes, i, b"join")
+                && !(i + 4 < bytes.len() && is_ident_char(bytes[i + 4])) =>
+            {
+                let end = i + 4;
+                // Walk back over the qualifiers in front of JOIN.
+                let mut start = i;
+                for group in [
+                    &["outer"][..],
+                    &["left", "right", "full", "inner", "cross"][..],
+                    &["natural"][..],
+                ] {
+                    let mut k = start;
+                    while k > 0 && bytes[k - 1].is_ascii_whitespace() {
+                        k -= 1;
+                    }
+                    let word_end = k;
+                    while k > 0 && is_ident_char(bytes[k - 1]) {
+                        k -= 1;
+                    }
+                    let word = sql[k..word_end].to_ascii_lowercase();
+                    if group.contains(&word.as_str()) {
+                        start = k;
+                    }
+                }
+                return Some((start, end));
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Find the byte offset in `s` (lowercase) where a top-level SQL clause starts
@@ -2277,11 +2262,13 @@ fn fix_placeholder_spacing(sql: &str) -> String {
     result
 }
 
-/// Replace `GLOB '<pattern>'` with `ILIKE '<pg_pattern>'`.
-/// Uses a simple state machine to avoid touching string literals.
+/// Spell the GLOB operator `SIMILAR TO`, which sqlparser accepts and SQLite
+/// never writes, so the query rewrite can turn the whole right operand --
+/// a literal, a bound parameter, or `'*' || ? || '*'` -- into an anchored
+/// regular expression match. `NOT GLOB` becomes `NOT SIMILAR TO` the same
+/// way. GLOB is case-sensitive; the ILIKE this used to emit was not, and
+/// its `%`/`_` could not carry a glob's character classes.
 fn rewrite_glob(sql: &str) -> String {
-    // We do a case-insensitive scan for the word GLOB followed by a quoted string.
-    // Strategy: tokenise by single-quoted strings to avoid false positives inside literals.
     let upper = sql.to_ascii_uppercase();
     // Fast path – nothing to do
     if !upper.contains("GLOB") {
@@ -2289,7 +2276,7 @@ fn rewrite_glob(sql: &str) -> String {
     }
 
     let bytes = sql.as_bytes();
-    let mut result = String::with_capacity(sql.len());
+    let mut result = String::with_capacity(sql.len() + 16);
     let mut i = 0;
 
     while i < bytes.len() {
@@ -2314,59 +2301,28 @@ fn rewrite_glob(sql: &str) -> String {
             continue;
         }
 
-        // Check for GLOB keyword (case-insensitive, word boundary)
-        let rest = sql.get(i..).unwrap_or("");
+        // The GLOB keyword on its own (not `glob(`, the function form, which
+        // the query rewrite handles as a call)
         let rest_upper = upper.get(i..).unwrap_or("");
         if rest_upper.starts_with("GLOB") {
-            // Must be followed by whitespace / quote (word boundary)
             let after = i + 4;
+            let prev_is_ident = i > 0 && is_ident_char(bytes[i - 1]);
             let boundary = after >= sql.len()
                 || !sql[after..].starts_with(|c: char| c.is_alphanumeric() || c == '_');
-            if boundary {
-                // Skip "GLOB"
-                i += 4;
-                // Skip whitespace
-                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                    i += 1;
-                }
-                // Now we should be at the opening quote of the pattern
-                if i < bytes.len() && bytes[i] == b'\'' {
-                    i += 1; // skip opening quote
-                    let mut pattern = String::new();
-                    while i < bytes.len() {
-                        if bytes[i] == b'\'' {
-                            i += 1;
-                            if i < bytes.len() && bytes[i] == b'\'' {
-                                pattern.push('\'');
-                                i += 1;
-                            } else {
-                                break;
-                            }
-                        } else {
-                            push_utf8_byte(&mut pattern, sql, i);
-                            i += 1;
-                        }
-                    }
-                    // Translate wildcards: * → %, ? → _
-                    let pg_pattern: String = pattern
-                        .chars()
-                        .map(|c| match c {
-                            '*' => '%',
-                            '?' => '_',
-                            other => other,
-                        })
-                        .collect();
-                    result.push_str(&format!("ILIKE '{}'", pg_pattern));
-                } else {
-                    // No quote found – emit ILIKE as-is and continue
-                    result.push_str("ILIKE ");
-                }
+            let mut j = after;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            let is_call = j < bytes.len() && bytes[j] == b'(';
+            if !prev_is_ident && boundary && !is_call {
+                result.push_str("SIMILAR TO");
+                i = after;
                 continue;
             }
         }
 
-        result.push(rest.chars().next().unwrap());
-        i += rest.chars().next().map_or(1, |c| c.len_utf8());
+        push_utf8_byte(&mut result, sql, i);
+        i += 1;
     }
 
     result
@@ -2580,6 +2536,13 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
                     i = j;
                     continue;
                 }
+
+                // sqlparser 0.61 accepts COLLATE only after a bare
+                // identifier: `metadata_items.title COLLATE NOCASE` is
+                // "Expected: end of statement, found: COLLATE". A qualified
+                // column is parenthesised, which it does accept, and the
+                // query rewrite unwraps again.
+                parenthesize_trailing_qualified_identifier(&mut result);
             }
         }
 
@@ -2588,4 +2551,136 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
     }
 
     result
+}
+
+/// If `out` ends (before optional whitespace) in a dotted identifier such as
+/// `t.col` or `"t"."col"`, wrap that identifier in parentheses.
+fn parenthesize_trailing_qualified_identifier(out: &mut String) {
+    let bytes = out.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end == 0 {
+        return;
+    }
+    let mut start = end;
+    let mut has_dot = false;
+    while start > 0 {
+        let b = bytes[start - 1];
+        if is_ident_char(b) || b == b'.' || b == b'"' || b == b'`' {
+            if b == b'.' {
+                has_dot = true;
+            }
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    if !has_dot || start == end {
+        return;
+    }
+    let ident = &out[start..end];
+    if ident.starts_with('.')
+        || ident.ends_with('.')
+        || ident.starts_with(|c: char| c.is_ascii_digit())
+    {
+        return;
+    }
+    let wrapped = format!("({})", ident);
+    out.replace_range(start..end, &wrapped);
+}
+
+/// Spell SQLite's `IS` / `IS NOT` against an expression as
+/// `IS NOT DISTINCT FROM` / `IS DISTINCT FROM`.
+///
+/// In SQLite `x IS y` compares like `=` but treats two NULLs as equal, and
+/// Plex writes it against a parameter (`guid IS ?`). sqlparser accepts only
+/// NULL, TRUE, FALSE, UNKNOWN, DISTINCT FROM and NORMALIZED after IS, so any
+/// other operand was a parse error. PostgreSQL's `IS [NOT] DISTINCT FROM`
+/// has the same null-safe meaning.
+fn rewrite_is_operator(sql: &str) -> String {
+    const KEYWORD_OPERANDS: &[&str] = &[
+        "null",
+        "true",
+        "false",
+        "unknown",
+        "distinct",
+        "normalized",
+        "nfc",
+        "nfd",
+        "nfkc",
+        "nfkd",
+    ];
+
+    fn word_at(bytes: &[u8], at: usize) -> (usize, usize) {
+        let mut i = at;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < bytes.len() && is_ident_char(bytes[i]) {
+            i += 1;
+        }
+        (start, i)
+    }
+
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 16);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Quoted strings and identifiers, and comments, are copied whole.
+        if b == b'\'' || b == b'"' || b == b'`' {
+            push_utf8_byte(&mut out, sql, i);
+            i += 1;
+            while i < bytes.len() {
+                let c = bytes[i];
+                push_utf8_byte(&mut out, sql, i);
+                i += 1;
+                if c == b {
+                    if b != b'`' && i < bytes.len() && bytes[i] == b {
+                        push_utf8_byte(&mut out, sql, i);
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                push_utf8_byte(&mut out, sql, i);
+                i += 1;
+            }
+            continue;
+        }
+
+        let prev_is_ident = i > 0 && is_ident_char(bytes[i - 1]);
+        if !prev_is_ident
+            && starts_with_ascii_icase_at(bytes, i, b"is")
+            && !(i + 2 < bytes.len() && is_ident_char(bytes[i + 2]))
+        {
+            let (w1s, w1e) = word_at(bytes, i + 2);
+            let w1 = sql[w1s..w1e].to_ascii_lowercase();
+            if w1 == "not" {
+                let (w2s, w2e) = word_at(bytes, w1e);
+                let w2 = sql[w2s..w2e].to_ascii_lowercase();
+                if w2s == w2e || !KEYWORD_OPERANDS.contains(&w2.as_str()) {
+                    out.push_str("IS DISTINCT FROM");
+                    i = w1e;
+                    continue;
+                }
+            } else if w1s == w1e || !KEYWORD_OPERANDS.contains(&w1.as_str()) {
+                out.push_str("IS NOT DISTINCT FROM");
+                i += 2;
+                continue;
+            }
+        }
+
+        push_utf8_byte(&mut out, sql, i);
+        i += 1;
+    }
+    out
 }

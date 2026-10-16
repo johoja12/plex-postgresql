@@ -15,8 +15,8 @@ fn keyword_glob() {
     let t = translate("SELECT * FROM t WHERE name GLOB '*test*'").unwrap();
     let low = t.sql.to_lowercase();
     assert!(
-        low.contains("ilike") || low.contains("like"),
-        "expected ILIKE/LIKE, got: {}",
+        low.contains("name ~ '^.*test.*$'"),
+        "expected a case-sensitive regular expression match, got: {}",
         t.sql
     );
     assert!(

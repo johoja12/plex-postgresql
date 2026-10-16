@@ -13,7 +13,7 @@ use sqlparser::ast::*;
 use sqlparser::tokenizer::Span;
 #[cfg(test)]
 use std::sync::atomic::AtomicI8;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::env_utils;
 
@@ -24,6 +24,21 @@ use ast_transform::{transform_expr, transform_query};
 use preprocess::preprocess_sql;
 
 const STRICT_PRAGMA_ERROR_SQL: &str = "__STRICT_PRAGMA_ERROR__";
+
+/// Whether `PRAGMA case_sensitive_like = 1` has been seen. SQLite's LIKE is
+/// ASCII case-insensitive unless this pragma turns that off, and the query
+/// rewrite reads it to choose between ILIKE and LIKE. Process-wide, as the
+/// pragma reaches the shim once per connection and connections share one
+/// translator.
+static CASE_SENSITIVE_LIKE: AtomicBool = AtomicBool::new(false);
+
+pub fn case_sensitive_like() -> bool {
+    CASE_SENSITIVE_LIKE.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_case_sensitive_like(on: bool) {
+    CASE_SENSITIVE_LIKE.store(on, Ordering::Relaxed);
+}
 static PRAGMA_TOTAL: AtomicU64 = AtomicU64::new(0);
 static PRAGMA_MAPPED_SET: AtomicU64 = AtomicU64::new(0);
 static PRAGMA_MAPPED_READ: AtomicU64 = AtomicU64::new(0);

@@ -43,8 +43,9 @@ const STATEMENTS: &[(&str, &str)] = &[
         "create table options",
         "CREATE TABLE t (a TEXT DEFAULT 'é' NOT NULL ON CONFLICT IGNORE)",
     ),
-    // Without a wildcard, since GLOB's * and ? become ILIKE's % and _.
-    ("glob", "SELECT id FROM media_parts WHERE file GLOB '/library/Caché (2005)'"),
+    // Without a wildcard or a bracket, since a GLOB is a regular expression
+    // and those would be rewritten.
+    ("glob", "SELECT id FROM media_parts WHERE file GLOB '/library/Caché 2005'"),
     (
         "or conflict prefix",
         "INSERT OR IGNORE INTO tags (tag) VALUES ('Anne Rice’s Mayfair Witches')",

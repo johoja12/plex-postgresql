@@ -385,7 +385,7 @@ fn find_agg_for_expr(expr: &Expr, agg_map: &AggMap) -> Option<Expr> {
 
 /// Build a map from alias name → expression for SELECT aliases.
 /// E.g. `count(media_items.id) AS cnt` → ("cnt", Expr::Function(count(…)))
-fn build_alias_map(projection: &[SelectItem]) -> Vec<(String, Expr)> {
+pub(crate) fn build_alias_map(projection: &[SelectItem]) -> Vec<(String, Expr)> {
     let mut map = Vec::new();
     for item in projection {
         if let SelectItem::ExprWithAlias { expr, alias } = item {
@@ -395,9 +395,10 @@ fn build_alias_map(projection: &[SelectItem]) -> Vec<(String, Expr)> {
     map
 }
 
-/// Replace bare identifier references in an expression with their aliased expressions.
-/// E.g. `cnt = 0` → `count(media_items.id) = 0`
-fn expand_aliases_in_expr(expr: &mut Expr, alias_map: &[(String, Expr)]) {
+/// Replace bare identifier references in an expression with their aliased
+/// expressions. E.g. `cnt = 0` → `count(media_items.id) = 0`. Subqueries are
+/// left alone: an alias is not visible inside one.
+pub(crate) fn expand_aliases_in_expr(expr: &mut Expr, alias_map: &[(String, Expr)]) {
     match expr {
         Expr::Identifier(ident) => {
             let name = ident.value.to_lowercase();
@@ -412,11 +413,91 @@ fn expand_aliases_in_expr(expr: &mut Expr, alias_map: &[(String, Expr)]) {
             expand_aliases_in_expr(left, alias_map);
             expand_aliases_in_expr(right, alias_map);
         }
-        Expr::UnaryOp { expr: inner, .. } => {
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::Cast { expr: inner, .. }
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotFalse(inner)
+        | Expr::Collate { expr: inner, .. } => {
             expand_aliases_in_expr(inner, alias_map);
         }
-        Expr::Nested(inner) => {
+        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
+            expand_aliases_in_expr(a, alias_map);
+            expand_aliases_in_expr(b, alias_map);
+        }
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
             expand_aliases_in_expr(inner, alias_map);
+            for e in list {
+                expand_aliases_in_expr(e, alias_map);
+            }
+        }
+        Expr::InSubquery { expr: inner, .. } => {
+            expand_aliases_in_expr(inner, alias_map);
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            expand_aliases_in_expr(inner, alias_map);
+            expand_aliases_in_expr(low, alias_map);
+            expand_aliases_in_expr(high, alias_map);
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            ..
+        }
+        | Expr::ILike {
+            expr: inner,
+            pattern,
+            ..
+        }
+        | Expr::SimilarTo {
+            expr: inner,
+            pattern,
+            ..
+        } => {
+            expand_aliases_in_expr(inner, alias_map);
+            expand_aliases_in_expr(pattern, alias_map);
+        }
+        Expr::Function(func) => {
+            if let FunctionArguments::List(ref mut al) = func.args {
+                for arg in &mut al.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(e),
+                        ..
+                    } = arg
+                    {
+                        expand_aliases_in_expr(e, alias_map);
+                    }
+                }
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                expand_aliases_in_expr(op, alias_map);
+            }
+            for cw in conditions {
+                expand_aliases_in_expr(&mut cw.condition, alias_map);
+                expand_aliases_in_expr(&mut cw.result, alias_map);
+            }
+            if let Some(er) = else_result {
+                expand_aliases_in_expr(er, alias_map);
+            }
         }
         _ => {}
     }

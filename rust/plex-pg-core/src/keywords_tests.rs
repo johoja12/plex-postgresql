@@ -144,8 +144,10 @@ mod tests {
 
     #[test]
     fn subset_core__keyword_glob_wildcard() {
+        // GLOB is case-sensitive, so it is a regular expression match, not
+        // the ILIKE it used to become.
         let r = translate("SELECT * FROM t WHERE name GLOB '*test*'").unwrap();
-        assert!(r.sql.to_uppercase().contains("ILIKE") || r.sql.to_uppercase().contains("LIKE"));
+        assert!(r.sql.contains("name ~ '^.*test.*$'"), "{}", r.sql);
         assert!(!r.sql.to_uppercase().contains(" GLOB "));
     }
 

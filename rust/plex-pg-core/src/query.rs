@@ -3,22 +3,37 @@ use sqlparser::ast::helpers::attached_token::AttachedToken;
 ///
 /// Miscellaneous query fixups for SQLite → PostgreSQL translation:
 ///   1. Subquery alias      — FROM (SELECT …) without alias → AS _subq
-///   2. NULLS LAST          — `ORDER BY col IS NULL, col ASC` → `ORDER BY col NULLS LAST`
+///   2. NULLS LAST/FIRST    — `ORDER BY col IS NULL [DESC], col` → `ORDER BY col NULLS LAST|FIRST`
 ///   3. DISTINCT + agg ORDER BY — `SELECT DISTINCT … ORDER BY count(*)` → remove DISTINCT
-///   4. CASE booleans       — `CASE WHEN x THEN 1 ELSE 0 END` → TRUE/FALSE
+///   4. CASE booleans       — `CASE WHEN x THEN 1 ELSE 0 END` → TRUE/FALSE, in a boolean
+///                            context only (WHERE, HAVING, ON, AND/OR, NOT); an aggregate,
+///                            a projection or a comparison keeps the integers
 ///   5. WHERE 1 / WHERE 0   — → WHERE TRUE / WHERE FALSE
 ///   6. max(a,b) multi-arg  — → GREATEST(a,b)
 ///   7. min(a,b) multi-arg  — → LEAST(a,b)
 ///   8. COLLATE ICU strip   — remove icu_* collations
 ///   9. COLLATE NOCASE      — `x COLLATE NOCASE = y` → `LOWER(x) = LOWER(y)`
-///  10. FTS4 MATCH          — `col MATCH 'term'` → `to_tsvector('simple', col) @@ to_tsquery('simple', E'term')`
+///  10. FTS4 MATCH          — `col MATCH term` → `to_tsvector('simple', plex.fold(col)) @@ plex.fts_query(term)`
 ///  11. Collections filter  — remove `metadata_type=18` from OR conditions
-///  12. Int/text mismatch   — cast integer to ::text for known text columns
-///                            and cast string literal to integer for known int columns
+///  12. Affinity            — a text column compared with a number casts the number to
+///                            text; an integer column compared with a string casts the
+///                            string, or folds the comparison when the string is no
+///                            integer (SQLite's affinity rules, from the schema's column
+///                            types)
+///  13. LIKE                — bare LIKE is ASCII case-insensitive in SQLite → ILIKE
+///                            (unless `PRAGMA case_sensitive_like` was turned on)
+///  14. GLOB                — `x GLOB pat` (SIMILAR TO after preprocessing) → `x ~ '^regex$'`
+///  15. Aliases             — a projection alias used in WHERE or HAVING is replaced by
+///                            its expression
+///  16. LIMIT -1            — no limit; `LIMIT off, n` → `LIMIT n OFFSET off`
+///  17. UPDATE … LIMIT n    — `WHERE ctid IN (SELECT ctid FROM t WHERE … LIMIT n)`
+///
+/// Every rewrite enters subqueries (IN, EXISTS, scalar) and JOIN … ON expressions.
 use sqlparser::ast::*;
 use sqlparser::tokenizer::Span;
 
 use crate::rewriter::ast_utils::{take_boxed_expr, take_expr, wrap_double_colon_cast};
+use crate::schema_columns::{ColumnKind, COLUMNS};
 use std::cell::RefCell;
 
 pub fn transform(stmt: &mut Statement) {
@@ -30,19 +45,23 @@ pub fn transform(stmt: &mut Statement) {
             }
         }
         Statement::Update(u) => {
-            let _scope =
-                TextColumnScope::for_tables(&table_names_in(std::slice::from_ref(&u.table)));
-            if let Some(sel) = &mut u.selection {
-                transform_expr(sel);
+            let _scope = TableScope::enter(scoped_tables(std::slice::from_ref(&u.table)));
+            fix_table_with_joins(&mut u.table);
+            for assignment in &mut u.assignments {
+                transform_expr(&mut assignment.value);
             }
+            if let Some(sel) = &mut u.selection {
+                transform_bool_expr(sel);
+            }
+            rewrite_update_limit(u);
         }
         Statement::Delete(d) => {
             let tables = match &d.from {
-                FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => table_names_in(t),
+                FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => scoped_tables(t),
             };
-            let _scope = TextColumnScope::for_tables(&tables);
+            let _scope = TableScope::enter(tables);
             if let Some(sel) = &mut d.selection {
-                transform_expr(sel);
+                transform_bool_expr(sel);
             }
         }
         _ => {}
@@ -81,6 +100,8 @@ fn transform_query(q: &mut Query) {
 
     // Remove ORDER BY rowid (PostgreSQL doesn't have rowid)
     fix_order_by_rowid(q);
+
+    fix_limit_clause(q);
 }
 
 fn transform_set_expr(se: &mut SetExpr) {
@@ -103,9 +124,12 @@ fn transform_set_expr(se: &mut SetExpr) {
 }
 
 fn transform_select(sel: &mut Select) {
-    let _scope = TextColumnScope::for_tables(&table_names_in(&sel.from));
+    let _scope = TableScope::enter(scoped_tables(&sel.from));
 
-    // Fix FROM subqueries without alias
+    // Fix 15: a projection alias in WHERE or HAVING stands for its expression.
+    expand_projection_aliases(sel);
+
+    // Fix FROM subqueries without alias, and every JOIN's ON expression
     for twj in &mut sel.from {
         fix_table_with_joins(twj);
     }
@@ -114,7 +138,7 @@ fn transform_select(sel: &mut Select) {
     if let Some(w) = &mut sel.selection {
         fix_where_numeric(w);
         fix_collections_filter(w);
-        transform_expr(w);
+        transform_bool_expr(w);
     }
 
     // Projection
@@ -136,48 +160,113 @@ fn transform_select(sel: &mut Select) {
 
     // HAVING
     if let Some(h) = &mut sel.having {
-        transform_expr(h);
+        transform_bool_expr(h);
     }
 }
 
-// ─── Fix 1: Subquery alias ────────────────────────────────────────────────────
+// ─── Fix 15: projection aliases in WHERE / HAVING ────────────────────────────
+
+/// Plex's Live TV guide writes `min(begins_at, ends_at) as minimum_at …
+/// where minimum_at > ?`. SQLite resolves the alias; PostgreSQL answers
+/// "column minimum_at does not exist". The alias is replaced by its
+/// expression, as HAVING already was -- unless a column of that name exists
+/// on a table in scope, since SQLite resolves the column before the alias.
+fn expand_projection_aliases(sel: &mut Select) {
+    if sel.selection.is_none() && sel.having.is_none() {
+        return;
+    }
+    let alias_map: Vec<(String, Expr)> = crate::groupby::build_alias_map(&sel.projection)
+        .into_iter()
+        .filter(|(alias, expr)| {
+            let same_name = match expr {
+                Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(alias),
+                Expr::CompoundIdentifier(parts) => parts
+                    .last()
+                    .is_some_and(|p| p.value.eq_ignore_ascii_case(alias)),
+                _ => false,
+            };
+            !same_name && !is_known_column(alias)
+        })
+        .collect();
+    if alias_map.is_empty() {
+        return;
+    }
+    if let Some(w) = &mut sel.selection {
+        crate::groupby::expand_aliases_in_expr(w, &alias_map);
+    }
+    if let Some(h) = &mut sel.having {
+        crate::groupby::expand_aliases_in_expr(h, &alias_map);
+    }
+}
+
+// ─── Fix 1: Subquery alias, and JOIN … ON ────────────────────────────────────
 
 fn fix_table_with_joins(twj: &mut TableWithJoins) {
     fix_table_factor(&mut twj.relation);
     for join in &mut twj.joins {
         fix_table_factor(&mut join.relation);
-    }
-}
-
-fn fix_table_factor(tf: &mut TableFactor) {
-    if let TableFactor::Derived {
-        subquery, alias, ..
-    } = tf
-    {
-        transform_query(subquery);
-        // Add alias if missing
-        if alias.is_none() {
-            *alias = Some(TableAlias {
-                explicit: true,
-                name: Ident::new("_subq"),
-                columns: vec![],
-            });
+        if let Some(on) = join_on_expr_mut(&mut join.join_operator) {
+            transform_bool_expr(on);
         }
     }
 }
 
-// ─── Fix 2: NULLS LAST from IS NULL pattern ───────────────────────────────────
+fn join_on_expr_mut(op: &mut JoinOperator) -> Option<&mut Expr> {
+    match op {
+        JoinOperator::Join(JoinConstraint::On(e))
+        | JoinOperator::Inner(JoinConstraint::On(e))
+        | JoinOperator::Left(JoinConstraint::On(e))
+        | JoinOperator::LeftOuter(JoinConstraint::On(e))
+        | JoinOperator::Right(JoinConstraint::On(e))
+        | JoinOperator::RightOuter(JoinConstraint::On(e))
+        | JoinOperator::FullOuter(JoinConstraint::On(e))
+        | JoinOperator::CrossJoin(JoinConstraint::On(e))
+        | JoinOperator::Semi(JoinConstraint::On(e))
+        | JoinOperator::LeftSemi(JoinConstraint::On(e))
+        | JoinOperator::RightSemi(JoinConstraint::On(e))
+        | JoinOperator::Anti(JoinConstraint::On(e))
+        | JoinOperator::LeftAnti(JoinConstraint::On(e))
+        | JoinOperator::RightAnti(JoinConstraint::On(e))
+        | JoinOperator::StraightJoin(JoinConstraint::On(e)) => Some(e),
+        _ => None,
+    }
+}
 
-/// Detect: `ORDER BY expr IS NULL, expr [ASC|DESC]`
-/// Replace with: `ORDER BY expr [ASC|DESC] NULLS LAST`
+fn fix_table_factor(tf: &mut TableFactor) {
+    match tf {
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            transform_query(subquery);
+            // Add alias if missing
+            if alias.is_none() {
+                *alias = Some(TableAlias {
+                    explicit: true,
+                    name: Ident::new("_subq"),
+                    columns: vec![],
+                });
+            }
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => fix_table_with_joins(table_with_joins),
+        _ => {}
+    }
+}
+
+// ─── Fix 2: NULLS LAST / NULLS FIRST from IS NULL pattern ────────────────────
+
+/// Detect: `ORDER BY expr IS [NOT] NULL [ASC|DESC], expr [ASC|DESC]`
+/// Replace with: `ORDER BY expr [ASC|DESC] NULLS LAST|FIRST`
+///
+/// `IS NULL` is 1 for a null, so ascending puts nulls last and descending
+/// first; `IS NOT NULL` the other way round.
 fn fix_order_by_is_null(q: &mut Query) {
     let Some(ob) = &mut q.order_by else { return };
     let OrderByKind::Expressions(exprs) = &mut ob.kind else {
         return;
     };
 
-    // Find pairs: (i, j) where exprs[i] is `x IS NULL` and exprs[j] is `x [ASC|DESC]`
-    // Strategy: collect indices of IS NULL exprs, match with following expr
     let len = exprs.len();
     if len < 2 {
         return;
@@ -186,18 +275,23 @@ fn fix_order_by_is_null(q: &mut Query) {
     let mut to_remove: Vec<usize> = Vec::new();
     let mut i = 0;
     while i < len {
-        if let Expr::IsNull(ref inner) = exprs[i].expr {
-            let col = *inner.clone();
-            // Look for the next expr that matches `col`
-            if i + 1 < len {
-                let next = &mut exprs[i + 1];
-                if exprs_display_eq(&next.expr, &col) {
-                    // Set NULLS LAST on the real ordering expr
-                    next.options.nulls_first = Some(false);
-                    to_remove.push(i);
-                    i += 2;
-                    continue;
-                }
+        let (col, nulls_first_when_asc) = match &exprs[i].expr {
+            Expr::IsNull(inner) => (*inner.clone(), false),
+            Expr::IsNotNull(inner) => (*inner.clone(), true),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let descending = exprs[i].options.asc == Some(false);
+        let nulls_first = nulls_first_when_asc != descending;
+        if i + 1 < len {
+            let next = &mut exprs[i + 1];
+            if exprs_display_eq(&next.expr, &col) {
+                next.options.nulls_first = Some(nulls_first);
+                to_remove.push(i);
+                i += 2;
+                continue;
             }
         }
         i += 1;
@@ -233,6 +327,113 @@ fn fix_order_by_rowid(q: &mut Query) {
     // If all ORDER BY expressions were removed, remove the ORDER BY clause
     if exprs.is_empty() {
         q.order_by = None;
+    }
+}
+
+// ─── Fix 16: LIMIT ───────────────────────────────────────────────────────────
+
+/// `LIMIT off, n` is `LIMIT n OFFSET off` (the placeholder pass numbers the
+/// offset first, as SQLite binds it), and a negative LIMIT is no limit at all
+/// in SQLite -- PostgreSQL refuses it, so the clause goes.
+fn fix_limit_clause(q: &mut Query) {
+    if matches!(q.limit_clause, Some(LimitClause::OffsetCommaLimit { .. })) {
+        if let Some(LimitClause::OffsetCommaLimit { offset, limit }) = q.limit_clause.take() {
+            q.limit_clause = Some(LimitClause::LimitOffset {
+                limit: Some(limit),
+                offset: Some(Offset {
+                    value: offset,
+                    rows: OffsetRows::None,
+                }),
+                limit_by: vec![],
+            });
+        }
+    }
+    if let Some(LimitClause::LimitOffset { limit, .. }) = &mut q.limit_clause {
+        if limit.as_ref().is_some_and(is_negative_number) {
+            *limit = None;
+        }
+    }
+}
+
+fn is_negative_number(expr: &Expr) -> bool {
+    match expr {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => is_number_literal(expr),
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        }) => s.starts_with('-'),
+        Expr::Nested(inner) => is_negative_number(inner),
+        _ => false,
+    }
+}
+
+// ─── Fix 17: UPDATE … LIMIT n ────────────────────────────────────────────────
+
+/// PostgreSQL has no LIMIT on UPDATE. The rows are picked by ctid through a
+/// subquery in the WHERE -- after placeholder numbering, so the SET
+/// placeholders keep their order before the WHERE's (the text rewrite this
+/// replaces hoisted the WHERE into a CTE ahead of the SET, and every bind
+/// landed on the wrong column).
+fn rewrite_update_limit(u: &mut Update) {
+    let Some(limit) = u.limit.take() else { return };
+    if is_negative_number(&limit) {
+        return;
+    }
+    let selection = u.selection.take();
+    let subquery = select_ctid_query(u.table.clone(), selection, limit);
+    u.selection = Some(Expr::InSubquery {
+        expr: Box::new(Expr::Identifier(Ident::new("ctid"))),
+        subquery: Box::new(subquery),
+        negated: false,
+    });
+}
+
+fn select_ctid_query(table: TableWithJoins, selection: Option<Expr>, limit: Expr) -> Query {
+    Query {
+        with: None,
+        body: Box::new(SetExpr::Select(Box::new(Select {
+            select_token: AttachedToken::empty(),
+            optimizer_hint: None,
+            distinct: None,
+            select_modifiers: None,
+            top: None,
+            top_before_distinct: false,
+            projection: vec![SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(
+                "ctid",
+            )))],
+            exclude: None,
+            into: None,
+            from: vec![table],
+            lateral_views: vec![],
+            prewhere: None,
+            selection,
+            connect_by: vec![],
+            group_by: GroupByExpr::Expressions(vec![], vec![]),
+            cluster_by: vec![],
+            distribute_by: vec![],
+            sort_by: vec![],
+            having: None,
+            named_window: vec![],
+            qualify: None,
+            window_before_qualify: false,
+            value_table_mode: None,
+            flavor: SelectFlavor::Standard,
+        }))),
+        order_by: None,
+        limit_clause: Some(LimitClause::LimitOffset {
+            limit: Some(limit),
+            offset: None,
+            limit_by: vec![],
+        }),
+        fetch: None,
+        locks: vec![],
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: vec![],
     }
 }
 
@@ -349,10 +550,6 @@ fn fix_distinct_orderby_not_in_select(q: &mut Query) {
         for expr in to_add {
             sel.projection.push(SelectItem::UnnamedExpr(expr));
         }
-        // Fallback safety: if we still can't resolve (e.g. wildcard select),
-        // remove DISTINCT entirely — this may return duplicates but avoids 500.
-        // (Recheck after appending: if projection now has all ORDER BY exprs, keep DISTINCT.)
-        // Actually we already appended them above, so DISTINCT is now valid. No need to remove.
     }
 }
 
@@ -416,11 +613,24 @@ fn fix_where_numeric(expr: &mut Expr) {
 
 // ─── Main expression transformer ─────────────────────────────────────────────
 
+/// Transform an expression that yields a value (a projection, an argument, a
+/// comparison operand).
+fn transform_expr(expr: &mut Expr) {
+    transform_expr_in(expr, false);
+}
+
+/// Transform an expression read as a condition (WHERE, HAVING, ON, the
+/// operands of AND, OR and NOT, a CASE's WHEN).
+fn transform_bool_expr(expr: &mut Expr) {
+    transform_expr_in(expr, true);
+}
+
 /// Recursively transform an expression in place, applying all query-level
 /// fixups (CASE booleans, max/min→GREATEST/LEAST, COLLATE, FTS MATCH, etc.).
-fn transform_expr(expr: &mut Expr) {
+/// `boolean` says whether the expression is read as a condition.
+fn transform_expr_in(expr: &mut Expr, boolean: bool) {
     match expr {
-        // Fix 4: CASE WHEN x THEN 1 ELSE 0 END → TRUE/FALSE
+        // Fix 4: CASE WHEN x THEN 1 ELSE 0 END → TRUE/FALSE, in a boolean context
         Expr::Case {
             operand,
             conditions,
@@ -442,21 +652,41 @@ fn transform_expr(expr: &mut Expr) {
             if is_json_guard {
                 return;
             }
+            let has_operand = operand.is_some();
             if let Some(op) = operand {
                 transform_expr(op);
             }
-            for cw in conditions {
-                transform_expr(&mut cw.condition);
-                transform_expr(&mut cw.result);
-                maybe_bool_value_inplace(&mut cw.result);
+            for cw in conditions.iter_mut() {
+                // `CASE x WHEN 1` compares; `CASE WHEN a` tests.
+                transform_expr_in(&mut cw.condition, !has_operand);
+                transform_expr_in(&mut cw.result, boolean);
             }
-            if let Some(er) = else_result {
-                transform_expr(er);
-                maybe_bool_value_inplace(er);
+            if let Some(er) = else_result.as_deref_mut() {
+                transform_expr_in(er, boolean);
+            }
+            // Every result a 0/1 or a boolean literal: a condition reads them
+            // as booleans, and a boolean literal among them makes the 0/1
+            // booleans too, or PostgreSQL would mix integer and boolean.
+            let results: Vec<&Expr> = conditions
+                .iter()
+                .map(|cw| &cw.result)
+                .chain(else_result.as_deref())
+                .collect();
+            let all_bool_like = results
+                .iter()
+                .all(|r| is_zero_or_one_literal(r) || is_boolean_literal(r));
+            let any_boolean = results.iter().any(|r| is_boolean_literal(r));
+            if all_bool_like && (boolean || any_boolean) {
+                for cw in conditions.iter_mut() {
+                    maybe_bool_value_inplace(&mut cw.result);
+                }
+                if let Some(er) = else_result {
+                    maybe_bool_value_inplace(er);
+                }
             }
         }
 
-        // Fix 6 & 7: max(a,b) → GREATEST, min(a,b) → LEAST
+        // Fix 6 & 7: max(a,b) → GREATEST, min(a,b) → LEAST; glob(pat, x) → x ~ regex
         Expr::Function(ref mut func) => {
             let fn_name = func_name_str(func);
             let arg_count = if let FunctionArguments::List(ref al) = func.args {
@@ -482,15 +712,34 @@ fn transform_expr(expr: &mut Expr) {
                     }
                 }
             }
+            if let Some(filter) = &mut func.filter {
+                transform_bool_expr(filter);
+            }
 
             if fn_name == "max" && arg_count >= 2 {
                 rename_function(func, "GREATEST");
             } else if fn_name == "min" && arg_count >= 2 {
                 rename_function(func, "LEAST");
+            } else if fn_name == "glob" && arg_count == 2 {
+                // glob(X, Y) is Y GLOB X
+                let taken = take_expr(expr);
+                if let Expr::Function(Function {
+                    args: FunctionArguments::List(al),
+                    ..
+                }) = taken
+                {
+                    let mut args = al.args.into_iter().filter_map(|a| match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                        _ => None,
+                    });
+                    if let (Some(pattern), Some(subject)) = (args.next(), args.next()) {
+                        *expr = glob_match(subject, pattern, false);
+                    }
+                }
             }
         }
 
-        // Fix FTS4: col MATCH 'term' → to_tsvector('simple', col) @@ to_tsquery('simple', E'converted_term')
+        // Fix FTS4: col MATCH term → to_tsvector('simple', plex.fold(col)) @@ plex.fts_query(term)
         Expr::BinaryOp {
             op: BinaryOperator::PGCustomBinaryOperator(ref custom_ops),
             ..
@@ -544,13 +793,12 @@ fn transform_expr(expr: &mut Expr) {
             let is_eq_op = matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq);
             let is_logical_op = matches!(op, BinaryOperator::And | BinaryOperator::Or);
 
-            // Fix 12: Int/text mismatch
-            if is_eq_op && should_fix_int_text_mismatch(left, right) {
-                let taken = take_expr(expr);
-                if let Expr::BinaryOp { left, op, right } = taken {
-                    *expr = fix_int_text_mismatch(*left, op, *right);
+            // Fix 12: affinity between a column and a literal of the other type
+            if is_comparison_op(op) {
+                if let Some(fixed) = fix_affinity_comparison(left, op, right) {
+                    *expr = fixed;
+                    return;
                 }
-                return;
             }
 
             // Fix 9: COLLATE NOCASE on equality → LOWER(x) = LOWER(y)
@@ -568,8 +816,8 @@ fn transform_expr(expr: &mut Expr) {
                 // Fix 10: 0/1 in boolean context (AND/OR) → FALSE/TRUE
                 strip_collate_nocase_inplace(left);
                 strip_collate_nocase_inplace(right);
-                transform_expr(left);
-                transform_expr(right);
+                transform_bool_expr(left);
+                transform_bool_expr(right);
                 maybe_bool_value_inplace(left);
                 maybe_bool_value_inplace(right);
             } else {
@@ -579,17 +827,36 @@ fn transform_expr(expr: &mut Expr) {
                 transform_expr(right);
             }
         }
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: inner,
+        } => transform_bool_expr(inner),
         Expr::UnaryOp { expr: inner, .. } => transform_expr(inner),
-        Expr::Nested(inner) => transform_expr(inner),
+        Expr::Nested(inner) => transform_expr_in(inner, boolean),
         Expr::Cast { expr: inner, .. } => transform_expr(inner),
         Expr::InList {
-            expr: inner, list, ..
+            expr: inner,
+            list,
+            negated,
         } => {
             transform_expr(inner);
-            for e in list {
+            for e in list.iter_mut() {
                 transform_expr(e);
             }
+            if let Some(folded) = fix_affinity_in_list(inner, list, *negated) {
+                *expr = folded;
+            }
         }
+        Expr::InSubquery {
+            expr: inner,
+            subquery,
+            ..
+        } => {
+            transform_expr(inner);
+            transform_query(subquery);
+        }
+        Expr::Exists { subquery, .. } => transform_query(subquery),
+        Expr::Subquery(subquery) => transform_query(subquery),
         Expr::Between {
             expr: inner,
             low,
@@ -619,14 +886,14 @@ fn transform_expr(expr: &mut Expr) {
                 // Strip the collation entirely — unwrap inner expr
                 let taken = take_expr(expr);
                 if let Expr::Collate { expr: inner, .. } = taken {
-                    *expr = *inner;
+                    *expr = unwrap_nested_column(*inner);
                 }
                 transform_expr(expr);
             } else if collation_name == "nocase" {
                 // Standalone NOCASE (ORDER BY, non-equality) → LOWER(expr)
                 let taken = take_expr(expr);
                 if let Expr::Collate { expr: inner, .. } = taken {
-                    *expr = *inner;
+                    *expr = unwrap_nested_column(*inner);
                 }
                 transform_expr(expr);
                 wrap_lower_inplace(expr);
@@ -637,18 +904,18 @@ fn transform_expr(expr: &mut Expr) {
                 }
             }
         }
-        // Fix LIKE ... COLLATE NOCASE → ILIKE
+        // Fix 13: LIKE is ASCII case-insensitive in SQLite → ILIKE
         Expr::Like {
             expr: like_expr,
             pattern,
             ..
         } => {
-            let pat_nocase = is_collate_nocase(pattern);
+            let nocase = is_collate_nocase(pattern) || is_collate_nocase(like_expr);
             strip_collate_nocase_inplace(pattern);
+            strip_collate_nocase_inplace(like_expr);
             transform_expr(like_expr);
             transform_expr(pattern);
-            if pat_nocase {
-                // Convert to ILIKE — need to take the whole node
+            if nocase || !crate::keywords::case_sensitive_like() {
                 let taken = take_expr(expr);
                 if let Expr::Like {
                     negated,
@@ -675,13 +942,113 @@ fn transform_expr(expr: &mut Expr) {
         } => {
             // Strip NOCASE from ILIKE too (already case-insensitive)
             strip_collate_nocase_inplace(pattern);
+            strip_collate_nocase_inplace(ilike_expr);
             transform_expr(ilike_expr);
             transform_expr(pattern);
         }
-        Expr::IsNull(inner) => transform_expr(inner),
-        Expr::IsNotNull(inner) => transform_expr(inner),
+        // Fix 14: GLOB, which the preprocessor spells SIMILAR TO so that it parses
+        Expr::SimilarTo { .. } => {
+            let taken = take_expr(expr);
+            if let Expr::SimilarTo {
+                negated,
+                expr: subject,
+                pattern,
+                ..
+            } = taken
+            {
+                let mut subject = *subject;
+                let mut pattern = *pattern;
+                let nocase = is_collate_nocase(&pattern) || is_collate_nocase(&subject);
+                strip_collate_nocase_inplace(&mut pattern);
+                strip_collate_nocase_inplace(&mut subject);
+                transform_expr(&mut subject);
+                transform_expr(&mut pattern);
+                *expr = glob_match(subject, pattern, nocase);
+                if negated {
+                    *expr = negate_regex_match(take_expr(expr));
+                }
+            }
+        }
+        Expr::RLike {
+            expr: inner,
+            pattern,
+            ..
+        } => {
+            transform_expr(inner);
+            transform_expr(pattern);
+        }
+        Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotFalse(inner)
+        | Expr::IsUnknown(inner)
+        | Expr::IsNotUnknown(inner) => transform_expr(inner),
+        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
+            transform_expr(a);
+            transform_expr(b);
+        }
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            transform_expr(left);
+            transform_expr(right);
+        }
+        Expr::Tuple(items) => {
+            for e in items {
+                transform_expr(e);
+            }
+        }
+        Expr::Extract { expr: inner, .. }
+        | Expr::Ceil { expr: inner, .. }
+        | Expr::Floor { expr: inner, .. } => transform_expr(inner),
+        Expr::Substring {
+            expr: inner,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            transform_expr(inner);
+            if let Some(e) = substring_from {
+                transform_expr(e);
+            }
+            if let Some(e) = substring_for {
+                transform_expr(e);
+            }
+        }
+        Expr::Trim {
+            expr: inner,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            transform_expr(inner);
+            if let Some(e) = trim_what {
+                transform_expr(e);
+            }
+            if let Some(list) = trim_characters {
+                for e in list {
+                    transform_expr(e);
+                }
+            }
+        }
+        Expr::Position { expr: inner, r#in } => {
+            transform_expr(inner);
+            transform_expr(r#in);
+        }
         _ => {}
     }
+}
+
+fn is_comparison_op(op: &BinaryOperator) -> bool {
+    matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq
+    )
 }
 
 fn is_json_valid_call(expr: &Expr) -> bool {
@@ -745,6 +1112,26 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
     }
 }
 
+fn is_zero_or_one_literal(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(s, _),
+            ..
+        }) if s == "0" || s == "1"
+    )
+}
+
+fn is_boolean_literal(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Value(ValueWithSpan {
+            value: Value::Boolean(_),
+            ..
+        })
+    )
+}
+
 /// If the expression is a numeric literal 1 or 0, replace with TRUE/FALSE in place.
 fn maybe_bool_value_inplace(expr: &mut Expr) {
     if let Expr::Value(ValueWithSpan {
@@ -802,30 +1189,36 @@ fn strip_collate_nocase_inplace(expr: &mut Expr) {
     if should_strip {
         let taken = take_expr(expr);
         if let Expr::Collate { expr: inner, .. } = taken {
-            *expr = *inner;
+            *expr = unwrap_nested_column(*inner);
         }
+    }
+}
+
+/// The preprocessor parenthesises `table.col COLLATE NOCASE`, which sqlparser
+/// only accepts after a bare identifier; the parentheses have no further use.
+fn unwrap_nested_column(expr: Expr) -> Expr {
+    match expr {
+        Expr::Nested(inner)
+            if matches!(*inner, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) =>
+        {
+            *inner
+        }
+        other => other,
     }
 }
 
 // ─── Fix 11: Collections filter ───────────────────────────────────────────────
 
 /// Remove `metadata_type=18` from OR conditions.
-/// Plex can't properly serialize collection objects (type 18), causing errors.
 /// Pattern: `(metadata_type=1 OR metadata_type=18)` → `metadata_type=1`
+///
+/// A predicate that is only `(metadata_type=18)` is kept: collections are
+/// served, and folding it to TRUE answered the whole section where Plex asked
+/// for its collections alone.
 fn fix_collections_filter(expr: &mut Expr) {
     // Recurse into nested expressions first
     match expr {
-        Expr::Nested(inner) => {
-            fix_collections_filter(inner);
-            // After fixing inner, if it simplified to a single condition, unwrap
-            if is_metadata_type_eq(inner, 18) {
-                // Entire expression is just metadata_type=18 — replace with TRUE
-                *expr = Expr::Value(ValueWithSpan {
-                    value: Value::Boolean(true),
-                    span: Span::empty(),
-                });
-            }
-        }
+        Expr::Nested(inner) => fix_collections_filter(inner),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Or,
@@ -887,93 +1280,166 @@ fn is_metadata_type_eq(expr: &Expr, value: i64) -> bool {
     false
 }
 
-// ─── Fix 12: Int/text mismatch ────────────────────────────────────────────────
+// ─── Fix 12: column affinity ──────────────────────────────────────────────────
+//
+// SQLite compares a column with a literal under the column's affinity: a
+// number against a TEXT column is compared as text, and a string against an
+// INTEGER column is converted to a number -- or, when it is no number, stays
+// text and sorts after every integer, so `id = ''` is false and `id <> ''`
+// true. Plex writes `metadata_items.id=''` for an empty id list (deleting a
+// smart collection, 2026-10-16); the CAST it used to get made PostgreSQL
+// refuse the statement (`invalid input syntax for type integer: ""`), so the
+// delete answered 500 after five retries. schema_migrations.version is text,
+// and Plex writes `where version=202608120900`, which PostgreSQL rejects
+// outright: twelve digits is a bigint, and the schema's compat operators only
+// pair text with integer.
+//
+// Which columns are which comes from the schema's column types
+// (`schema_columns`), resolved against the tables of the statement being
+// transformed: a qualified column through its table or alias, a bare one
+// through every table in scope. `status`, `state`, `downloaded` and
+// `metadata_item_id` were once listed as text columns here; they are integers
+// everywhere, and `status <> 1` became `<> 1::TEXT` and failed.
 
-/// Known columns that are stored as TEXT in Plex but sometimes compared with integers
-const KNOWN_TEXT_COLUMNS: &[&str] = &["status", "state", "downloaded", "metadata_item_id"];
-
-/// Text columns that cannot go in the list above because the same name is an
-/// integer in another table, so they are only text in the tables named here.
-///
-/// schema_migrations.version is text; play_queues.version and
-/// metadata_item_clusterings.version are integers. Plex writes the migration
-/// version unquoted -- `where version=202608120900` -- which SQLite compares as
-/// text by affinity and PostgreSQL rejects outright: twelve digits is a bigint,
-/// and the schema's compat operators only pair text with integer.
-const KNOWN_TEXT_COLUMNS_BY_TABLE: &[(&str, &[&str])] = &[("schema_migrations", &["version"])];
+/// A table a statement reads, with the name a column may qualify it by.
+#[derive(Clone, Debug)]
+struct ScopedTable {
+    qualifier: String,
+    table: String,
+}
 
 thread_local! {
-    /// The per-table text columns in force for the statement being
-    /// transformed. `transform_expr` walks expressions without knowing which
+    /// The tables in scope for the expression being transformed, innermost
+    /// level first. `transform_expr` walks expressions without knowing which
     /// table they belong to, so the statement-level walk sets this before
-    /// descending; nested queries push their own and restore on the way out.
-    static STATEMENT_TEXT_COLUMNS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    /// descending; a subquery pushes its own level and restores on the way
+    /// out, keeping the outer tables visible for correlated references.
+    static SCOPE: RefCell<Vec<Vec<ScopedTable>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Scopes `STATEMENT_TEXT_COLUMNS` to the tables of one statement, restoring
-/// whatever an enclosing statement had set when dropped.
-struct TextColumnScope {
-    previous: Vec<&'static str>,
+/// Scopes `SCOPE` to the tables of one statement or subquery.
+struct TableScope;
+
+impl TableScope {
+    fn enter(tables: Vec<ScopedTable>) -> Self {
+        SCOPE.with(|s| s.borrow_mut().insert(0, tables));
+        Self
+    }
 }
 
-impl TextColumnScope {
-    fn for_tables(tables: &[String]) -> Self {
-        let mut columns: Vec<&'static str> = Vec::new();
-        for table in tables {
-            let table = table.to_lowercase();
-            let table = table.rsplit('.').next().unwrap_or(&table);
-            for (known, cols) in KNOWN_TEXT_COLUMNS_BY_TABLE {
-                if *known == table {
-                    columns.extend_from_slice(cols);
+impl Drop for TableScope {
+    fn drop(&mut self) {
+        SCOPE.with(|s| {
+            let mut levels = s.borrow_mut();
+            if !levels.is_empty() {
+                levels.remove(0);
+            }
+        });
+    }
+}
+
+/// The tables of a FROM list, joined ones included: a column in the WHERE may
+/// belong to any of them.
+fn scoped_tables(from: &[TableWithJoins]) -> Vec<ScopedTable> {
+    fn push(out: &mut Vec<ScopedTable>, factor: &TableFactor) {
+        match factor {
+            TableFactor::Table { name, alias, .. } => {
+                if let Some(ObjectNamePart::Identifier(ident)) = name.0.last() {
+                    let table = ident.value.to_lowercase();
+                    let qualifier = alias
+                        .as_ref()
+                        .map(|a| a.name.value.to_lowercase())
+                        .unwrap_or_else(|| table.clone());
+                    out.push(ScopedTable { qualifier, table });
                 }
             }
-        }
-        let previous =
-            STATEMENT_TEXT_COLUMNS.with(|c| std::mem::replace(&mut *c.borrow_mut(), columns));
-        Self { previous }
-    }
-}
-
-impl Drop for TextColumnScope {
-    fn drop(&mut self) {
-        let previous = std::mem::take(&mut self.previous);
-        STATEMENT_TEXT_COLUMNS.with(|c| *c.borrow_mut() = previous);
-    }
-}
-
-/// The real table names in a FROM list -- not aliases, which is what the
-/// per-table list is keyed by. Joined tables count too: a column in the WHERE
-/// may belong to any of them.
-fn table_names_in(from: &[TableWithJoins]) -> Vec<String> {
-    fn name_of(factor: &TableFactor) -> Option<String> {
-        if let TableFactor::Table { name, .. } = factor {
-            if let Some(ObjectNamePart::Identifier(ident)) = name.0.last() {
-                return Some(ident.value.clone());
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
+                push(out, &table_with_joins.relation);
+                for join in &table_with_joins.joins {
+                    push(out, &join.relation);
+                }
             }
+            _ => {}
         }
-        None
     }
-    let mut names = Vec::new();
+    let mut out = Vec::new();
     for twj in from {
-        names.extend(name_of(&twj.relation));
-        names.extend(twj.joins.iter().filter_map(|j| name_of(&j.relation)));
+        push(&mut out, &twj.relation);
+        for join in &twj.joins {
+            push(&mut out, &join.relation);
+        }
     }
-    names
+    out
 }
 
-fn is_known_text_column(col: &str) -> bool {
-    KNOWN_TEXT_COLUMNS.contains(&col) || STATEMENT_TEXT_COLUMNS.with(|c| c.borrow().contains(&col))
+fn schema_kind(table: &str, column: &str) -> Option<ColumnKind> {
+    COLUMNS
+        .iter()
+        .find(|(t, c, _)| *t == table && *c == column)
+        .map(|(_, _, kind)| *kind)
 }
 
-/// Known columns that are stored as INTEGER in Plex but sometimes compared with strings
-const KNOWN_INT_COLUMNS: &[&str] = &["id"];
+fn schema_has_table(table: &str) -> bool {
+    COLUMNS.iter().any(|(t, _, _)| *t == table)
+}
 
-fn get_column_name(expr: &Expr) -> Option<String> {
+/// Every Plex `id` is an integer, whether or not the table is in the schema.
+fn id_kind(column: &str) -> Option<ColumnKind> {
+    (column == "id").then_some(ColumnKind::Integer)
+}
+
+/// The affinity of a column reference, or None when it is no column, the
+/// column is unknown, or tables in scope disagree about it.
+fn column_kind(expr: &Expr) -> Option<ColumnKind> {
     match expr {
-        Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
-        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.to_lowercase()),
+        Expr::Identifier(ident) => {
+            let column = ident.value.to_lowercase();
+            SCOPE.with(|s| {
+                for level in s.borrow().iter() {
+                    let kinds: Vec<ColumnKind> = level
+                        .iter()
+                        .filter_map(|t| schema_kind(&t.table, &column))
+                        .collect();
+                    if let Some(first) = kinds.first() {
+                        return kinds.iter().all(|k| k == first).then_some(*first);
+                    }
+                    // A table the schema does not know (a CTE, a derived
+                    // table's name) may own the column: look no further out.
+                    if level.iter().any(|t| !schema_has_table(&t.table)) {
+                        return id_kind(&column);
+                    }
+                }
+                id_kind(&column)
+            })
+        }
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            let qualifier = parts[parts.len() - 2].value.to_lowercase();
+            let column = parts[parts.len() - 1].value.to_lowercase();
+            SCOPE.with(|s| {
+                for level in s.borrow().iter() {
+                    if let Some(t) = level.iter().find(|t| t.qualifier == qualifier) {
+                        return schema_kind(&t.table, &column).or_else(|| id_kind(&column));
+                    }
+                }
+                schema_kind(&qualifier, &column).or_else(|| id_kind(&column))
+            })
+        }
+        Expr::Nested(inner) => column_kind(inner),
         _ => None,
     }
+}
+
+/// Whether a table of the innermost scope has a column of this name.
+fn is_known_column(name: &str) -> bool {
+    let name = name.to_lowercase();
+    name == "id"
+        || SCOPE.with(|s| {
+            s.borrow()
+                .first()
+                .is_some_and(|level| level.iter().any(|t| schema_kind(&t.table, &name).is_some()))
+        })
 }
 
 fn is_pg_json_op(op: &str) -> bool {
@@ -1018,25 +1484,30 @@ fn make_jsonb_cast(expr: Expr) -> Expr {
 }
 
 fn make_json_valid_call(expr: Expr) -> Expr {
-    Expr::Function(Function {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("json_valid"))]),
-        uses_odbc_syntax: false,
-        parameters: FunctionArguments::None,
-        args: FunctionArguments::List(FunctionArgumentList {
-            duplicate_treatment: None,
-            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))],
-            clauses: vec![],
-        }),
-        filter: None,
-        null_treatment: None,
-        over: None,
-        within_group: vec![],
-    })
+    make_function_call("json_valid", vec![expr])
 }
 
 fn make_function_call(name: &str, args: Vec<Expr>) -> Expr {
+    make_named_function_call(
+        ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
+        args,
+    )
+}
+
+/// `schema.name(args)`
+fn make_schema_function_call(schema: &str, name: &str, args: Vec<Expr>) -> Expr {
+    make_named_function_call(
+        ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new(schema)),
+            ObjectNamePart::Identifier(Ident::new(name)),
+        ]),
+        args,
+    )
+}
+
+fn make_named_function_call(name: ObjectName, args: Vec<Expr>) -> Expr {
     Expr::Function(Function {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
+        name,
         uses_odbc_syntax: false,
         parameters: FunctionArguments::None,
         args: FunctionArguments::List(FunctionArgumentList {
@@ -1051,6 +1522,27 @@ fn make_function_call(name: &str, args: Vec<Expr>) -> Expr {
         null_treatment: None,
         over: None,
         within_group: vec![],
+    })
+}
+
+fn make_string(s: &str) -> Expr {
+    Expr::Value(ValueWithSpan {
+        value: Value::SingleQuotedString(s.to_string()),
+        span: Span::empty(),
+    })
+}
+
+fn make_number(s: &str) -> Expr {
+    Expr::Value(ValueWithSpan {
+        value: Value::Number(s.to_string(), false),
+        span: Span::empty(),
+    })
+}
+
+fn make_boolean(b: bool) -> Expr {
+    Expr::Value(ValueWithSpan {
+        value: Value::Boolean(b),
+        span: Span::empty(),
     })
 }
 
@@ -1155,12 +1647,7 @@ fn is_json_extract_text_op(op: &BinaryOperator) -> bool {
 
 fn rewrite_json_path_binary_op(left_jsonb: Expr, op: &BinaryOperator, segs: &[String]) -> Expr {
     let mut args = vec![left_jsonb];
-    args.extend(segs.iter().cloned().map(|s| {
-        Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(s),
-            span: Span::empty(),
-        })
-    }));
+    args.extend(segs.iter().map(|s| make_string(s)));
     let fn_name = if is_json_extract_text_op(op) {
         "jsonb_extract_path_text"
     } else {
@@ -1218,68 +1705,38 @@ fn is_number_literal(expr: &Expr) -> bool {
     )
 }
 
-fn is_string_literal(expr: &Expr) -> bool {
-    matches!(
-        expr,
+fn string_literal(expr: &Expr) -> Option<&str> {
+    match expr {
         Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(_),
+            value: Value::SingleQuotedString(s),
             ..
-        })
-    )
+        }) => Some(s),
+        _ => None,
+    }
 }
 
-/// Check if this binary comparison has an int/text mismatch that needs fixing
-fn should_fix_int_text_mismatch(left: &Expr, right: &Expr) -> bool {
-    // Pattern A: known_text_col = number → cast number to text
-    if let Some(col) = get_column_name(left) {
-        if is_known_text_column(&col) && is_number_literal(right) {
-            return true;
-        }
-    }
-    if let Some(col) = get_column_name(right) {
-        if is_known_text_column(&col) && is_number_literal(left) {
-            return true;
-        }
-    }
-    // Pattern B: known_int_col = 'string' → cast string to int
-    if let Some(col) = get_column_name(left) {
-        if KNOWN_INT_COLUMNS.contains(&col.as_str()) && is_string_literal(right) {
-            return true;
-        }
-    }
-    if let Some(col) = get_column_name(right) {
-        if KNOWN_INT_COLUMNS.contains(&col.as_str()) && is_string_literal(left) {
-            return true;
-        }
-    }
-    false
+/// How SQLite reads a string literal under INTEGER affinity.
+enum NumericString {
+    Integer,
+    Real,
+    Text,
 }
 
-/// An integer column compared with a string literal that is not an integer.
-///
-/// SQLite gives the literal the column's INTEGER affinity, and when it cannot
-/// be converted it stays TEXT, which sorts after every integer: `id = ''` is
-/// false, `id <> ''` true, `id < ''` true. Plex writes `metadata_items.id=''`
-/// for an empty id list (deleting a smart collection, which has no members,
-/// 2026-10-16); the CAST below made PostgreSQL refuse the statement
-/// (`invalid input syntax for type integer: ""`), so the delete answered 500
-/// after five retries. The comparison's constant value is returned instead.
-fn non_integer_literal_comparison(
-    lit: &Expr,
-    op: &BinaryOperator,
-    literal_on_left: bool,
-) -> Option<Expr> {
-    let Expr::Value(ValueWithSpan {
-        value: Value::SingleQuotedString(s),
-        span,
-    }) = lit
-    else {
-        return None;
-    };
-    if s.trim().parse::<i64>().is_ok() {
-        return None;
+fn classify_numeric_string(s: &str) -> NumericString {
+    let t = s.trim();
+    if t.parse::<i64>().is_ok() {
+        NumericString::Integer
+    } else if t.parse::<f64>().is_ok() && !t.eq_ignore_ascii_case("nan") && !t.contains("inf") {
+        NumericString::Real
+    } else {
+        NumericString::Text
     }
-    // With the literal on the right: integer < text, always.
+}
+
+/// An integer column compared with a string literal that is not an integer:
+/// the literal stays TEXT, which sorts after every integer, so the comparison
+/// is a constant. With the literal on the right: integer < text, always.
+fn non_integer_literal_comparison(op: &BinaryOperator, literal_on_left: bool) -> Option<Expr> {
     let value = match op {
         BinaryOperator::Eq => false,
         BinaryOperator::NotEq => true,
@@ -1287,190 +1744,286 @@ fn non_integer_literal_comparison(
         BinaryOperator::Gt | BinaryOperator::GtEq => literal_on_left,
         _ => return None,
     };
-    Some(Expr::Value(ValueWithSpan {
-        value: Value::Boolean(value),
-        span: *span,
-    }))
+    Some(make_boolean(value))
 }
 
-/// Fix int/text mismatch by adding appropriate casts.
-/// Takes ownership because the caller already extracted the parts via std::mem::replace.
-fn fix_int_text_mismatch(mut left: Expr, op: BinaryOperator, mut right: Expr) -> Expr {
-    let left_col = get_column_name(&left);
-    let right_col = get_column_name(&right);
-
-    // Recurse into both sides first
-    transform_expr(&mut left);
-    transform_expr(&mut right);
-
-    if left_col
-        .as_ref()
-        .map(|c| is_known_text_column(c))
-        .unwrap_or(false)
-        && is_number_literal(&right)
-    {
-        // text_col = 123 → text_col = 123::text
-        Expr::BinaryOp {
-            left: Box::new(left),
-            op,
-            right: Box::new(Expr::Cast {
-                kind: CastKind::DoubleColon,
-                expr: Box::new(right),
-                data_type: DataType::Text,
-                array: false,
-                format: None,
-            }),
-        }
-    } else if right_col
-        .as_ref()
-        .map(|c| is_known_text_column(c))
-        .unwrap_or(false)
-        && is_number_literal(&left)
-    {
-        Expr::BinaryOp {
-            left: Box::new(Expr::Cast {
-                kind: CastKind::DoubleColon,
-                expr: Box::new(left),
-                data_type: DataType::Text,
-                array: false,
-                format: None,
-            }),
-            op,
-            right: Box::new(right),
-        }
-    } else if left_col
-        .as_ref()
-        .map(|c| KNOWN_INT_COLUMNS.contains(&c.as_str()))
-        .unwrap_or(false)
-        && is_string_literal(&right)
-    {
-        if let Some(constant) = non_integer_literal_comparison(&right, &op, false) {
-            return constant;
-        }
-        // int_col = '123' → int_col = CAST('123' AS INTEGER)
-        Expr::BinaryOp {
-            left: Box::new(left),
-            op,
-            right: Box::new(Expr::Cast {
-                kind: CastKind::Cast,
-                expr: Box::new(right),
-                data_type: DataType::Integer(None),
-                array: false,
-                format: None,
-            }),
-        }
-    } else if right_col
-        .as_ref()
-        .map(|c| KNOWN_INT_COLUMNS.contains(&c.as_str()))
-        .unwrap_or(false)
-        && is_string_literal(&left)
-    {
-        if let Some(constant) = non_integer_literal_comparison(&left, &op, true) {
-            return constant;
-        }
-        Expr::BinaryOp {
-            left: Box::new(Expr::Cast {
-                kind: CastKind::Cast,
-                expr: Box::new(left),
-                data_type: DataType::Integer(None),
-                array: false,
-                format: None,
-            }),
-            op,
-            right: Box::new(right),
-        }
-    } else {
-        Expr::BinaryOp {
-            left: Box::new(left),
-            op,
-            right: Box::new(right),
-        }
+/// A string literal compared with an integer column: the number it converts
+/// to, or None when it is no number.
+fn integer_affinity_literal(s: &str) -> Option<Expr> {
+    match classify_numeric_string(s) {
+        NumericString::Integer => Some(Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(make_string(s)),
+            data_type: DataType::Integer(None),
+            array: false,
+            format: None,
+        }),
+        NumericString::Real => Some(make_number(s.trim())),
+        NumericString::Text => None,
     }
 }
 
-// ─── Fix FTS4: MATCH → @@ to_tsquery ──────────────────────────────────────────
+/// Fix a comparison between a column and a literal of the other affinity.
+/// Returns the replacement, with both sides transformed, or None when the
+/// comparison is not of that shape.
+fn fix_affinity_comparison(left: &mut Expr, op: &BinaryOperator, right: &mut Expr) -> Option<Expr> {
+    let left_kind = column_kind(left);
+    let right_kind = column_kind(right);
 
-/// Transform `col MATCH 'term'` → `to_tsvector('simple', col) @@ to_tsquery('simple', E'converted_term')`
-///
-/// The old strategy of appending `_fts` to the column name (e.g. `title_sort` →
-/// `title_sort_fts`) created nonexistent column references.  The PostgreSQL FTS
-/// views (`fts4_metadata_titles`, `fts4_metadata_titles_icu`) expose the source
-/// text columns (`title`, `title_sort`, `original_title`) but only a single
-/// pre-computed tsvector column (`title_fts`).  Columns like `title_sort` have
-/// no corresponding `title_sort_fts` tsvector column, so the `_fts` suffix
-/// approach fails.
-///
-/// The correct approach is to wrap the source column with `to_tsvector` at
-/// query time.  This works for any column name, matches the `'simple'`
-/// dictionary used by the schema's tsvector triggers, and does not require a
-/// pre-computed tsvector column to exist.
-fn transform_fts_match(left: Expr, right: Expr) -> Expr {
-    // Build: to_tsvector('simple', col)
-    let make_fn = |fn_name: &str, col: Expr| -> Expr {
-        Expr::Function(Function {
-            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(fn_name))]),
-            uses_odbc_syntax: false,
-            parameters: FunctionArguments::None,
-            args: FunctionArguments::List(FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
-                        value: Value::SingleQuotedString("simple".to_string()),
-                        span: Span::empty(),
-                    }))),
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(col)),
-                ],
-                clauses: vec![],
-            }),
-            filter: None,
-            null_treatment: None,
-            over: None,
-            within_group: vec![],
-        })
+    let (column_side, literal_side, literal_on_left, kind) = match (left_kind, right_kind) {
+        (Some(kind), None) if kind != ColumnKind::Other => (&mut *left, &mut *right, false, kind),
+        (None, Some(kind)) if kind != ColumnKind::Other => (&mut *right, &mut *left, true, kind),
+        _ => return None,
     };
 
-    let tsvector_call = make_fn("to_tsvector", left);
-
-    // Convert the match term to tsquery syntax
-    let term_str = match &right {
-        Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(s),
-            ..
-        }) => convert_fts_term(s),
-        _ => {
-            return Expr::BinaryOp {
-                left: Box::new(tsvector_call),
-                op: BinaryOperator::AtAt,
-                right: Box::new(right),
+    let replacement = match kind {
+        ColumnKind::Text if is_number_literal(literal_side) => {
+            // text_col = 123 → text_col = 123::text
+            make_text_cast(take_expr(literal_side))
+        }
+        ColumnKind::Integer => {
+            let s = string_literal(literal_side)?.to_string();
+            match integer_affinity_literal(&s) {
+                Some(number) => number,
+                None => return non_integer_literal_comparison(op, literal_on_left),
             }
         }
+        _ => return None,
     };
+    let column = take_expr(column_side);
+    let (l, r) = if literal_on_left {
+        (replacement, column)
+    } else {
+        (column, replacement)
+    };
+    Some(Expr::BinaryOp {
+        left: Box::new(l),
+        op: op.clone(),
+        right: Box::new(r),
+    })
+}
 
-    // Build: to_tsvector('simple', col) @@ to_tsquery('simple', E'term')
-    let tsquery_call = Expr::Function(Function {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("to_tsquery"))]),
-        uses_odbc_syntax: false,
-        parameters: FunctionArguments::None,
-        args: FunctionArguments::List(FunctionArgumentList {
-            duplicate_treatment: None,
-            args: vec![
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
-                    value: Value::SingleQuotedString("simple".to_string()),
-                    span: Span::empty(),
-                }))),
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
-                    value: Value::EscapedStringLiteral(term_str),
-                    span: Span::empty(),
-                }))),
-            ],
-            clauses: vec![],
-        }),
-        filter: None,
-        null_treatment: None,
-        over: None,
-        within_group: vec![],
-    });
+/// `int_col IN ('', '3', 'x')`: each member takes the column's affinity, so
+/// a member that is no integer can never match and is dropped; an emptied
+/// list is FALSE (TRUE for NOT IN).
+fn fix_affinity_in_list(inner: &Expr, list: &mut Vec<Expr>, negated: bool) -> Option<Expr> {
+    if column_kind(inner) != Some(ColumnKind::Integer) {
+        return None;
+    }
+    if !list.iter().any(|e| string_literal(e).is_some()) {
+        return None;
+    }
+    let members: Vec<Expr> = std::mem::take(list)
+        .into_iter()
+        .filter_map(|e| match string_literal(&e) {
+            Some(s) => integer_affinity_literal(s),
+            None => Some(e),
+        })
+        .collect();
+    if members.is_empty() {
+        return Some(make_boolean(negated));
+    }
+    *list = members;
+    None
+}
 
+// ─── Fix 14: GLOB → regular expression ────────────────────────────────────────
+//
+// GLOB is case-sensitive, and LIKE's `%`/`_` cannot carry its character
+// classes, so the pattern becomes an anchored POSIX regular expression: `*`
+// is `.*`, `?` is `.`, `[abc]` stays a class, and every other metacharacter
+// is escaped. A pattern Plex builds at run time (`'*' || ? || '*'`) is
+// converted piece by piece: the literal pieces here, the bound ones in
+// PostgreSQL with regexp_replace, so the bound text's own `*` and `?` count
+// as wildcards and its punctuation does not.
+
+fn glob_match(subject: Expr, pattern: Expr, nocase: bool) -> Expr {
+    let regex = glob_pattern_to_regex_expr(pattern);
+    Expr::BinaryOp {
+        left: Box::new(subject),
+        op: if nocase {
+            BinaryOperator::PGRegexIMatch
+        } else {
+            BinaryOperator::PGRegexMatch
+        },
+        right: Box::new(regex),
+    }
+}
+
+fn negate_regex_match(expr: Expr) -> Expr {
+    match expr {
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left,
+            op: match op {
+                BinaryOperator::PGRegexMatch => BinaryOperator::PGRegexNotMatch,
+                BinaryOperator::PGRegexIMatch => BinaryOperator::PGRegexNotIMatch,
+                other => other,
+            },
+            right,
+        },
+        other => Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: Box::new(Expr::Nested(Box::new(other))),
+        },
+    }
+}
+
+/// The anchored regular expression for a GLOB pattern expression.
+fn glob_pattern_to_regex_expr(pattern: Expr) -> Expr {
+    let mut pieces = Vec::new();
+    flatten_concat(pattern, &mut pieces);
+    if pieces.len() == 1 {
+        if let Some(s) = string_literal(&pieces[0]) {
+            return make_string(&format!("^{}$", glob_to_regex(s)));
+        }
+    }
+    let mut parts = vec![make_string("^")];
+    for piece in pieces {
+        parts.push(match string_literal(&piece) {
+            Some(s) => make_string(&glob_to_regex(s)),
+            None => glob_fragment_to_regex_at_runtime(piece),
+        });
+    }
+    parts.push(make_string("$"));
+    let mut iter = parts.into_iter();
+    let mut acc = iter.next().expect("at least the anchor");
+    for part in iter {
+        acc = Expr::BinaryOp {
+            left: Box::new(acc),
+            op: BinaryOperator::StringConcat,
+            right: Box::new(part),
+        };
+    }
+    Expr::Nested(Box::new(acc))
+}
+
+fn flatten_concat(expr: Expr, out: &mut Vec<Expr>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::StringConcat,
+            right,
+        } => {
+            flatten_concat(*left, out);
+            flatten_concat(*right, out);
+        }
+        Expr::Nested(inner) => flatten_concat(*inner, out),
+        other => out.push(other),
+    }
+}
+
+/// A GLOB pattern as an unanchored regular expression.
+fn glob_to_regex(glob: &str) -> String {
+    let chars: Vec<char> = glob.chars().collect();
+    let mut out = String::with_capacity(glob.len() + 8);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            '[' => {
+                // A class runs to the next `]`; a `]` right after `[` or `[^`
+                // is a member, as in SQLite.
+                let mut j = i + 1;
+                if j < chars.len() && chars[j] == '^' {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == ']' {
+                    j += 1;
+                }
+                while j < chars.len() && chars[j] != ']' {
+                    j += 1;
+                }
+                if j < chars.len() {
+                    let class: String = chars[i..=j].iter().collect();
+                    out.push_str(&class.replace('\\', "\\\\"));
+                    i = j;
+                } else {
+                    out.push_str("\\[");
+                }
+            }
+            '.' | '^' | '$' | '+' | '(' | ')' | '{' | '}' | '|' | '\\' | ']' => {
+                out.push('\\');
+                out.push(c);
+            }
+            other => out.push(other),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// A run-time GLOB fragment (a bound parameter, a column) as a regular
+/// expression: metacharacters escaped, then `*` → `.*` and `?` → `.`.
+fn glob_fragment_to_regex_at_runtime(fragment: Expr) -> Expr {
+    let escaped = make_function_call(
+        "regexp_replace",
+        vec![
+            fragment,
+            make_string("([\\\\.^$+(){}|])"),
+            make_string("\\\\\\1"),
+            make_string("g"),
+        ],
+    );
+    let stars = make_function_call(
+        "regexp_replace",
+        vec![
+            escaped,
+            make_string("\\*"),
+            make_string(".*"),
+            make_string("g"),
+        ],
+    );
+    make_function_call(
+        "regexp_replace",
+        vec![
+            stars,
+            make_string("\\?"),
+            make_string("."),
+            make_string("g"),
+        ],
+    )
+}
+
+// ─── Fix FTS4: MATCH → @@ plex.fts_query ──────────────────────────────────────
+
+/// The columns an fts4 view's own name stands for in `fts4_x MATCH term`.
+const FTS_TABLE_COLUMNS: &[(&str, &[&str])] = &[
+    (
+        "fts4_metadata_titles",
+        &["title", "title_sort", "original_title"],
+    ),
+    (
+        "fts4_metadata_titles_icu",
+        &["title", "title_sort", "original_title"],
+    ),
+    ("fts4_tag_titles", &["tag"]),
+    ("fts4_tag_titles_icu", &["tag"]),
+];
+
+/// `col MATCH term` → `to_tsvector('simple', plex.fold(col)) @@ plex.fts_query(term)`
+///
+/// `plex.fold` lowers and unaccents the text and `plex.fts_query` turns an
+/// FTS4 query into a tsquery (the schema's functions), for a literal term and
+/// a bound one alike -- the translator used to convert a literal itself and
+/// send a bound term as `@@ $1`, a raw string cast to tsquery, so a search
+/// Plex bound never matched a row. A match against the view's own name
+/// searches every column it indexes.
+fn transform_fts_match(left: Expr, right: Expr) -> Expr {
+    let text = match &left {
+        Expr::Identifier(ident) => {
+            let name = ident.value.to_lowercase();
+            match FTS_TABLE_COLUMNS.iter().find(|(t, _)| *t == name) {
+                Some((_, columns)) => fts_columns_text(columns),
+                None => left,
+            }
+        }
+        _ => left,
+    };
+    let folded = make_schema_function_call("plex", "fold", vec![text]);
+    let tsvector_call = make_function_call("to_tsvector", vec![make_string("simple"), folded]);
+    let tsquery_call = make_schema_function_call("plex", "fts_query", vec![right]);
     Expr::BinaryOp {
         left: Box::new(tsvector_call),
         op: BinaryOperator::AtAt,
@@ -1478,105 +2031,28 @@ fn transform_fts_match(left: Expr, right: Expr) -> Expr {
     }
 }
 
-/// Convert SQLite FTS term syntax to PostgreSQL tsquery syntax.
-///
-/// | SQLite         | PostgreSQL tsquery |
-/// |----------------|-------------------|
-/// | `term`         | `term`            |
-/// | `term1 term2`  | `term1 & term2`   |
-/// | `-term`        | `!term`           |
-/// | `term1 OR term2`| `term1 | term2`  |
-/// | `"exact phrase"`| `exact <-> phrase`|
-/// | `'` (quote)    | stripped           |
-fn convert_fts_term(input: &str) -> String {
-    let mut result = String::new();
-    let mut chars = input.chars().peekable();
-    let mut need_and = false;
-
-    while let Some(&c) = chars.peek() {
-        match c {
-            // Negation
-            '-' => {
-                if need_and {
-                    result.push_str(" & ");
-                }
-                chars.next();
-                result.push('!');
-                need_and = false;
-            }
-            // Phrase: "word1 word2" → word1 <-> word2
-            '"' => {
-                if need_and {
-                    result.push_str(" & ");
-                }
-                chars.next(); // skip opening "
-                let mut phrase = String::new();
-                while let Some(&pc) = chars.peek() {
-                    if pc == '"' {
-                        chars.next();
-                        break;
-                    }
-                    phrase.push(pc);
-                    chars.next();
-                }
-                let words: Vec<&str> = phrase.split_whitespace().collect();
-                result.push_str(&words.join(" <-> "));
-                need_and = true;
-            }
-            // Single quote — strip (not valid in tsquery)
-            '\'' => {
-                chars.next();
-            }
-            // Whitespace — check for OR or implicit AND
-            ' ' | '\t' | '\n' => {
-                chars.next();
-                // Skip whitespace
-                while let Some(&wc) = chars.peek() {
-                    if wc == ' ' || wc == '\t' || wc == '\n' {
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                // Check for OR keyword
-                if chars.peek() == Some(&'O') || chars.peek() == Some(&'o') {
-                    let rest: String = chars.clone().take(3).collect();
-                    if rest.to_uppercase().starts_with("OR ")
-                        || (rest.len() >= 2 && rest[..2].to_uppercase() == "OR" && rest.len() == 2)
-                    {
-                        chars.next(); // O
-                        chars.next(); // R
-                                      // skip space after OR
-                        while let Some(&wc) = chars.peek() {
-                            if wc == ' ' {
-                                chars.next();
-                            } else {
-                                break;
-                            }
-                        }
-                        result.push_str(" | ");
-                        need_and = false;
-                        continue;
-                    }
-                }
-                // Implicit AND (space between terms)
-                if need_and && chars.peek().is_some() {
-                    result.push_str(" & ");
-                    need_and = false;
-                }
-            }
-            // Regular character — part of a term
-            _ => {
-                if !need_and {
-                    // First char of a new term
-                }
-                result.push(c);
-                chars.next();
-                need_and = true;
-            }
-        }
+/// `coalesce(a, '') || ' ' || coalesce(b, '') …`
+fn fts_columns_text(columns: &[&str]) -> Expr {
+    let mut iter = columns.iter().map(|c| {
+        make_function_call(
+            "coalesce",
+            vec![Expr::Identifier(Ident::new(*c)), make_string("")],
+        )
+    });
+    let mut acc = iter.next().expect("an fts view has a column");
+    for next in iter {
+        let spaced = Expr::BinaryOp {
+            left: Box::new(acc),
+            op: BinaryOperator::StringConcat,
+            right: Box::new(make_string(" ")),
+        };
+        acc = Expr::BinaryOp {
+            left: Box::new(spaced),
+            op: BinaryOperator::StringConcat,
+            right: Box::new(next),
+        };
     }
-    result
+    acc
 }
 
 /// Wrap an expression in LOWER(…) in place.
@@ -1587,20 +2063,7 @@ fn wrap_lower_inplace(expr: &mut Expr) {
 
 /// Wrap an expression in LOWER(…)
 fn wrap_lower(expr: Expr) -> Expr {
-    Expr::Function(Function {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("LOWER"))]),
-        uses_odbc_syntax: false,
-        parameters: FunctionArguments::None,
-        args: FunctionArguments::List(FunctionArgumentList {
-            duplicate_treatment: None,
-            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))],
-            clauses: vec![],
-        }),
-        filter: None,
-        null_treatment: None,
-        over: None,
-        within_group: vec![],
-    })
+    make_function_call("LOWER", vec![expr])
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1747,11 +2210,20 @@ mod tests {
 
     #[test]
     fn subset_core__query_case_then_1_else_0_to_booleans() {
+        // A CASE read as a condition yields booleans; one that yields a
+        // value (a projection, an aggregate's argument) keeps SQLite's
+        // integers, since `sum(CASE WHEN a THEN TRUE ELSE FALSE END)` is
+        // no PostgreSQL.
         let r = translate("SELECT (CASE WHEN a THEN 1 ELSE 0 END) FROM t").unwrap();
-        let sql = r.sql.to_lowercase();
         assert!(
-            sql.contains("true") || sql.contains("false"),
-            "Expected boolean values, got: {}",
+            r.sql.contains("CASE WHEN a THEN 1 ELSE 0 END"),
+            "a projected CASE keeps its integers, got: {}",
+            r.sql
+        );
+        let r = translate("SELECT * FROM t WHERE (CASE WHEN a THEN 1 ELSE 0 END)").unwrap();
+        assert!(
+            r.sql.contains("CASE WHEN a THEN true ELSE false END"),
+            "a CASE as a condition is boolean, got: {}",
             r.sql
         );
     }
@@ -1875,8 +2347,8 @@ mod tests {
             r.sql
         );
         assert!(
-            sql.contains("to_tsquery("),
-            "Expected to_tsquery() call, got: {}",
+            sql.contains("plex.fts_query('plex')"),
+            "Expected plex.fts_query() call, got: {}",
             r.sql
         );
         assert!(sql.contains("@@"), "Expected @@ operator, got: {}", r.sql);
@@ -1912,13 +2384,15 @@ mod tests {
 
     #[test]
     fn subset_fts__match_prefix_query_converts_star_to_colon_star() {
+        // The prefix star is plex.fts_query's to turn into `war:*`; the
+        // translator hands the term over whole. (This test once passed on
+        // `sql.contains("war")`, which any output satisfied.)
         let r =
             translate("SELECT rowid FROM fts4_metadata_titles WHERE title MATCH 'War*'").unwrap();
-        let sql = r.sql.to_lowercase();
-        assert!(
-            sql.contains("war:*") || sql.contains("war"),
-            "Expected prefix tsquery token, got: {}",
-            r.sql
+        assert_eq!(
+            r.sql,
+            "SELECT rowid FROM fts4_metadata_titles \
+             WHERE to_tsvector('simple', plex.fold(title)) @@ plex.fts_query('War*')"
         );
     }
 }
