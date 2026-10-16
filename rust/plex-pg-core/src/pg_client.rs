@@ -13,6 +13,7 @@ mod c_abi;
 mod config;
 mod connection_helpers;
 mod connection_lifecycle;
+pub(crate) mod error_class;
 mod globals;
 mod hash_sqlstate;
 mod pool_acquire;
@@ -42,6 +43,7 @@ pub(crate) use connection_helpers::current_thread_has_other_streaming_connection
 use connection_helpers::{conn_db_path, conn_is_pg_active_ptr};
 use connection_lifecycle::{close_handle_connection, destroy_pool_connection};
 pub use connection_lifecycle::{rust_pg_close, rust_pg_connect, rust_pg_ensure_connection};
+pub(crate) use error_class::{classify_result, PgErrorClass};
 pub use globals::{
     rust_get_global_last_insert_rowid, rust_get_global_metadata_id,
     rust_set_global_last_insert_rowid, rust_set_global_metadata_id,

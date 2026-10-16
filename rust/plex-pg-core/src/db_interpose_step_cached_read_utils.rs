@@ -52,14 +52,6 @@ fn is_duplicate_prepared_stmt(res: *mut PGresult) -> bool {
     crate::pg_client::rust_is_duplicate_sqlstate(sqlstate) != 0
 }
 
-fn is_stale_prepared_stmt(res: *mut PGresult) -> bool {
-    if res.is_null() {
-        return false;
-    }
-    let sqlstate = crate::libpq_helpers::rust_pq_result_error_field(res, PG_DIAG_SQLSTATE);
-    crate::pg_client::rust_is_stale_sqlstate(sqlstate) != 0
-}
-
 #[no_mangle]
 pub extern "C" fn rust_step_cached_read_finalize_advance(
     cached: *mut PgStmt,
@@ -267,27 +259,32 @@ pub extern "C" fn rust_step_cached_read_execute(
             };
         }
 
+        // A refused read used to fall back to whatever the shadow SQLite had
+        // answered, which for the library is nothing. One classifier with the
+        // step: retry what a retry can mend, report the rest.
+        let (class, message) = crate::pg_client::classify_result(c.conn, s.result);
         let ctx = CString::new("CACHED READ").unwrap();
-        if !conn.is_null() && !c.conn.is_null() {
-            let err = crate::libpq_helpers::rust_pq_error_message(c.conn);
-            log_sql_fallback(orig_sql, translated_sql, err, ctx.as_ptr());
-        } else {
-            let err = CString::new("NULL connection").unwrap();
-            log_sql_fallback(orig_sql, translated_sql, err.as_ptr(), ctx.as_ptr());
-        }
-
-        if is_stale_prepared_stmt(s.result) {
-            crate::pg_client::rust_stmt_cache_clear_local(conn as *mut c_void);
-            crate::libpq_helpers::rust_pq_clear(s.result);
-            s.result = std::ptr::null_mut();
-            if !pg_conn_error_out.is_null() {
-                *pg_conn_error_out = 1;
-            }
-            return STEP_RESULT_ERROR;
-        }
+        let message_c = CString::new(message.clone()).unwrap_or_default();
+        log_sql_fallback(orig_sql, translated_sql, message_c.as_ptr(), ctx.as_ptr());
         crate::libpq_helpers::rust_pq_clear(s.result);
         s.result = std::ptr::null_mut();
-        crate::pg_client::rust_pool_check_health(conn as *mut c_void);
-        STEP_RESULT_FALLBACK
+        match class {
+            crate::pg_client::PgErrorClass::StalePlan => {
+                crate::pg_client::rust_stmt_cache_clear_local(conn as *mut c_void);
+                if !pg_conn_error_out.is_null() {
+                    *pg_conn_error_out = 1;
+                }
+            }
+            crate::pg_client::PgErrorClass::Retry => {
+                crate::pg_client::rust_pool_check_health(conn as *mut c_void);
+                if !pg_conn_error_out.is_null() {
+                    *pg_conn_error_out = 1;
+                }
+            }
+            crate::pg_client::PgErrorClass::Fail => {
+                c.set_last_error(SQLITE_ERROR, &message);
+            }
+        }
+        STEP_RESULT_ERROR
     }
 }

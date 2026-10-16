@@ -6,9 +6,10 @@ pub(super) unsafe fn eager_fetch_result(
     exec_conn: *mut PgConnection,
     stmt_guard: &mut Option<StmtGuard>,
     conn_guard: &mut PthreadMutexGuard,
+    pg_conn_error_out: *mut c_int,
 ) -> c_int {
     let s = &mut *pg_stmt;
-    let ec = &*exec_conn;
+    let ec = &mut *exec_conn;
     // Clear any pre-existing result (e.g. from metadata-only fetch) to prevent leak
     if !s.result.is_null() {
         crate::libpq_helpers::rust_pq_clear(s.result);
@@ -37,22 +38,42 @@ pub(super) unsafe fn eager_fetch_result(
             *stmt_guard = None; // unlock
             return STEP_RESULT_ROW;
         }
-    } else if !s.result.is_null() {
-        let err2 = crate::libpq_helpers::rust_pq_error_message(ec.conn);
-        let ctx = CString::new("EAGER FALLBACK").unwrap();
-        let fallback_err = if err2.is_null() {
-            CString::new("?").unwrap()
-        } else {
-            CString::new(cstr_to_str(err2)).unwrap_or_else(|_| CString::new("?").unwrap())
-        };
-        log_sql_fallback(s.sql, s.pg_sql, fallback_err.as_ptr(), ctx.as_ptr());
-        crate::libpq_helpers::rust_pq_clear(s.result);
-        s.result = std::ptr::null_mut();
-        crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
+        s.read_done = 1;
+        *exec_conn_io = exec_conn;
+        *stmt_guard = None; // unlock
+        return STEP_RESULT_DONE;
     }
 
-    s.read_done = 1;
+    // Anything else is a failure. This used to log "EAGER FALLBACK" and
+    // answer SQLITE_DONE with no rows, so a query PostgreSQL refused read to
+    // Plex as an empty table: a filter that matched nothing, a setting that
+    // did not exist. A failed read is SQLITE_ERROR, with the reason.
+    let (class, message) = crate::pg_client::classify_result(ec.conn, s.result);
+    log_error(&format!(
+        "EAGER fetch error ({:?}): {} sql={:.200}",
+        class,
+        message,
+        cstr_to_str(s.pg_sql)
+    ));
+    if !s.result.is_null() {
+        crate::libpq_helpers::rust_pq_clear(s.result);
+        s.result = std::ptr::null_mut();
+    }
     *exec_conn_io = exec_conn;
+    match class {
+        PgErrorClass::StalePlan => {
+            crate::pg_client::rust_stmt_cache_clear_local(exec_conn as *mut c_void);
+            set_pg_conn_error(pg_conn_error_out);
+        }
+        PgErrorClass::Retry => {
+            crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
+            set_pg_conn_error(pg_conn_error_out);
+        }
+        PgErrorClass::Fail => {
+            ec.set_last_error(SQLITE_ERROR, &message);
+            s.read_done = 1;
+        }
+    }
     *stmt_guard = None; // unlock
-    STEP_RESULT_DONE
+    STEP_RESULT_ERROR
 }

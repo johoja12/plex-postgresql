@@ -19,6 +19,7 @@ use crate::db_interpose_conn_utils::{
 use crate::env_utils;
 use crate::ffi_types::{sqlite3, sqlite3_stmt, PgConnection, PgStmt, StmtGuard, STMT_NAME_LEN};
 use crate::libpq_helpers::PGresult;
+use crate::pg_client::PgErrorClass;
 pub use cached_write::{
     rust_step_cached_write_build_exec_sql, rust_step_cached_write_execute_and_finalize,
     rust_step_cached_write_should_noop, rust_step_pg_write_should_noop,
@@ -27,9 +28,10 @@ pub use connection::{rust_step_pick_thread_connection, rust_step_write_prepare_c
 pub use logging::{rust_step_log_step_exit_trace, rust_step_write_log_debug_context};
 pub use special_insert::rust_step_write_should_skip_special_insert;
 use support::{
-    is_duplicate_prepared_stmt, is_stale_prepared_stmt, malloc_cstring, owned_db_path, param_at,
+    is_duplicate_prepared_stmt, malloc_cstring, owned_db_path, param_at,
     skip_stats_resources_update,
 };
+pub(crate) use write_exec::note_failed_write;
 pub use write_exec::rust_step_write_execute_and_finalize;
 
 const SQLITE_DONE: c_int = 101;

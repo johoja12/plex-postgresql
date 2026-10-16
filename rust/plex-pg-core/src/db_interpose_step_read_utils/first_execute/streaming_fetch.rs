@@ -79,16 +79,14 @@ pub(super) unsafe fn streaming_fetch_result(
         return finish_streaming_done(s, exec_conn_io, exec_conn, stmt_guard);
     }
 
-    let err = crate::libpq_helpers::rust_pq_error_message(ec.conn);
+    let (class, message) = crate::pg_client::classify_result(ec.conn, first_res);
     log_error(&format!(
-        "STREAM first fetch error: {} (status={}) sql={:.200}",
-        cstr_to_str(err),
+        "STREAM first fetch error ({:?}): {} (status={}) sql={:.200}",
+        class,
+        message,
         first_status,
         cstr_to_str(s.pg_sql)
     ));
-    if is_stale_prepared_stmt(first_res) {
-        crate::pg_client::rust_stmt_cache_clear_local(exec_conn as *mut c_void);
-    }
     crate::libpq_helpers::rust_pq_clear(first_res);
     let mut drain = crate::libpq_helpers::rust_pq_get_result(ec.conn);
     while !drain.is_null() {
@@ -96,9 +94,25 @@ pub(super) unsafe fn streaming_fetch_result(
         drain = crate::libpq_helpers::rust_pq_get_result(ec.conn);
     }
     clear_streaming_state(s);
-    crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
     *exec_conn_io = exec_conn;
-    *stmt_guard = None; // unlock
-    set_pg_conn_error(pg_conn_error_out);
+    match class {
+        PgErrorClass::StalePlan => {
+            crate::pg_client::rust_stmt_cache_clear_local(exec_conn as *mut c_void);
+            *stmt_guard = None; // unlock
+            set_pg_conn_error(pg_conn_error_out);
+        }
+        PgErrorClass::Retry => {
+            crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
+            *stmt_guard = None; // unlock
+            set_pg_conn_error(pg_conn_error_out);
+        }
+        PgErrorClass::Fail => {
+            // Permanent: Plex gets SQLITE_ERROR now and this message from
+            // sqlite3_errmsg, as it would from SQLite. No retry, no reconnect.
+            ec.set_last_error(SQLITE_ERROR, &message);
+            s.read_done = 1;
+            *stmt_guard = None; // unlock
+        }
+    }
     STEP_RESULT_ERROR
 }

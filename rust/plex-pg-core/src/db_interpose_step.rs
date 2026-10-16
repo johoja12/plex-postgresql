@@ -48,14 +48,7 @@ fn set_stmt_translation_error(pg_stmt: *mut PgStmt, msg: &str) {
         if stmt.conn().is_null() {
             return;
         }
-        let conn = &mut *stmt.conn();
-        conn.last_error_code = SQLITE_ERROR;
-        conn.last_error.fill(0);
-        let bytes = msg.as_bytes();
-        let len = bytes.len().min(conn.last_error.len().saturating_sub(1));
-        for (dst, src) in conn.last_error.iter_mut().zip(bytes.iter()).take(len) {
-            *dst = *src as c_char;
-        }
+        (&mut *stmt.conn()).set_last_error(SQLITE_ERROR, msg);
     }
 }
 

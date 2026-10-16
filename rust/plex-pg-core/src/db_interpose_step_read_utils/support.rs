@@ -53,14 +53,6 @@ pub(crate) fn is_duplicate_prepared_stmt(res: *mut PGresult) -> bool {
     crate::pg_client::rust_is_duplicate_sqlstate(sqlstate) != 0
 }
 
-pub(crate) fn is_stale_prepared_stmt(res: *mut PGresult) -> bool {
-    if res.is_null() {
-        return false;
-    }
-    let sqlstate = crate::libpq_helpers::rust_pq_result_error_field(res, PG_DIAG_SQLSTATE);
-    crate::pg_client::rust_is_stale_sqlstate(sqlstate) != 0
-}
-
 pub(crate) fn step_read_clear_row_caches(stmt: *mut PgStmt) {
     if stmt.is_null() {
         return;

@@ -29,6 +29,7 @@ pub(crate) fn orig_exec_for_tests(
 
 const SQLITE_OK: c_int = 0;
 const SQLITE_ERROR: c_int = 1;
+const SQLITE_ABORT: c_int = 4;
 
 const CONNECTION_OK: c_int = 0;
 const PGRES_COMMAND_OK: c_int = 1;
@@ -37,7 +38,7 @@ const PG_DIAG_SQLSTATE: c_int = b'C' as c_int;
 
 const PG_RETRY_MAX_DELAYS: usize = 10;
 
-type ExecCallback =
+pub(crate) type ExecCallback =
     Option<unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int>;
 
 thread_local! {
@@ -207,13 +208,7 @@ fn rust_my_sqlite3_exec_impl(
         unsafe {
             trace_exec_skipped_select(b"pg_route\0".as_ptr() as *const c_char, db, pg_conn, sql);
         }
-        // Transaction control (BEGIN/COMMIT/ROLLBACK/SAVEPOINT) is in skip-SQL,
-        // so exec_via_postgres will no-op them. PG runs in autocommit mode —
-        // each statement commits immediately. This is intentional: the pool
-        // architecture cannot guarantee connection affinity across statements,
-        // so forwarding transactions would send BEGIN/COMMIT to different
-        // connections, causing data visibility bugs.
-        return exec_via_postgres(pg_conn, sql);
+        return exec_via_postgres(pg_conn, sql, callback, arg, errmsg);
     }
 
     // For non-PG databases (e.g. :memory:), icu_load_collation may fail because

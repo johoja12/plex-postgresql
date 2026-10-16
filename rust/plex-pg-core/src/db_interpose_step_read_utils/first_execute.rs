@@ -113,6 +113,7 @@ pub(super) fn first_execute_impl(
             exec_conn,
             &mut stmt_guard,
             &mut conn_guard,
+            pg_conn_error_out,
         )
     }
 }

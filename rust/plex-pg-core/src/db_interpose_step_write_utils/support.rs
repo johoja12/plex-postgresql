@@ -32,14 +32,6 @@ pub(super) fn is_duplicate_prepared_stmt(res: *mut PGresult) -> bool {
     crate::pg_client::rust_is_duplicate_sqlstate(sqlstate) != 0
 }
 
-pub(super) fn is_stale_prepared_stmt(res: *mut PGresult) -> bool {
-    if res.is_null() {
-        return false;
-    }
-    let sqlstate = crate::libpq_helpers::rust_pq_result_error_field(res, PG_DIAG_SQLSTATE);
-    crate::pg_client::rust_is_stale_sqlstate(sqlstate) != 0
-}
-
 pub(super) fn skip_stats_resources_update() -> bool {
     let cached = SKIP_STATS_RESOURCES_UPDATE.load(Ordering::Relaxed);
     if cached != -1 {

@@ -25,16 +25,34 @@ pub(crate) fn should_use_streaming(stmt: *const PgStmt, disable_streaming_env: b
     }
 
     let pg_sql = unsafe { cstr_bytes(stmt.pg_sql) };
-    if contains_icase_bytes(pg_sql, b"limit 1") {
+    if has_limit_one(pg_sql) {
         return false;
     }
 
     let sql = unsafe { cstr_bytes(stmt.sql) };
-    if contains_icase_bytes(sql, b"limit 1") {
+    if has_limit_one(sql) {
         return false;
     }
 
     true
+}
+
+/// Whether the statement ends its result at one row: `LIMIT 1` as a token.
+///
+/// This was a substring test for "limit 1", which `LIMIT 10`, `LIMIT 100`
+/// and `LIMIT 1, 20` all contain, so every paginated listing was fetched
+/// eagerly as if it were a single-row probe. A `1` followed by a digit is
+/// another number; followed by a comma it is the offset of SQLite's
+/// `LIMIT offset, count`.
+pub(crate) fn has_limit_one(sql: &[u8]) -> bool {
+    use std::sync::LazyLock;
+    static LIMIT_ONE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+        // After `1\b` the next non-space byte must not be a comma; `\b`
+        // already refuses a digit. `\s*([^,\s]|$)` cannot skip over a comma,
+        // whichever way `\s*` backtracks.
+        regex::bytes::Regex::new(r"(?i)\blimit\s+1\b\s*([^,\s]|$)").unwrap()
+    });
+    LIMIT_ONE.is_match(sql)
 }
 
 pub(crate) unsafe fn adopt_materialized_result_owner(

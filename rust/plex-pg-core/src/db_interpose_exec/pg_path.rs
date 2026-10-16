@@ -1,23 +1,85 @@
-use super::support::{
-    is_duplicate_prepared_stmt, is_stale_prepared_stmt, malloc_cstring,
-    parse_positive_returning_rowid,
-};
+use super::support::{is_duplicate_prepared_stmt, malloc_cstring, parse_positive_returning_rowid};
 use super::*;
 use crate::log_info_lazy;
+use crate::pg_client::PgErrorClass;
 
 fn set_pg_last_error(pg: &mut crate::ffi_types::PgConnection, msg: &str) {
-    pg.last_error_code = SQLITE_ERROR;
-    pg.last_error.fill(0);
-    let bytes = msg.as_bytes();
-    let len = bytes.len().min(pg.last_error.len().saturating_sub(1));
-    for (dst, src) in pg.last_error.iter_mut().zip(bytes.iter()).take(len) {
-        *dst = *src as c_char;
+    pg.set_last_error(SQLITE_ERROR, msg);
+}
+
+/// Hand the caller `*errmsg` as `sqlite3_exec` does: a copy from
+/// `sqlite3_malloc`, which it frees with `sqlite3_free`. Nothing is written
+/// when the caller passed no slot.
+pub(crate) fn set_errmsg_out(errmsg: *mut *mut c_char, msg: &str) {
+    if errmsg.is_null() {
+        return;
     }
+    let bytes = msg.as_bytes();
+    let n = bytes.len() + 1;
+    let out = crate::db_interpose_metadata::rust_my_sqlite3_malloc(n as c_int) as *mut c_char;
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
+        *out.add(bytes.len()) = 0;
+        *errmsg = out;
+    }
+}
+
+/// The row callback `sqlite3_exec` promises: once per row, with the column
+/// names and the row's values as C strings, NULL for SQL NULL. A non-zero
+/// return stops the loop and the exec answers SQLITE_ABORT.
+///
+/// `sqlite3_exec` with a callback on a PostgreSQL-routed handle never called
+/// it before 2026-10-16: the rows were fetched and dropped, so anything Plex
+/// read this way (a PRAGMA-style probe, a count) saw no rows at all.
+pub(crate) unsafe fn deliver_rows_to_callback(
+    res: *const PGresult,
+    callback: ExecCallback,
+    arg: *mut c_void,
+) -> c_int {
+    let Some(cb) = callback else {
+        return SQLITE_OK;
+    };
+    let nrows = crate::libpq_helpers::rust_pq_ntuples(res);
+    let ncols = crate::libpq_helpers::rust_pq_nfields(res);
+    let mut names: Vec<*mut c_char> = (0..ncols)
+        .map(|c| crate::db_interpose_helpers::rust_pg_result_col_name(res, c) as *mut c_char)
+        .collect();
+    let mut values: Vec<*mut c_char> = vec![std::ptr::null_mut(); ncols.max(0) as usize];
+    for row in 0..nrows {
+        for col in 0..ncols {
+            let mut value: *const c_char = std::ptr::null();
+            let mut len: c_int = 0;
+            let mut is_null: c_int = 0;
+            crate::db_interpose_helpers::rust_pg_result_value_ptr_len(
+                res,
+                row,
+                col,
+                &mut value,
+                &mut len,
+                &mut is_null,
+            );
+            values[col as usize] = if is_null != 0 {
+                std::ptr::null_mut()
+            } else {
+                value as *mut c_char
+            };
+        }
+        if cb(arg, ncols, values.as_mut_ptr(), names.as_mut_ptr()) != 0 {
+            return SQLITE_ABORT;
+        }
+    }
+    SQLITE_OK
 }
 
 pub(crate) fn exec_via_postgres(
     pg_conn: *mut crate::ffi_types::PgConnection,
     sql: *const c_char,
+    callback: ExecCallback,
+    arg: *mut c_void,
+    errmsg: *mut *mut c_char,
 ) -> c_int {
     let pg = unsafe { &mut *pg_conn };
     unsafe {
@@ -243,6 +305,30 @@ pub(crate) fn exec_via_postgres(
                     };
                     pg.last_changes = crate::db_interpose_helpers::rust_pg_text_to_int(tuples_ptr);
 
+                    if status == PGRES_TUPLES_OK
+                        && callback.is_some()
+                        && !starts_with_icase_bytes(sql_bytes, b"INSERT")
+                    {
+                        // The INSERT's rows are the RETURNING id the shim
+                        // added, which Plex did not ask for.
+                        let rc = deliver_rows_to_callback(res, callback, arg);
+                        if rc != SQLITE_OK {
+                            if !owned_insert.is_null() {
+                                libc::free(owned_insert as *mut c_void);
+                            }
+                            crate::libpq_helpers::rust_pq_clear(res);
+                            conn_guard.unlock();
+                            sql_translation_free(&mut trans as *mut SqlTranslation);
+                            if !blobs_rewrite.is_null() {
+                                libc::free(blobs_rewrite as *mut c_void);
+                            }
+                            set_pg_last_error(pg, "query aborted");
+                            pg.last_error_code = rc;
+                            set_errmsg_out(errmsg, "query aborted");
+                            return rc;
+                        }
+                    }
+
                     if starts_with_icase_bytes(sql_bytes, b"INSERT")
                         && status == PGRES_TUPLES_OK
                         && crate::libpq_helpers::rust_pq_ntuples(res) > 0
@@ -262,6 +348,8 @@ pub(crate) fn exec_via_postgres(
                         if !id_str.is_null() && !CStr::from_ptr(id_str).to_bytes().is_empty() {
                             if let Some(rowid) = parse_positive_returning_rowid(id_str) {
                                 pg.last_insert_rowid = rowid;
+                                pg.last_insert_failed
+                                    .store(0, std::sync::atomic::Ordering::Release);
                                 crate::pg_client::rust_set_global_last_insert_rowid(rowid);
                             }
                             if contains_bytes(sql_bytes, b"play_queue_generators") {
@@ -277,35 +365,39 @@ pub(crate) fn exec_via_postgres(
                         }
                     }
                 } else {
-                    let err = if pg.conn.is_null() {
-                        c"NULL connection".as_ptr()
-                    } else {
-                        crate::libpq_helpers::rust_pq_error_message(pg.conn)
-                    };
-                    log_error(&format!(
-                        "PostgreSQL exec error: {}",
-                        cstr_to_string_or(err, "NULL connection")
-                    ));
-                    let is_conn_error = pg.conn.is_null()
-                        || crate::libpq_helpers::rust_pq_status(pg.conn) != CONNECTION_OK;
-                    let is_stale_stmt = is_stale_prepared_stmt(res);
-                    if is_stale_stmt {
-                        crate::pg_client::rust_stmt_cache_clear_local(pg_conn as *mut c_void);
+                    // Refused. One classifier with the step: a lost connection
+                    // or a stale plan is retried by the caller; anything else
+                    // is SQLITE_ERROR now, with PostgreSQL's message as
+                    // sqlite3_errmsg and in *errmsg. This used to answer
+                    // SQLITE_OK for a constraint violation.
+                    let (class, message) = crate::pg_client::classify_result(pg.conn, res);
+                    log_error(&format!("PostgreSQL exec error ({:?}): {}", class, message));
+                    if !owned_insert.is_null() {
+                        libc::free(owned_insert as *mut c_void);
                     }
-                    crate::pg_client::rust_pool_check_health(pg_conn as *mut c_void);
-                    if is_conn_error || is_stale_stmt {
-                        if !owned_insert.is_null() {
-                            libc::free(owned_insert as *mut c_void);
-                        }
-                        crate::libpq_helpers::rust_pq_clear(res);
-                        conn_guard.unlock();
-                        sql_translation_free(&mut trans as *mut SqlTranslation);
-                        if !blobs_rewrite.is_null() {
-                            libc::free(blobs_rewrite as *mut c_void);
-                        }
-                        EXEC_PG_CONN_ERROR.with(|c| c.set(1));
-                        return SQLITE_ERROR;
+                    crate::libpq_helpers::rust_pq_clear(res);
+                    conn_guard.unlock();
+                    sql_translation_free(&mut trans as *mut SqlTranslation);
+                    if !blobs_rewrite.is_null() {
+                        libc::free(blobs_rewrite as *mut c_void);
                     }
+                    match class {
+                        PgErrorClass::StalePlan => {
+                            crate::pg_client::rust_stmt_cache_clear_local(pg_conn as *mut c_void);
+                            EXEC_PG_CONN_ERROR.with(|c| c.set(1));
+                        }
+                        PgErrorClass::Retry => {
+                            crate::pg_client::rust_pool_check_health(pg_conn as *mut c_void);
+                            EXEC_PG_CONN_ERROR.with(|c| c.set(1));
+                        }
+                        PgErrorClass::Fail => {
+                            crate::db_interpose_step_write_utils::note_failed_write(
+                                pg, exec_sql, &message,
+                            );
+                            set_errmsg_out(errmsg, &message);
+                        }
+                    }
+                    return SQLITE_ERROR;
                 }
 
                 if !owned_insert.is_null() {
@@ -322,6 +414,7 @@ pub(crate) fn exec_via_postgres(
                 );
                 log_error(&msg);
                 set_pg_last_error(pg, &msg);
+                set_errmsg_out(errmsg, &msg);
                 sql_translation_free(&mut trans as *mut SqlTranslation);
                 if !blobs_rewrite.is_null() {
                     libc::free(blobs_rewrite as *mut c_void);
