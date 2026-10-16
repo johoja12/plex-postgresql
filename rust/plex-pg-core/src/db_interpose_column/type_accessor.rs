@@ -26,7 +26,7 @@ impl LiveTypeState {
     fn decltype_guess(&self) -> &'static str {
         match self.oid {
             16 | 21 | 23 | 26 => "INTEGER",
-            20 | 1114 | 1184 => "dt_integer(8)",
+            20 => "dt_integer(8)",
             700 | 701 | 1700 => "REAL",
             17 => "BLOB",
             _ => "TEXT",
@@ -490,10 +490,12 @@ fn column_type_emit_log(pg_stmt: *mut PgStmt, p_stmt: *mut sqlite3_stmt, ctx: &C
 mod tests {
     use super::*;
 
+    // A timestamp's value is text ("2024-01-02 03:04:05"); read as INTEGER
+    // it was atoll'd to the year.
     #[test]
-    fn null_oid_mapping_keeps_timestamp_columns_integer() {
-        assert_eq!(sqlite_type_for_oid(1114), SQLITE_INTEGER);
-        assert_eq!(sqlite_type_for_oid(1184), SQLITE_INTEGER);
+    fn timestamp_columns_read_as_text() {
+        assert_eq!(sqlite_type_for_oid(1114), SQLITE_TEXT);
+        assert_eq!(sqlite_type_for_oid(1184), SQLITE_TEXT);
     }
 
     // A NULL column has to read as NULL whatever it was declared as. Reported

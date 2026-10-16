@@ -33,7 +33,9 @@ pub(crate) fn oid_to_sqlite_type(oid: u32) -> i32 {
 pub(crate) fn oid_to_sqlite_decltype(oid: u32) -> &'static CStr {
     let bytes: &'static [u8] = match oid {
         16 | 21 | 23 | 26 => DECLTYPE_INTEGER,
-        20 | 1114 | 1184 => DECLTYPE_DT_INTEGER_8, // 64-bit epoch/int8 → SOCI int64
+        20 => DECLTYPE_DT_INTEGER_8, // int8 → SOCI int64
+        // timestamp and timestamptz (1114, 1184) are TEXT: their value is
+        // "2024-01-02 03:04:05", not an epoch.
         700 | 701 | 1700 => DECLTYPE_REAL,
         17 => DECLTYPE_BLOB,
         _ => DECLTYPE_TEXT,

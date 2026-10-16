@@ -60,17 +60,19 @@ unsafe fn load_cached_text_state(pg_stmt: &mut PgStmt, idx: c_int) -> Option<Cac
     })
 }
 
-/// Write cached text output into a thread-local buffer.
+/// Write cached text output into a thread-local buffer. Returns the text
+/// and whether it is in the ring (and so must be pinned to the statement).
 /// SAFETY: Must be called while stmt mutex is held. Does NOT call log_debug/log_error
 /// to avoid deadlock with the LOGGER mutex.
 unsafe fn write_cached_text_output(
     pg_stmt: &mut PgStmt,
     _idx: c_int,
     state: &CachedTextState,
-) -> *const c_uchar {
+) -> (*const c_uchar, bool) {
     let str_len = libc::strlen(state.source_value) as usize;
     let buf_idx = next_text_buffer_index();
     let mut out_ptr: *const c_uchar = ptr::null();
+    let mut from_ring = true;
     COLUMN_TEXT_BUFFERS.with(|bufs| {
         let mut bufs = bufs.borrow_mut();
         let buf = &mut bufs[buf_idx];
@@ -91,6 +93,7 @@ unsafe fn write_cached_text_output(
             // Longer than the buffer: the cached row's own copy, which lives
             // as long as SQLite keeps a column_text pointer (the row).
             out_ptr = state.source_value as *const c_uchar;
+            from_ring = false;
             return;
         }
 
@@ -101,7 +104,7 @@ unsafe fn write_cached_text_output(
         buf[copy_len] = 0;
         out_ptr = buf.as_ptr();
     });
-    out_ptr
+    (out_ptr, from_ring)
 }
 
 unsafe fn load_live_text_state(pg_stmt: &mut PgStmt, idx: c_int) -> Option<LiveTextState> {
@@ -142,14 +145,16 @@ unsafe fn load_live_text_state(pg_stmt: &mut PgStmt, idx: c_int) -> Option<LiveT
     })
 }
 
-/// Write live (non-cached) text output into a thread-local buffer.
+/// Write live (non-cached) text output into a thread-local buffer. Returns
+/// the text and whether it is in the ring (and so must be pinned to the
+/// statement).
 /// SAFETY: Must be called while stmt mutex is held. Does NOT call log_debug/log_error
 /// to avoid deadlock with the LOGGER mutex.
 unsafe fn write_live_text_output(
     pg_stmt: &mut PgStmt,
     idx: c_int,
     state: &LiveTextState,
-) -> *const c_uchar {
+) -> (*const c_uchar, bool) {
     let buf_idx = next_text_buffer_index();
     let mut out_ptr: *const c_uchar = ptr::null();
     let mut preview = [0u8; 128];
@@ -179,7 +184,7 @@ unsafe fn write_live_text_output(
         // PQgetvalue returned NULL for a non-NULL cell — likely a stale PGresult
         // race condition. Match the C shim behavior: return empty string instead
         // of NULL to prevent std::string(nullptr) → basic_string exception.
-        return b"\0".as_ptr();
+        return (b"\0".as_ptr(), false);
     }
     if transform_rc == 0 && source_len >= TEXT_BUFFER_SIZE {
         // Longer than the buffer, which holds the first 8,191 bytes: libpq's
@@ -197,10 +202,60 @@ unsafe fn write_live_text_output(
             &mut is_null as *mut c_int,
         );
         if !value.is_null() && is_null == 0 {
-            return value as *const c_uchar;
+            return (value as *const c_uchar, false);
         }
     }
-    out_ptr
+    (out_ptr, true)
+}
+
+/// Keep the text the statement is handing out for `idx` on the statement
+/// itself, so the pointer lives until its next step, reset or finalize --
+/// SQLite's promise for `sqlite3_column_text`.
+///
+/// The thread-local ring the value was rendered into has 64 slots, and a
+/// statement with more columns than that, or Plex reading a column, then
+/// sixty-odd others, then the first again, found the first overwritten.
+/// `cached_text` is cleared on the next row (here and by the blob accessor,
+/// which shares it), by the streaming step, and by reset and finalize.
+///
+/// A pointer that is not the ring's -- libpq's own copy of a long value, a
+/// cached row's -- lives as long as the result does and is handed out as is.
+///
+/// SAFETY: Must be called while stmt mutex is held. Does NOT log.
+unsafe fn pin_text_to_statement(
+    pg_stmt: &mut PgStmt,
+    idx: c_int,
+    text: *const c_uchar,
+    from_ring: bool,
+) -> *const c_uchar {
+    if text.is_null() || !from_ring || idx < 0 {
+        return text;
+    }
+    let row = pg_stmt.current_row;
+    if pg_stmt.cached_row != row {
+        crate::db_interpose_helpers::rust_step_clear_row_caches(
+            pg_stmt.cached_text.as_mut_ptr(),
+            pg_stmt.cached_blob.as_mut_ptr(),
+            pg_stmt.cached_blob_len.as_mut_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            pg_stmt.cached_text.len() as c_int,
+            &mut pg_stmt.cached_row as *mut c_int,
+            ptr::null_mut(),
+        );
+        pg_stmt.cached_row = row;
+    }
+    let i = idx as usize;
+    pg_stmt.ensure_column_capacity(i + 1);
+    let copy = libc::strdup(text as *const c_char);
+    if copy.is_null() {
+        return text;
+    }
+    if !pg_stmt.cached_text[i].is_null() {
+        libc::free(pg_stmt.cached_text[i] as *mut c_void);
+    }
+    pg_stmt.cached_text[i] = copy;
+    copy as *const c_uchar
 }
 
 pub(super) fn column_text_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const c_uchar {
@@ -242,29 +297,41 @@ pub(super) fn column_text_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const 
     {
         let _guard = unsafe { PgStmt::lock_mutex(dbg_stmt) };
 
-        if !pg_stmt.cached_result.is_null() {
+        // Already rendered for this row: the same pointer, as SQLite gives.
+        // Rendering again would replace, and free, the copy Plex may still
+        // be reading.
+        if idx >= 0
+            && pg_stmt.cached_row == pg_stmt.current_row
+            && (idx as usize) < pg_stmt.cached_text.len()
+            && !pg_stmt.cached_text[idx as usize].is_null()
+        {
+            return pg_stmt.cached_text[idx as usize] as *const c_uchar;
+        }
+
+        let (text, from_ring) = if !pg_stmt.cached_result.is_null() {
             match unsafe { load_cached_text_state(pg_stmt, idx) } {
                 Some(state) => unsafe { write_cached_text_output(pg_stmt, idx, &state) },
                 // SQL NULL: return empty string instead of NULL to prevent
                 // Plex's std::string(nullptr) → basic_string crash.
                 // Real SQLite returns NULL here, but Plex doesn't always check.
-                None => empty_text_buffer(),
+                None => (empty_text_buffer(), true),
             }
         } else if pg_stmt.result.is_null() {
-            empty_text_buffer()
+            (empty_text_buffer(), true)
         } else if idx < 0 || idx >= pg_stmt.num_cols {
-            empty_text_buffer()
+            (empty_text_buffer(), true)
         } else {
             let row = pg_stmt.current_row;
             if row < 0 || row >= pg_stmt.num_rows {
-                empty_text_buffer()
+                (empty_text_buffer(), true)
             } else {
                 match unsafe { load_live_text_state(pg_stmt, idx) } {
                     Some(state) => unsafe { write_live_text_output(pg_stmt, idx, &state) },
-                    None => empty_text_buffer(),
+                    None => (empty_text_buffer(), true),
                 }
             }
-        }
+        };
+        unsafe { pin_text_to_statement(pg_stmt, idx, text, from_ring) }
     }
     // Mutex released here.
 }

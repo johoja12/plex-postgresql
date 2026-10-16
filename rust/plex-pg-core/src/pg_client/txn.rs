@@ -388,15 +388,6 @@ pub(crate) fn forget_db(db: usize) {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn state_of(conn: *const PgConnection) -> TxnState {
-    mutex_lock(&TXN)
-        .by_conn
-        .get(&(conn as usize))
-        .cloned()
-        .unwrap_or_default()
-}
-
 /// Run a transaction-control statement for handle `db` on `conn`.
 ///
 /// Returns Ok(()) when it is done (or was a no-op), Err(message) when
