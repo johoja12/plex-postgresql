@@ -86,6 +86,7 @@ pub mod pms_process_compat;
 pub mod query;
 pub mod quotes;
 pub mod rewriter;
+mod schema_columns;
 pub mod runtime_common;
 #[cfg(target_os = "linux")]
 pub mod runtime_linux;
