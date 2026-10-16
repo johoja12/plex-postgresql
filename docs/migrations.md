@@ -105,3 +105,5 @@ SELECT * FROM plex.spellfix_suggest('matrx');
 -- #27: no guard trigger or extra column is left
 SELECT tgname FROM pg_trigger WHERE tgrelid = 'plex.metadata_items'::regclass AND NOT tgisinternal;
 ```
+
+Applied as a superuser, a migration hands what it creates to the `plex` role at its end (the 2026-10-16 file does); check with `SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='plex' AND pg_get_userbyid(c.relowner)<>'plex';` after applying.

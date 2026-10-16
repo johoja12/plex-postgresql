@@ -588,6 +588,41 @@ SELECT pg_temp.unique_index_if_clean('media_provider_resources_on_uuid', 'media_
 SELECT pg_temp.unique_index_if_clean('index_external_metadata_sources_on_uri', 'external_metadata_sources', ARRAY['uri']);
 DROP FUNCTION pg_temp.unique_index_if_clean(text, text, text[]);
 
+-- Ownership. Applied as the superuser (CloudNativePG's postgres), every
+-- object above would belong to postgres and the shim's role, plex, got
+-- "permission denied for view fts4_metadata_titles_icu" and "... for table
+-- spellfix_vocab" (talos, 2026-10-16). Everything the migration creates is
+-- handed to the role the shim connects as; applied as plex itself, these are
+-- no-ops.
+DO $$
+DECLARE
+  r record;
+BEGIN
+  FOR r IN
+    SELECT c.relkind, c.relname
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'plex' AND c.relkind IN ('r', 'v')
+      AND c.relname IN ('spellfix_vocab', 'fts4_metadata_titles', 'fts4_metadata_titles_icu', 'fts4_tag_titles', 'fts4_tag_titles_icu')
+      AND pg_get_userbyid(c.relowner) <> 'plex'
+  LOOP
+    EXECUTE format('ALTER %s plex.%I OWNER TO plex', CASE r.relkind WHEN 'v' THEN 'VIEW' ELSE 'TABLE' END, r.relname);
+  END LOOP;
+  FOR r IN
+    SELECT p.oid::regprocedure AS sig
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'plex' AND pg_get_userbyid(p.proowner) <> 'plex'
+      AND p.proname IN ('fold', 'fts_lexemes', 'fts_phrase', 'fts_query', 'fts_term', 'spellfix_suggest', 'spellfix_vocab_add', 'spellfix_words')
+  LOOP
+    EXECUTE format('ALTER FUNCTION %s OWNER TO plex', r.sig);
+  END LOOP;
+  FOR r IN
+    SELECT collname FROM pg_collation
+    WHERE collnamespace = 'plex'::regnamespace AND pg_get_userbyid(collowner) <> 'plex'
+  LOOP
+    EXECUTE format('ALTER COLLATION plex.%I OWNER TO plex', r.collname);
+  END LOOP;
+END $$;
+
 COMMIT;
 
 ANALYZE plex.metadata_items;
