@@ -56,9 +56,6 @@ CREATE TABLE IF NOT EXISTS "media_subscriptions" ("id" INTEGER PRIMARY KEY AUTOI
 CREATE TABLE IF NOT EXISTS "media_grabs" ("id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, "uuid" varchar(255), "status" integer, "error" integer, "metadata_item_id" integer, "media_subscription_id" integer, "extra_data" varchar(255), "created_at" dt_integer(8), "updated_at" dt_integer(8));
 CREATE TABLE IF NOT EXISTS "metadata_item_clusters" ("id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, "zoom_level" integer, "library_section_id" integer, "title" varchar(255), "count" integer, "starts_at" dt_integer(8), "ends_at" dt_integer(8), "extra_data" varchar(255));
 CREATE TABLE IF NOT EXISTS "metadata_item_clusterings" ("id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, "metadata_item_id" integer, "metadata_item_cluster_id" integer, "index" integer, "version" integer, FOREIGN KEY(metadata_item_cluster_id) REFERENCES metadata_item_clusters(id) ON DELETE CASCADE, FOREIGN KEY(metadata_item_id) REFERENCES metadata_items(id) ON DELETE CASCADE);
-CREATE TABLE IF NOT EXISTS "locations_node"(nodeno INTEGER PRIMARY KEY, data BLOB);
-CREATE TABLE IF NOT EXISTS "locations_rowid"(rowid INTEGER PRIMARY KEY, nodeno INTEGER);
-CREATE TABLE IF NOT EXISTS "locations_parent"(nodeno INTEGER PRIMARY KEY, parentnode INTEGER);
 CREATE TABLE IF NOT EXISTS "locatables" ("id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, "location_id" INTEGER NOT NULL, "locatable_id" INTEGER NOT NULL, "locatable_type" VARCHAR(255) NOT NULL, "created_at" dt_integer(8), "updated_at" dt_integer(8), "extra_data" VARCHAR(255), "geocoding_version" integer, UNIQUE("location_id", "locatable_id", "locatable_type"));
 CREATE TABLE IF NOT EXISTS "blobs" ("id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, "blob" blob, "linked_type" varchar(255), "linked_id" integer, "linked_guid" varchar(255), "created_at" dt_integer(8), "blob_type" integer);
 CREATE TABLE IF NOT EXISTS "location_places" ("id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, "location_id" INTEGER, "guid" VARCHAR(255) NOT NULL, UNIQUE("location_id", "guid"));
@@ -241,13 +238,5 @@ CREATE INDEX "index_metadata_agent_provider_group_items_on_order" ON "metadata_a
 CREATE INDEX "index_metadata_items_on_is_adult" ON "metadata_items" ("is_adult");
 CREATE INDEX "index_library_sections_on_metadata_agent_provider_group_id" ON "library_sections" ("metadata_agent_provider_group_id");
 CREATE INDEX "index_metadata_items_on_metadata_agent_provider_group_id" ON "metadata_items" ("metadata_agent_provider_group_id");
-CREATE VIRTUAL TABLE spellfix_metadata_titles USING spellfix1;
-CREATE VIRTUAL TABLE spellfix_tag_titles USING spellfix1;
-CREATE VIRTUAL TABLE fts4_metadata_titles USING fts4(content="metadata_items", title, title_sort, original_title)
-/* fts4_metadata_titles(title,title_sort,original_title) */;
-CREATE VIRTUAL TABLE fts4_tag_titles USING fts4(content="tags", tag)
-/* fts4_tag_titles(tag) */;
 CREATE VIRTUAL TABLE "locations" USING rtree("id" integer, "lat_min" float, "lat_max" float, "lon_min" float, "lon_max" float)
 /* locations(id,lat_min,lat_max,lon_min,lon_max) */;
-CREATE VIRTUAL TABLE fts4_metadata_titles_icu USING fts4(content="metadata_items", title, title_sort, original_title, tokenize=collating 'root@colStrength=primary;colAlternate=shifted');
-CREATE VIRTUAL TABLE fts4_tag_titles_icu USING fts4(content="tags", tag, tokenize=collating 'root@colStrength=primary;colAlternate=shifted');

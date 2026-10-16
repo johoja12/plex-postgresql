@@ -23,7 +23,7 @@ A living map of SQLite surface area vs. translator support, with direct pointers
 | GROUP BY strictness | Supported | `rewrite/groupby` | `rust/plex-pg-core/src/groupby.rs` | Adds non-aggregate columns. |
 | Function rewrites (IFNULL, IIF, STRFTIME, etc.) | Supported | `subset/core` | `rust/plex-pg-core/src/functions.rs`, `rust/plex-pg-core/src/emit.rs` | Includes common Plex patterns. |
 | JSON functions / operators | Partial | `subset/json` | `rust/plex-pg-core/src/functions.rs`, `rust/plex-pg-core/src/query.rs` | JSONPath fallback used for some patterns. |
-| FTS MATCH rewrite | Partial | `subset/fts` | `rust/plex-pg-core/src/db_interpose_helpers_tests.rs` | Limited to known Plex queries. |
+| FTS MATCH rewrite | Partial | `subset/fts` | `rust/plex-pg-core/src/db_interpose_helpers_tests.rs` | Limited to known Plex queries. The schema side -- the `fts4_*` views, `plex.fold`, `plex.fts_query`, the GIN expression indexes, `plex.spellfix_suggest` -- is in `docs/translator/KNOWN_GAPS.md` ("Schema-side support"). |
 | DDL-lite (CREATE TABLE/INDEX IF NOT EXISTS) | Partial | `subset/ddl-lite` | `rust/plex-pg-core/src/quotes.rs`, `rust/plex-pg-core/src/db_interpose_helpers_tests.rs`, `rust/plex-pg-core/src/emit.rs` | Only patterns used by Plex. |
 | PRAGMA / extension hooks | Skipped/No-op | `subset/pragma` | `rust/plex-pg-core/src/keywords_tests.rs`, `rust/plex-pg-core/src/pg_config.rs` | Explicit skip list and prefix checks. |
 | Transaction control (BEGIN/COMMIT/ROLLBACK) | Skipped/No-op | `subset/txn` | `rust/plex-pg-core/src/pg_config.rs` | Skip-SQL (not routed to PG), matches C shim. |

@@ -33,6 +33,7 @@ fi
 echo "Step 1: Creating schema..."
 $PSQL -c "CREATE SCHEMA IF NOT EXISTS $PG_SCHEMA;"
 $PSQL -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" 2>/dev/null || true
+$PSQL -c "CREATE EXTENSION IF NOT EXISTS unaccent;" 2>/dev/null || true
 
 echo "Step 2: Applying schema..."
 $PSQL -f "$(dirname "$0")/../schema/plex_schema.sql"

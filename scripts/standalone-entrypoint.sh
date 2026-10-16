@@ -84,6 +84,7 @@ init_schema() {
 
     psql -c "CREATE SCHEMA IF NOT EXISTS $schema;" 2>/dev/null || true
     psql -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" 2>/dev/null || true
+    psql -c "CREATE EXTENSION IF NOT EXISTS unaccent;" 2>/dev/null || true
 
     local table_count=$(psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ')
 
