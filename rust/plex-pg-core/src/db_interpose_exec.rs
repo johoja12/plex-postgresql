@@ -187,7 +187,12 @@ fn rust_my_sqlite3_exec_impl(
         return orig_exec(db, sql, callback, arg, errmsg);
     }
 
-    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    // Inside a transaction the handle's statements all go to the connection
+    // the BEGIN went to; otherwise the thread's own slot.
+    let mut pg_conn = crate::pg_client::txn::pinned_conn(db);
+    if pg_conn.is_null() {
+        pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    }
 
     if !pg_conn.is_null() && unsafe { (&*pg_conn).is_pg_active } != 0 {
         // SQLite engine config (fts3_tokenizer, icu_load_collation, load_extension)
@@ -208,7 +213,7 @@ fn rust_my_sqlite3_exec_impl(
         unsafe {
             trace_exec_skipped_select(b"pg_route\0".as_ptr() as *const c_char, db, pg_conn, sql);
         }
-        return exec_via_postgres(pg_conn, sql, callback, arg, errmsg);
+        return exec_via_postgres(pg_conn, db, sql, callback, arg, errmsg);
     }
 
     // For non-PG databases (e.g. :memory:), icu_load_collation may fail because

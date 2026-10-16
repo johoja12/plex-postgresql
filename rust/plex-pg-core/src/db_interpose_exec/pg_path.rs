@@ -76,6 +76,7 @@ pub(crate) unsafe fn deliver_rows_to_callback(
 
 pub(crate) fn exec_via_postgres(
     pg_conn: *mut crate::ffi_types::PgConnection,
+    db: *mut sqlite3,
     sql: *const c_char,
     callback: ExecCallback,
     arg: *mut c_void,
@@ -91,6 +92,7 @@ pub(crate) fn exec_via_postgres(
             let mut conn_guard = PthreadMutexGuard::lock(&mut pg.mutex as *mut _);
             if !pg.conn.is_null() {
                 crate::libpq_helpers::rust_pq_reset(pg.conn);
+                crate::pg_client::txn::forget_connection(pg_conn);
                 if crate::libpq_helpers::rust_pq_status(pg.conn) != CONNECTION_OK {
                     log_error("EXEC: PQreset failed, trying fresh PQconnectdb...");
                     crate::pg_client::rust_stmt_cache_clear(pg_conn as *mut c_void);
@@ -172,6 +174,25 @@ pub(crate) fn exec_via_postgres(
         let blobs_rewrite = rewrite_blobs_schema_migrations(sql, pg.db_path.as_ptr());
         if !blobs_rewrite.is_null() {
             exec_sql = blobs_rewrite;
+        }
+
+        // BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE: forwarded on this
+        // connection (pg_client::txn), a no-op with PLEX_PG_TRANSACTIONS=0.
+        if crate::pg_client::txn::enabled() {
+            let sql_str = crate::db_interpose_helpers::cstr_to_str_or_empty(exec_sql);
+            if let Some(cmd) = crate::pg_client::txn::classify_sql(sql_str) {
+                let rc = match crate::pg_client::txn::run(pg_conn, db, &cmd) {
+                    Ok(()) => SQLITE_OK,
+                    Err(msg) => {
+                        set_errmsg_out(errmsg, &msg);
+                        SQLITE_ERROR
+                    }
+                };
+                if !blobs_rewrite.is_null() {
+                    libc::free(blobs_rewrite as *mut c_void);
+                }
+                return rc;
+            }
         }
 
         if crate::pg_config::pg_config_should_skip_sql(exec_sql) == 0 {

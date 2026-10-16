@@ -54,6 +54,56 @@ fn set_stmt_translation_error(pg_stmt: *mut PgStmt, msg: &str) {
 
 use crate::env_utils::loadone_trace_enabled;
 
+/// Forward a registered transaction-control statement (`is_pg == 3`) to
+/// PostgreSQL. None when the statement is not transaction control, or
+/// forwarding is off: the caller answers DONE as for any skipped SQL.
+unsafe fn step_transaction_control(pg_stmt: *mut PgStmt) -> Option<c_int> {
+    let s = &*pg_stmt;
+    if !crate::pg_client::txn::enabled() || s.sql.is_null() {
+        return None;
+    }
+    let sql = crate::db_interpose_helpers::cstr_to_str_or_empty(s.sql);
+    let cmd = crate::pg_client::txn::classify_sql(sql)?;
+    let db = if s.shadow_stmt.is_null() {
+        std::ptr::null_mut()
+    } else {
+        call_sqlite3_db_handle(s.shadow_stmt)
+    };
+    let conn = transaction_connection(db);
+    match crate::pg_client::txn::run(conn, db, &cmd) {
+        Ok(()) => Some(SQLITE_DONE),
+        Err(msg) => {
+            let msg = format!("PG transaction control failed: {} :: {}", sql, msg);
+            set_stmt_translation_error(pg_stmt, &msg);
+            if !conn.is_null() {
+                (&mut *conn).set_last_error(SQLITE_ERROR, &msg);
+            }
+            crate::db_interpose_conn_utils::log_error(&msg);
+            Some(SQLITE_ERROR)
+        }
+    }
+}
+
+/// The connection a transaction-control statement for `db` runs on: the
+/// one its transaction is already pinned to, else the thread's own slot --
+/// acquired through the pool, which skips a slot with a stream in flight,
+/// so the BEGIN never lands on a connection another statement is reading.
+pub(crate) unsafe fn transaction_connection(db: *mut sqlite3) -> *mut PgConnection {
+    let pinned = crate::pg_client::txn::pinned_conn(db);
+    if !pinned.is_null() && !(&*pinned).conn.is_null() {
+        return pinned;
+    }
+    let found = crate::pg_client::rust_pg_find_connection(db);
+    if found.is_null() {
+        return std::ptr::null_mut();
+    }
+    let fc = &*found;
+    if fc.is_pg_active != 0 && !fc.conn.is_null() {
+        return found;
+    }
+    std::ptr::null_mut()
+}
+
 fn take_step_trace_slot() -> Option<u32> {
     if !loadone_trace_enabled() {
         return None;
@@ -208,11 +258,13 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
         }
 
         if s.is_pg == 3 {
-            // Transaction control (BEGIN/COMMIT/ROLLBACK/SAVEPOINT) — skip entirely.
-            // PG runs in autocommit mode: each statement commits immediately.
-            // Forwarding transactions is unsound with the connection pool (BEGIN
-            // and COMMIT could land on different connections). Skipping is safe
-            // because DDL is idempotent (IF NOT EXISTS / ON CONFLICT DO NOTHING).
+            // Skipped SQL (PRAGMA, VACUUM, ...) is a no-op: SQLITE_DONE.
+            // Transaction control is forwarded to PostgreSQL on the thread's
+            // own slot, pinned to the handle until the transaction ends
+            // (pg_client::txn), unless PLEX_PG_TRANSACTIONS turns that off.
+            if let Some(rc) = step_transaction_control(pg_stmt) {
+                return rc;
+            }
             log_debug_lazy!(
                 "[RACE_DEBUG] STEP_END thread={:p} stmt={:p} rc={} reason=skip",
                 libc::pthread_self() as *mut c_void,
@@ -252,7 +304,18 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
         exec_conn = crate::db_interpose_step_read_utils::streaming_conn_for_this_thread(pg_stmt);
         if exec_conn.is_null() && !s.shadow_stmt.is_null() {
             let db = call_sqlite3_db_handle(s.shadow_stmt);
-            let handle_conn = crate::pg_client::rust_pg_find_connection(db);
+            // Inside a transaction every statement of the handle runs on the
+            // connection the BEGIN went to.
+            let pinned = crate::pg_client::txn::pinned_conn(db);
+            if !pinned.is_null() && !(&*pinned).conn.is_null() {
+                exec_conn = pinned;
+                crate::pg_client::rust_pool_touch_connection(exec_conn as *const c_void);
+            }
+            let handle_conn = if exec_conn.is_null() {
+                crate::pg_client::rust_pg_find_connection(db)
+            } else {
+                std::ptr::null_mut()
+            };
             if !handle_conn.is_null() {
                 let hc = &*handle_conn;
                 if hc.is_pg_active != 0
