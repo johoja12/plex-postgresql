@@ -7,7 +7,8 @@ use sqlparser::ast::helpers::attached_token::AttachedToken;
 ///   iif(cond,then,else)   → CASE WHEN cond THEN then ELSE else END
 ///   typeof(x)             → pg_typeof(x)::text
 ///   last_insert_rowid()   → lastval()
-///   json_each(x)          → json_array_elements(x)
+///   json_each(x)          → json_array_elements_text(x) (SQLite's `value` is the
+///                           element itself, so a string comes back without JSON quotes)
 ///   json_extract(x,'$.a') → jsonb_extract_path_text(x::jsonb,'a')
 ///   json_set(x,'$.a',v)   → jsonb_set(x::jsonb, string_to_array('a',','), to_jsonb(v), true)
 ///   SUBSTR(a,b,c)         → SUBSTRING(a,b,c)
@@ -152,7 +153,7 @@ fn is_json_array_elements_table(tf: &TableFactor) -> bool {
                 _ => None,
             })
             .unwrap_or_default();
-        return table_name == "json_array_elements";
+        return table_name == "json_array_elements" || table_name == "json_array_elements_text";
     }
     false
 }
@@ -193,7 +194,11 @@ fn object_last_ident_lower(name: &ObjectName) -> Option<String> {
 fn rename_sqlite_json_table_fn_name_if_present(name: &mut ObjectName) -> Option<&'static str> {
     let source = object_last_ident_lower(name)?;
     let target = match source.as_str() {
-        "json_each" => "json_array_elements",
+        // json_array_elements would hand back each element as JSON, so a
+        // string keeps its quotes and `tg.tag IN (SELECT value FROM
+        // json_each(:C1))` -- Plex's collection delete -- matched nothing
+        // (2026-10-16). _text yields the element's text, as SQLite does.
+        "json_each" => "json_array_elements_text",
         "json_tree" => "jsonb_each_text",
         _ => return None,
     };
@@ -717,7 +722,7 @@ fn transform_table_factor(f: &mut TableFactor) {
         }
         TableFactor::Table { name, args, .. } => {
             // SQLite JSON SRFs in FROM clause:
-            // - json_each(x) -> json_array_elements(x::json)
+            // - json_each(x) -> json_array_elements_text(x::json)
             // - json_tree(x) -> jsonb_each_text(x::jsonb)
             if let Some(target) = rename_sqlite_json_table_fn_name_if_present(name) {
                 if let Some(TableFunctionArgs { args, .. }) = args {

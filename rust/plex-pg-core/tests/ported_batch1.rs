@@ -726,3 +726,30 @@ fn type_no_patterns() {
     assert!(t.sql.contains("id"), "expected id in: {}", t.sql);
     assert!(t.sql.contains("name"), "expected name in: {}", t.sql);
 }
+
+// Plex removes a collection's memberships with
+// `tg.tag IN (SELECT value FROM json_each(:C1))`. json_array_elements hands
+// each element back as JSON, so a string keeps its quotes ("A24") and the
+// IN matches nothing: a deleted collection kept every tagging and came back
+// the next time a member was touched (2026-10-16). SQLite's `value` is the
+// element's own text, which json_array_elements_text gives.
+#[test]
+fn function_json_each_value_is_the_elements_text_not_its_json() {
+    let t = translate(
+        "DELETE FROM taggings WHERE (`tag_id` IN (SELECT tg.`id` FROM tags tg WHERE (tg.`tag` IN (SELECT value FROM json_each(:C1)) AND tg.`tag_type`=:C2)) AND `metadata_item_id` IN (SELECT value FROM json_each(:C3)))",
+    )
+    .unwrap();
+    let low = t.sql.to_lowercase();
+    assert_eq!(
+        low.matches("json_array_elements_text(").count(),
+        2,
+        "both json_each tables take _text in: {}",
+        t.sql
+    );
+    assert!(
+        !low.contains("json_array_elements($"),
+        "json_array_elements would keep a string's quotes in: {}",
+        t.sql
+    );
+    assert_eq!(t.param_names.len(), 3, "sql={}", t.sql);
+}
