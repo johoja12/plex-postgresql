@@ -1,380 +1,141 @@
 /// Module: placeholders
 ///
-/// Replaces `?` and `:name` placeholders with PostgreSQL-style `$1`, `$2`, ...
-/// Builds a `param_names` vector: `None` for `?`, `Some("name")` for `:name`.
-/// The same `:name` reuses the same `$N`.
+/// Replaces SQLite's placeholders with PostgreSQL's `$1`, `$2`, ... and
+/// records `param_names`: `None` for a positional slot, `Some("name")` for a
+/// named one (the prefix dropped, as the bind layer compares names).
+///
+/// The numbering is SQLite's (sqlite3_bind_parameter_index): a `?` takes the
+/// slot after the largest assigned so far, `?NNN` is slot NNN (the same slot
+/// wherever it repeats), and `:name`, `@name` and `$name` take a new slot the
+/// first time and reuse it after (`?NNN:name` is the dedup pass's token for a
+/// name whose slot it fixed before moving it). Slots are assigned in source order over the
+/// whole statement through sqlparser's `VisitorMut`, so a placeholder in any
+/// position -- an IS NULL operand, COLLATE, SUBSTRING, a window's PARTITION BY
+/// or FILTER, a tuple, a CTE, EXPLAIN, ON CONFLICT DO UPDATE, LIMIT and OFFSET
+/// in either form -- is numbered; the hand-written walk this replaced skipped
+/// every one of those (`_ => {}`), so Plex's `? IS NULL` was prepared with one
+/// parameter fewer than it bound (2026-10-16 audit, item 8).
+///
+/// `LIMIT ?, ?` (MySQL/SQLite order: offset first) is numbered offset, then
+/// limit, and rewritten to `LIMIT $2 OFFSET $1`, so the bind order stays
+/// SQLite's.
 use sqlparser::ast::*;
+use std::collections::HashMap;
+use std::ops::ControlFlow;
 
 pub fn transform(stmt: &mut Statement, param_names: &mut Vec<Option<String>>) {
-    // counter: next $N index (1-based)
-    let mut counter: usize = param_names.len() + 1;
-    // map: named placeholder → $N index
-    let mut name_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-
-    transform_stmt(stmt, param_names, &mut counter, &mut name_map);
+    let mut numbering = Numbering {
+        param_names,
+        names: HashMap::new(),
+    };
+    let _ = stmt.visit(&mut numbering);
 }
 
-fn transform_stmt(
-    stmt: &mut Statement,
-    param_names: &mut Vec<Option<String>>,
-    counter: &mut usize,
-    name_map: &mut std::collections::HashMap<String, usize>,
-) {
-    match stmt {
-        Statement::Query(q) => transform_query(q, param_names, counter, name_map),
-        Statement::Insert(insert) => {
-            // Transform the source query
-            if let Some(src) = &mut insert.source {
-                transform_query(src, param_names, counter, name_map);
-            }
-            // Transform ON CONFLICT DO UPDATE SET expressions
-            if let Some(on_insert) = &mut insert.on {
-                if let OnInsert::OnConflict(on_conflict) = on_insert {
-                    if let OnConflictAction::DoUpdate(do_update) = &mut on_conflict.action {
-                        for assign in &mut do_update.assignments {
-                            transform_expr(&mut assign.value, param_names, counter, name_map);
-                        }
-                        if let Some(sel) = &mut do_update.selection {
-                            transform_expr(sel, param_names, counter, name_map);
-                        }
-                    }
-                }
-            }
-        }
-        Statement::Update(update) => {
-            for assign in &mut update.assignments {
-                transform_expr(&mut assign.value, param_names, counter, name_map);
-            }
-            if let Some(sel) = &mut update.selection {
-                transform_expr(sel, param_names, counter, name_map);
-            }
-        }
-        Statement::Delete(del) => {
-            if let Some(sel) = &mut del.selection {
-                transform_expr(sel, param_names, counter, name_map);
-            }
-        }
-        _ => {}
-    }
+struct Numbering<'a> {
+    /// One entry per slot; `len() + 1` is the next fresh slot.
+    param_names: &'a mut Vec<Option<String>>,
+    /// Named placeholder (without its prefix) → slot.
+    names: HashMap<String, usize>,
 }
 
-fn transform_query(
-    query: &mut Query,
-    param_names: &mut Vec<Option<String>>,
-    counter: &mut usize,
-    name_map: &mut std::collections::HashMap<String, usize>,
-) {
-    // CTEs
-    if let Some(with) = &mut query.with {
-        for cte in &mut with.cte_tables {
-            transform_query(&mut cte.query, param_names, counter, name_map);
-        }
+impl Numbering<'_> {
+    fn fresh(&mut self, name: Option<&str>) -> usize {
+        self.param_names.push(name.map(str::to_string));
+        self.param_names.len()
     }
-    transform_set_expr(&mut query.body, param_names, counter, name_map);
-    // ORDER BY
-    if let Some(order_by) = &mut query.order_by {
-        if let OrderByKind::Expressions(exprs) = &mut order_by.kind {
-            for order_expr in exprs {
-                transform_expr(&mut order_expr.expr, param_names, counter, name_map);
-            }
-        }
-    }
-    // LIMIT / OFFSET
-    if let Some(limit_clause) = &mut query.limit_clause {
-        match limit_clause {
-            LimitClause::LimitOffset { limit, offset, .. } => {
-                if let Some(l) = limit {
-                    transform_expr(l, param_names, counter, name_map);
-                }
-                if let Some(o) = offset {
-                    transform_expr(&mut o.value, param_names, counter, name_map);
-                }
-            }
-            LimitClause::OffsetCommaLimit { offset, limit } => {
-                transform_expr(offset, param_names, counter, name_map);
-                transform_expr(limit, param_names, counter, name_map);
-            }
-        }
-    }
-}
 
-fn transform_set_expr(
-    set_expr: &mut SetExpr,
-    param_names: &mut Vec<Option<String>>,
-    counter: &mut usize,
-    name_map: &mut std::collections::HashMap<String, usize>,
-) {
-    match set_expr {
-        SetExpr::Select(select) => transform_select(select, param_names, counter, name_map),
-        SetExpr::Query(q) => transform_query(q, param_names, counter, name_map),
-        SetExpr::SetOperation { left, right, .. } => {
-            transform_set_expr(left, param_names, counter, name_map);
-            transform_set_expr(right, param_names, counter, name_map);
+    /// `?NNN`: slot NNN, padding the slots before it when it skips ahead.
+    fn explicit(&mut self, n: usize) {
+        while self.param_names.len() < n {
+            self.param_names.push(None);
         }
-        SetExpr::Values(values) => {
-            for row in &mut values.rows {
-                for expr in row {
-                    transform_expr(expr, param_names, counter, name_map);
-                }
-            }
-        }
-        _ => {}
     }
-}
 
-fn transform_select(
-    select: &mut Select,
-    param_names: &mut Vec<Option<String>>,
-    counter: &mut usize,
-    name_map: &mut std::collections::HashMap<String, usize>,
-) {
-    // SELECT items
-    for item in &mut select.projection {
-        match item {
-            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                transform_expr(e, param_names, counter, name_map);
-            }
-            _ => {}
-        }
+    /// `?NNN:name`, the dedup pass's token for a named placeholder whose
+    /// SQLite slot it already knows (it moves values about, so this pass's
+    /// walk order could not tell).
+    fn explicit_named(&mut self, n: usize, name: &str) {
+        self.explicit(n);
+        self.param_names[n - 1] = Some(name.to_string());
+        self.names.insert(name.to_string(), n);
     }
-    // FROM
-    for table in &mut select.from {
-        transform_table_with_joins(table, param_names, counter, name_map);
-    }
-    // WHERE
-    if let Some(sel) = &mut select.selection {
-        transform_expr(sel, param_names, counter, name_map);
-    }
-    // GROUP BY
-    match &mut select.group_by {
-        GroupByExpr::Expressions(exprs, _) => {
-            for e in exprs {
-                transform_expr(e, param_names, counter, name_map);
-            }
-        }
-        _ => {}
-    }
-    // HAVING
-    if let Some(having) = &mut select.having {
-        transform_expr(having, param_names, counter, name_map);
-    }
-}
 
-fn transform_table_with_joins(
-    table: &mut TableWithJoins,
-    param_names: &mut Vec<Option<String>>,
-    counter: &mut usize,
-    name_map: &mut std::collections::HashMap<String, usize>,
-) {
-    transform_table_factor(&mut table.relation, param_names, counter, name_map);
-    for join in &mut table.joins {
-        transform_table_factor(&mut join.relation, param_names, counter, name_map);
-        match &mut join.join_operator {
-            JoinOperator::Join(JoinConstraint::On(e))
-            | JoinOperator::Inner(JoinConstraint::On(e))
-            | JoinOperator::Left(JoinConstraint::On(e))
-            | JoinOperator::LeftOuter(JoinConstraint::On(e))
-            | JoinOperator::Right(JoinConstraint::On(e))
-            | JoinOperator::RightOuter(JoinConstraint::On(e))
-            | JoinOperator::Semi(JoinConstraint::On(e))
-            | JoinOperator::LeftSemi(JoinConstraint::On(e))
-            | JoinOperator::RightSemi(JoinConstraint::On(e))
-            | JoinOperator::Anti(JoinConstraint::On(e))
-            | JoinOperator::LeftAnti(JoinConstraint::On(e))
-            | JoinOperator::RightAnti(JoinConstraint::On(e))
-            | JoinOperator::StraightJoin(JoinConstraint::On(e))
-            | JoinOperator::FullOuter(JoinConstraint::On(e)) => {
-                transform_expr(e, param_names, counter, name_map);
-            }
-            _ => {}
+    fn named(&mut self, name: &str) -> usize {
+        if let Some(&n) = self.names.get(name) {
+            return n;
         }
+        let n = self.fresh(Some(name));
+        self.names.insert(name.to_string(), n);
+        n
     }
-}
 
-fn transform_table_factor(
-    factor: &mut TableFactor,
-    param_names: &mut Vec<Option<String>>,
-    counter: &mut usize,
-    name_map: &mut std::collections::HashMap<String, usize>,
-) {
-    match factor {
-        TableFactor::Derived { subquery, .. } => {
-            transform_query(subquery, param_names, counter, name_map);
+    /// The slot of a placeholder token, or None when it is left as written
+    /// (a `$N` already numbered, or a token that is no placeholder).
+    fn slot(&mut self, token: &str) -> Option<usize> {
+        if token == "?" {
+            return Some(self.fresh(None));
         }
-        TableFactor::Table { args, .. } => {
-            if let Some(TableFunctionArgs { args: fn_args, .. }) = args {
-                for arg in fn_args.iter_mut() {
-                    match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                            transform_expr(e, param_names, counter, name_map);
-                        }
-                        FunctionArg::Named {
-                            arg: FunctionArgExpr::Expr(e),
-                            ..
-                        } => {
-                            transform_expr(e, param_names, counter, name_map);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        TableFactor::Function { args, .. } => {
-            for arg in args.iter_mut() {
-                match arg {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                        transform_expr(e, param_names, counter, name_map);
-                    }
-                    FunctionArg::Named {
-                        arg: FunctionArgExpr::Expr(e),
-                        ..
-                    } => {
-                        transform_expr(e, param_names, counter, name_map);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        TableFactor::TableFunction { expr, .. } => {
-            transform_expr(expr, param_names, counter, name_map);
-        }
-        TableFactor::NestedJoin {
-            table_with_joins, ..
-        } => {
-            transform_table_with_joins(table_with_joins, param_names, counter, name_map);
-        }
-        _ => {}
-    }
-}
-
-/// Recursively transform a mutable `Expr`, replacing placeholders in place.
-pub fn transform_expr(
-    expr: &mut Expr,
-    param_names: &mut Vec<Option<String>>,
-    counter: &mut usize,
-    name_map: &mut std::collections::HashMap<String, usize>,
-) {
-    match expr {
-        // ── Placeholder hit ─────────────────────────────────────────────
-        Expr::Value(ValueWithSpan {
-            value: Value::Placeholder(s),
-            ..
-        }) => {
-            let placeholder = s.clone();
-            let n = if placeholder == "?" {
-                // unnamed – always a new slot
-                let n = *counter;
-                *counter += 1;
-                param_names.push(None);
-                n
-            } else if let Some(name) = placeholder.strip_prefix(':') {
-                // named – reuse if seen before
-                if let Some(&existing_n) = name_map.get(name) {
-                    existing_n
-                } else {
-                    let n = *counter;
-                    *counter += 1;
-                    name_map.insert(name.to_string(), n);
-                    param_names.push(Some(name.to_string()));
-                    n
-                }
-            } else {
-                // already a $N or unknown – leave alone
-                return;
+        if let Some(rest) = token.strip_prefix('?') {
+            let (digits, name) = match rest.split_once(':') {
+                Some((digits, name)) if !name.is_empty() => (digits, Some(name)),
+                _ => (rest, None),
             };
-            *s = format!("${n}");
+            let n: usize = digits.parse().ok().filter(|&n| n >= 1)?;
+            match name {
+                Some(name) => self.explicit_named(n, name),
+                None => self.explicit(n),
+            }
+            return Some(n);
         }
+        let name = token.strip_prefix([':', '@', '$'])?;
+        if name.is_empty() {
+            return None;
+        }
+        if token.starts_with('$') && name.bytes().all(|b| b.is_ascii_digit()) {
+            // Already PostgreSQL's: a translation translated again.
+            return None;
+        }
+        Some(self.named(name))
+    }
+}
 
-        // ── Recurse into all sub-expressions ────────────────────────────
-        Expr::BinaryOp { left, right, .. } => {
-            transform_expr(left, param_names, counter, name_map);
-            transform_expr(right, param_names, counter, name_map);
-        }
-        Expr::UnaryOp { expr: inner, .. } => {
-            transform_expr(inner, param_names, counter, name_map);
-        }
-        Expr::InList { expr: e, list, .. } => {
-            transform_expr(e, param_names, counter, name_map);
-            for item in list {
-                transform_expr(item, param_names, counter, name_map);
-            }
-        }
-        Expr::InSubquery {
-            expr: e, subquery, ..
-        } => {
-            transform_expr(e, param_names, counter, name_map);
-            transform_query(subquery, param_names, counter, name_map);
-        }
-        Expr::Between {
-            expr: e, low, high, ..
-        } => {
-            transform_expr(e, param_names, counter, name_map);
-            transform_expr(low, param_names, counter, name_map);
-            transform_expr(high, param_names, counter, name_map);
-        }
-        Expr::Function(f) => {
-            if let FunctionArguments::List(ref mut arg_list) = f.args {
-                for arg in &mut arg_list.args {
-                    match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                            transform_expr(e, param_names, counter, name_map);
-                        }
-                        FunctionArg::Named {
-                            arg: FunctionArgExpr::Expr(e),
-                            ..
-                        } => {
-                            transform_expr(e, param_names, counter, name_map);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Expr::Cast { expr: inner, .. } => {
-            transform_expr(inner, param_names, counter, name_map);
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
+impl VisitorMut for Numbering<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        if let Expr::Value(ValueWithSpan {
+            value: Value::Placeholder(token),
             ..
-        } => {
-            if let Some(op) = operand {
-                transform_expr(op, param_names, counter, name_map);
-            }
-            for cw in conditions {
-                transform_expr(&mut cw.condition, param_names, counter, name_map);
-                transform_expr(&mut cw.result, param_names, counter, name_map);
-            }
-            if let Some(er) = else_result {
-                transform_expr(er, param_names, counter, name_map);
+        }) = expr
+        {
+            if let Some(n) = self.slot(token) {
+                *token = format!("${n}");
             }
         }
-        Expr::Nested(inner) => {
-            transform_expr(inner, param_names, counter, name_map);
+        ControlFlow::Continue(())
+    }
+
+    /// `LIMIT offset, limit` was numbered offset first (the fields' order, as
+    /// SQLite binds it); print it as PostgreSQL's `LIMIT limit OFFSET offset`.
+    fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<()> {
+        if matches!(
+            query.limit_clause,
+            Some(LimitClause::OffsetCommaLimit { .. })
+        ) {
+            let Some(LimitClause::OffsetCommaLimit { offset, limit }) = query.limit_clause.take()
+            else {
+                unreachable!()
+            };
+            query.limit_clause = Some(LimitClause::LimitOffset {
+                limit: Some(limit),
+                offset: Some(Offset {
+                    value: offset,
+                    rows: OffsetRows::None,
+                }),
+                limit_by: vec![],
+            });
         }
-        Expr::Subquery(q) => {
-            transform_query(q, param_names, counter, name_map);
-        }
-        Expr::Exists { subquery, .. } => {
-            transform_query(subquery, param_names, counter, name_map);
-        }
-        Expr::Extract { expr: inner, .. } => {
-            transform_expr(inner, param_names, counter, name_map);
-        }
-        Expr::Like {
-            expr: e, pattern, ..
-        } => {
-            transform_expr(e, param_names, counter, name_map);
-            transform_expr(pattern, param_names, counter, name_map);
-        }
-        Expr::ILike {
-            expr: e, pattern, ..
-        } => {
-            transform_expr(e, param_names, counter, name_map);
-            transform_expr(pattern, param_names, counter, name_map);
-        }
-        _ => {}
+        ControlFlow::Continue(())
     }
 }
 
@@ -384,6 +145,9 @@ pub fn transform_expr(
 #[allow(non_snake_case)]
 mod tests {
     use crate::translate;
+    use sqlparser::ast::Statement;
+    use sqlparser::dialect::SQLiteDialect;
+    use sqlparser::parser::Parser;
 
     #[test]
     fn rewrite_placeholders__placeholder_question_mark() {
@@ -450,5 +214,23 @@ mod tests {
         assert!(r.sql.contains("$1"), "sql={}", r.sql);
         assert!(r.sql.contains("$2"), "sql={}", r.sql);
         assert!(!r.sql.contains("?"), "sql={}", r.sql);
+    }
+
+    // The parser's own `LIMIT offset, limit` node (the preprocess pass rewrites
+    // the text before the parser sees it, so only a direct call reaches it):
+    // the offset is bound first, as SQLite binds `LIMIT ?, ?`.
+    #[test]
+    fn rewrite_placeholders__offset_comma_limit_numbers_the_offset_first() {
+        let mut stmt: Statement =
+            Parser::parse_sql(&SQLiteDialect {}, "SELECT * FROM t WHERE a = ? LIMIT ?, ?")
+                .unwrap()
+                .remove(0);
+        let mut names = Vec::new();
+        super::transform(&mut stmt, &mut names);
+        assert_eq!(
+            stmt.to_string(),
+            "SELECT * FROM t WHERE a = $1 LIMIT $3 OFFSET $2"
+        );
+        assert_eq!(names, vec![None, None, None]);
     }
 }
