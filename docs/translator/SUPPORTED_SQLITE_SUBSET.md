@@ -17,7 +17,7 @@ The translator intentionally targets the SQLite surface area Plex actually exerc
 - JSON functions and operators: broad support, but some path forms still use guarded fallbacks
 - Transaction control: routed and normalized for Plex usage, but SQLite and PostgreSQL semantics are not identical
 - DDL-lite: limited `CREATE TABLE` and `CREATE INDEX` normalization used by Plex bootstrap and migrations
-- FTS: rewritten only for known Plex query shapes
+- FTS: rewritten only for known Plex query shapes, onto the schema's `fts4_*` views, `plex.fold` and `plex.fts_query` (`docs/translator/KNOWN_GAPS.md`, "Schema-side support")
 - PRAGMA handling: supported where it can be mapped safely; otherwise it is explicitly skipped or downgraded
 
 ## Non-Goals
