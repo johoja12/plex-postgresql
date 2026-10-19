@@ -1,5 +1,6 @@
 use super::*;
 use crate::log_debug_lazy;
+use std::sync::atomic::Ordering;
 
 pub(super) fn changes_impl(db: *mut sqlite3) -> c_int {
     let _guard = match InterposeGuard::try_enter() {
@@ -7,7 +8,10 @@ pub(super) fn changes_impl(db: *mut sqlite3) -> c_int {
         None => return 0,
     };
 
-    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    // Read, never acquired: these accessors run after the statement, on the
+    // connection it used, and acquiring here blocked for the retry ladder
+    // on a full pool and re-assigned the handle's slot on every call.
+    let pg_conn = crate::pg_client::peek_connection(db);
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         if conn.is_pg_active != 0 {
@@ -30,7 +34,7 @@ pub(super) fn changes64_impl(db: *mut sqlite3) -> i64 {
         None => return 0,
     };
 
-    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    let pg_conn = crate::pg_client::peek_connection(db);
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         if conn.is_pg_active != 0 {
@@ -53,7 +57,7 @@ pub(super) fn last_insert_rowid_impl(db: *mut sqlite3) -> i64 {
         None => return 0,
     };
 
-    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    let pg_conn = crate::pg_client::peek_connection(db);
     if pg_conn.is_null() {
         // No PostgreSQL connection for this handle means the shim never took
         // it over. Plex opens its in-memory statistics database through the
@@ -89,97 +93,27 @@ pub(super) fn last_insert_rowid_impl(db: *mut sqlite3) -> i64 {
         pg_conn
     );
 
-    {
-        let pg = unsafe { &*pg_conn };
-        if pg.last_insert_rowid > 0 {
-            let rowid = pg.last_insert_rowid;
-            log_debug_lazy!("last_insert_rowid: using cached connection rowid={}", rowid);
-            return rowid;
-        }
+    let pg = unsafe { &*pg_conn };
+    if pg.last_insert_failed.load(Ordering::Acquire) != 0 {
+        // The last INSERT on this connection was refused: 0, not the row
+        // before it (see PgConnection::last_insert_failed).
+        log_debug("last_insert_rowid: last insert failed, RETURNING 0");
+        return 0;
+    }
+    if pg.last_insert_rowid > 0 {
+        let rowid = pg.last_insert_rowid;
+        log_debug_lazy!("last_insert_rowid: using cached connection rowid={}", rowid);
+        return rowid;
     }
 
-    let global_rowid = crate::pg_client::rust_get_global_last_insert_rowid();
-    if global_rowid > 0 {
-        log_debug_lazy!(
-            "last_insert_rowid: using cached global rowid={}",
-            global_rowid
-        );
-        return global_rowid;
-    }
-
-    let mut result: i64 = 0;
-    let pg = unsafe { &mut *pg_conn };
-    unsafe {
-        if !pg_conn.is_null() && pg.is_pg_active != 0 && !pg.conn.is_null() {
-            let mut conn_guard = PthreadMutexGuard::lock(&mut pg.mutex as *mut _);
-            log_debug_lazy!(
-                "last_insert_rowid: EXECUTING lastval() on conn {:p}",
-                pg.conn
-            );
-            let res = crate::libpq_helpers::rust_pq_exec(
-                pg.conn,
-                b"SELECT lastval()\0".as_ptr() as *const c_char,
-            );
-            if res.is_null() {
-                conn_guard.unlock();
-                log_debug("last_insert_rowid: NULL result, RETURNING 0");
-                return 0;
-            }
-
-            let status = crate::libpq_helpers::rust_pq_result_status(res);
-            log_debug_lazy!(
-                "last_insert_rowid: STATUS={} TUPLES={}",
-                status,
-                crate::libpq_helpers::rust_pq_ntuples(res)
-            );
-            if status == PGRES_TUPLES_OK && crate::libpq_helpers::rust_pq_ntuples(res) > 0 {
-                let mut val_buf = [0 as c_char; 64];
-                let mut val_str: *const c_char = b"0\0".as_ptr() as *const c_char;
-                if crate::db_interpose_helpers::rust_pg_result_text_copy(
-                    res as *const crate::db_interpose_helpers::PGresult,
-                    0,
-                    0,
-                    val_buf.as_mut_ptr(),
-                    val_buf.len(),
-                ) >= 0
-                {
-                    val_str = val_buf.as_ptr();
-                }
-                let rowid = crate::db_interpose_helpers::rust_pg_text_to_int64(val_str);
-                log_debug_lazy!(
-                    "last_insert_rowid: GOT VALUE={} rowid={}",
-                    cstr_to_string_or(val_str, "0"),
-                    rowid
-                );
-                crate::libpq_helpers::rust_pq_clear(res);
-                conn_guard.unlock();
-                if rowid > 0 {
-                    log_debug_lazy!("last_insert_rowid: RETURNING rowid={}", rowid);
-                    result = rowid;
-                } else {
-                    log_debug("last_insert_rowid: rowid <= 0, RETURNING 0");
-                }
-            } else {
-                if status == PGRES_FATAL_ERROR {
-                    let err = crate::libpq_helpers::rust_pq_error_message(pg.conn);
-                    log_debug_lazy!(
-                        "last_insert_rowid: FATAL_ERROR: {}",
-                        cstr_to_string_or(err, "(null)")
-                    );
-                } else {
-                    log_debug_lazy!("last_insert_rowid: NON-TUPLES status={}", status);
-                }
-                crate::libpq_helpers::rust_pq_clear(res);
-                conn_guard.unlock();
-                log_debug("last_insert_rowid: RETURNING 0 due to error");
-            }
-        } else {
-            log_debug("last_insert_rowid: NO PG_CONN or not active, RETURNING 0");
-        }
-    }
-
-    log_debug_lazy!("last_insert_rowid: FINAL result={}", result);
-    result
+    // Nothing has been inserted on this connection. The answer used to be
+    // the process-global row id -- the last INSERT by any thread on any
+    // handle -- and then `SELECT lastval()`, which is the session's last
+    // sequence value whatever statement advanced it. Both hand a redirected
+    // handle an id that is not its own; SQLite's answer for a handle that
+    // has inserted nothing is 0.
+    log_debug("last_insert_rowid: no insert on this connection, RETURNING 0");
+    0
 }
 
 pub(super) fn errmsg_impl(db: *mut sqlite3) -> *const c_char {
@@ -192,7 +126,7 @@ pub(super) fn errmsg_impl(db: *mut sqlite3) -> *const c_char {
         }
     }
 
-    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    let pg_conn = crate::pg_client::peek_connection(db);
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         if conn.last_error_code != SQLITE_OK && conn.last_error[0] != 0 {
@@ -205,6 +139,9 @@ pub(super) fn errmsg_impl(db: *mut sqlite3) -> *const c_char {
         log_debug("ERRMSG: returning 'not an error'");
         return NOT_AN_ERROR.as_ptr() as *const c_char;
     }
+    if redirected_handle(db) {
+        return NOT_AN_ERROR.as_ptr() as *const c_char;
+    }
 
     if let Some(f) = get_shim_sqlite3_errmsg() {
         return unsafe { f(db) };
@@ -213,6 +150,12 @@ pub(super) fn errmsg_impl(db: *mut sqlite3) -> *const c_char {
         return unsafe { f(db) };
     }
     b"unknown error\0".as_ptr() as *const c_char
+}
+
+/// Whether the handle is one the shim serves from PostgreSQL: registered
+/// with a connection, whatever its pool slot's state right now.
+fn redirected_handle(db: *mut sqlite3) -> bool {
+    !crate::pg_client::rust_find_registered_connection(db as *const c_void).is_null()
 }
 
 pub(super) fn errcode_impl(db: *mut sqlite3) -> c_int {
@@ -225,7 +168,7 @@ pub(super) fn errcode_impl(db: *mut sqlite3) -> c_int {
         }
     }
 
-    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    let pg_conn = crate::pg_client::peek_connection(db);
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         log_debug_lazy!(
@@ -233,6 +176,15 @@ pub(super) fn errcode_impl(db: *mut sqlite3) -> c_int {
             conn.last_error_code
         );
         return conn.last_error_code;
+    }
+    if redirected_handle(db) {
+        // A redirected handle with no connection to peek at is idle; its
+        // shadow SQLite handle is never asked, because a failed prepare
+        // leaves SQLITE_ERROR there for good and Plex, which polls errcode
+        // on its error path, then threw on every later request
+        // (2026-10-16, after one failed search).
+        log_debug("ERRCODE: redirected handle without a connection, returning SQLITE_OK");
+        return SQLITE_OK;
     }
 
     if let Some(f) = get_shim_sqlite3_errcode() {
@@ -245,10 +197,13 @@ pub(super) fn errcode_impl(db: *mut sqlite3) -> c_int {
 }
 
 pub(super) fn extended_errcode_impl(db: *mut sqlite3) -> c_int {
-    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
+    let pg_conn = crate::pg_client::peek_connection(db);
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         return conn.last_error_code;
+    }
+    if redirected_handle(db) {
+        return SQLITE_OK;
     }
     if let Some(f) = get_orig_sqlite3_extended_errcode() {
         return unsafe { f(db) };

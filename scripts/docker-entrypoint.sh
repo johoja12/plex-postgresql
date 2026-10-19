@@ -110,6 +110,7 @@ init_schema() {
         if [ -f "$schema_file" ]; then
             echo "Loading schema from $schema_file..."
             psql -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" 2>/dev/null || true
+            psql -c "CREATE EXTENSION IF NOT EXISTS unaccent;" 2>/dev/null || true
             if psql -f "$schema_file" 2>&1; then
                 local new_count=$(psql -t -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$schema';" 2>/dev/null | tr -d ' ')
                 echo "Schema loaded successfully! $new_count tables created."

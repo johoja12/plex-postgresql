@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.33 (2026-10-16)
+
+The clusterplex.31 regressions seen on talos, each reproduced on the standalone rig (`docker-compose.standalone.yml`) and fixed: a MATCH followed by AND or OR keeps the conjunction outside `plex.fts_query`; no pool slot is given back at thread exit; a CASE whose branch is a condition makes its 0/1 booleans and an integer CASE read as a condition compares with 0; the rtree stays out of the shadow schema; a DISTINCT keeps a GROUP BY an aggregate reads; `errcode`/`errmsg` on a redirected handle never read the shadow SQLite's stale error, and a successful step clears the connection's last error (Plex polls errcode on its error path, and one failed statement used to make every later request throw). The migration hands its objects to the `plex` role when applied as a superuser.
+
+### v1.3.17-clusterplex.31 (2026-10-16)
+
+Fixes from the 2026-10-16 audit (`docs/audits/2026-10-16-shim-audit.md`).
+
+#### Translator
+- Placeholders and SQLite builtins are rewritten in every AST position (sqlparser `VisitorMut`): `? IS NULL`, COLLATE, SUBSTR/TRIM, window and FILTER clauses, tuples, CTEs, `ON CONFLICT`, `LIMIT`/`OFFSET`; `?NNN`, `@name` and `$name` parameters; `LIMIT ?, ?` binds the offset first; `UPDATE ... LIMIT` keeps its SET binds.
+- A projection alias in WHERE/HAVING is its expression; bare `LIKE` is `ILIKE` (SQLite's case-insensitive LIKE); `GLOB` is an anchored regular expression; `IS <expr>` is `IS [NOT] DISTINCT FROM`; `qualified.col COLLATE NOCASE` parses; rewrites reach subqueries and JOIN ON; CASE 1/0 becomes boolean only in a boolean context; integer columns compared with non-integer strings fold to their SQLite constant (every integer column of the schema, IN lists and ordering included); `(metadata_type=18)` is kept; two-argument `trim` is `btrim`.
+- `json_each` yields element text; a rewrite that cannot translate a call leaves it whole instead of emptying it; bound JSON paths use jsonpath; date functions honour SQLite's modifiers (`utc`, `localtime`, `start of day|month|year`, `unixepoch`, `weekday N`, `subsec`) and `datetime`/`date`/`time`; `group_concat` keeps DISTINCT and ORDER BY; `substr` with a negative start; `typeof` is `plex.sqlite_typeof`; `printf`, `hex`, `round` map to PostgreSQL forms.
+- `fts4_* ... MATCH term` is `to_tsvector('simple', plex.fold(col)) @@ plex.fts_query(term)` for literal and bound terms; `PRAGMA integrity_check`/`quick_check`/`optimize`/`wal_checkpoint` answer a row.
+- `COLLATE icu_root` is `plex.icu_root`; pattern matches on `tags.tag`, `title_sort`, `name_sort` compare under `plex.icu_root`.
+
+#### Runtime
+- One error classifier: only connection loss, serialization failures and stale plans (26000, 0A000) are retried; everything else fails at once with the message in `sqlite3_errmsg`; the eager read path returns an error instead of a silent empty result; `LIMIT 1` is matched as a token.
+- A PostgreSQL write error is SQLITE_ERROR, `changes()` is 0 and `last_insert_rowid()` is 0 after a failed INSERT.
+- A full pool or a low stack refuses a library statement with SQLITE_BUSY instead of routing it to the empty shadow SQLite; pool slots are released when their thread exits; `streaming_active` is cleared on recycle; metadata accessors never acquire a slot.
+- A bind past the translated parameter count is SQLITE_RANGE; `sqlite3_exec` delivers rows to its callback and sets `*errmsg`; value/column text buffers are per thread and per statement; timestamps read as text; expression columns without metadata have a NULL decltype; control bytes in text binds stay text.
+- Transactions are forwarded on the thread's own connection (`PLEX_PG_TRANSACTIONS=0` turns it off); `last_insert_rowid` never falls back to a process-global value.
+
+#### Schema (apply `schema/migrations/2026-10-16-fts-collations-indexes.sql` to an existing database)
+- `fts4_*` views carry every column Plex names; `plex.fold`, `plex.fts_query`, `plex.spellfix_suggest` with trigram GIN indexes; `unaccent` installed.
+- Collations `plex.nocase` (on `tags.tag`, `metadata_items.title_sort`, `library_sections.name_sort`) and `plex.icu_root`.
+- Stock Plex's missing indexes (Live TV guide, Recently Added, view history, tags, unique keys); PG-only `subtype`, `title_fts`, orphan-fixing triggers and cross-section checks removed; `sqlite_schema.sql` loads into the shadow without errors.
+
 ## [1.3.18] - 2026-09-21
 
 ### Changed

@@ -21,18 +21,17 @@ fn passthrough_column_value(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *mut sqlit
 pub(super) fn column_value_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *mut sqlite3_value {
     let raw_pg_stmt = pg_find_any_stmt(p_stmt);
     let dbg_sql = unsafe { column_value_debug_sql(raw_pg_stmt) };
-    let dbg_db = get_orig_sqlite3_db_handle()
-        .map(|f| unsafe { f(p_stmt) })
-        .unwrap_or(ptr::null_mut());
-    unsafe {
-        crate::db_interpose_common::note_column_phase(
-            b"column_value\0",
-            dbg_sql,
-            p_stmt as *const c_void,
-            dbg_db as *const c_void,
-            idx,
-        );
-    }
+    // The shim's own resolver: a routed statement answers its shadow or
+    // connection handle and never hands the pointer to SQLite, which a
+    // test's fake statement pointer crashed (2026-10-16).
+    let dbg_db = crate::db_interpose_metadata::rust_my_sqlite3_db_handle(p_stmt);
+    crate::db_interpose_common::note_column_phase(
+        b"column_value\0",
+        dbg_sql,
+        p_stmt as *const c_void,
+        dbg_db as *const c_void,
+        idx,
+    );
 
     if raw_pg_stmt.is_null() || unsafe { (&*raw_pg_stmt).is_pg == 0 } {
         return passthrough_column_value(p_stmt, idx);

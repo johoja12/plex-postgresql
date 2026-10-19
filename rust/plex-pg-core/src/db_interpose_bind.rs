@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::db_interpose_common::{
     get_orig_sqlite3_bind_blob, get_orig_sqlite3_bind_blob64, get_orig_sqlite3_bind_double,
-    get_orig_sqlite3_bind_int, get_orig_sqlite3_bind_int64, get_orig_sqlite3_bind_null,
+    get_orig_sqlite3_bind_int64, get_orig_sqlite3_bind_null,
     get_orig_sqlite3_bind_text, get_orig_sqlite3_bind_text64, get_orig_sqlite3_bind_value,
     get_orig_sqlite3_db_handle, get_orig_sqlite3_reset, get_orig_sqlite3_sql,
 };
@@ -23,6 +23,7 @@ use value_binds::{bind_null_impl, bind_value_impl};
 const SQLITE_OK: c_int = 0;
 const SQLITE_ERROR: c_int = 1;
 const SQLITE_MISUSE: c_int = 21;
+const SQLITE_RANGE: c_int = 25;
 
 const SQLITE_INTEGER: c_int = 1;
 const SQLITE_FLOAT: c_int = 2;

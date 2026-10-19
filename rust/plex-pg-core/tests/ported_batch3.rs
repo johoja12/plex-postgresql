@@ -500,25 +500,26 @@ fn distinct_orderby_groupby() {
 
 #[test]
 fn case_booleans_else_1_true() {
-    // CASE WHEN a THEN 0 ELSE 1 END → ELSE TRUE (1→TRUE)
+    // A projected CASE keeps SQLite's integers; as a condition it is boolean.
     let t = translate("SELECT (CASE WHEN a THEN 0 ELSE 1 END) FROM t").unwrap();
-    let sql = t.sql.to_lowercase();
     assert!(
-        sql.contains("else true"),
-        "1 in ELSE should become TRUE, got: {}",
+        t.sql.contains("THEN 0 ELSE 1 END"),
+        "a projected CASE keeps its integers, got: {}",
         t.sql
     );
+    let t = translate("SELECT * FROM t WHERE x AND (CASE WHEN a THEN 0 ELSE 1 END)").unwrap();
+    let sql = t.sql.to_lowercase();
     assert!(
-        sql.contains("then false"),
-        "0 in THEN should become FALSE, got: {}",
+        sql.contains("then false else true end"),
+        "a CASE under AND is a condition, got: {}",
         t.sql
     );
 }
 
 #[test]
 fn case_booleans_else_0_false() {
-    // CASE WHEN a THEN 1 ELSE 0 END → THEN TRUE ELSE FALSE
-    let t = translate("SELECT (CASE WHEN a THEN 1 ELSE 0 END) FROM t").unwrap();
+    // CASE WHEN a THEN 1 ELSE 0 END → THEN TRUE ELSE FALSE where it is read as a condition
+    let t = translate("SELECT * FROM t WHERE CASE WHEN a THEN 1 ELSE 0 END").unwrap();
     let sql = t.sql.to_lowercase();
     assert!(
         sql.contains("then true"),

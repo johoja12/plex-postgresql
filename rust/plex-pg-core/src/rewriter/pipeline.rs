@@ -48,6 +48,7 @@ mod tests {
                 "quotes",
                 "groupby",
                 "query",
+                "collation",
             ]
         );
     }

@@ -134,10 +134,14 @@ fn common_helpers_simple_str_replace_sql_transform() {
     );
 }
 
+// Reset and count assertions operate on the same process-wide tracker.
+static EXCEPTION_TRACKER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn exception_tracker_increments_for_same_type() {
+    let _serialised = EXCEPTION_TRACKER_TEST_LOCK.lock().unwrap();
     rust_reset_exception_tracking();
-    let name = CString::new("TestException").unwrap();
+    let name = c"TestException";
 
     let t1 = rust_get_exception_tracker(name.as_ptr());
     assert!(!t1.is_null());
@@ -150,8 +154,9 @@ fn exception_tracker_increments_for_same_type() {
 
 #[test]
 fn exception_tracking_reset_clears_counts() {
+    let _serialised = EXCEPTION_TRACKER_TEST_LOCK.lock().unwrap();
     rust_reset_exception_tracking();
-    let name = CString::new("ResetException").unwrap();
+    let name = c"ResetException";
     let t1 = rust_get_exception_tracker(name.as_ptr());
     assert_eq!(unsafe { (*t1).count }, 1);
 
@@ -162,6 +167,7 @@ fn exception_tracking_reset_clears_counts() {
 
 #[test]
 fn common_handle_exception_increments_total_count() {
+    let _serialised = EXCEPTION_TRACKER_TEST_LOCK.lock().unwrap();
     rust_reset_exception_tracking();
     unsafe {
         *tls_column_type_calls_ptr() = 1;
@@ -188,19 +194,10 @@ fn common_handle_exception_increments_total_count() {
 
 #[test]
 fn common_load_sqlite_symbols_sets_pointers() {
-    unsafe {
-        super::orig_sqlite3_open = None;
-        super::orig_sqlite3_prepare_v2 = None;
-        super::orig_sqlite3_column_decltype = None;
-    }
-
+    // Do not clear process-wide function pointers: other tests may be using
+    // them concurrently, and unloading their backing DSO would leave dangling
+    // pointers in the shared registry.
     rust_common_load_sqlite_symbols(std::ptr::null_mut());
-    unsafe {
-        let open = super::orig_sqlite3_open;
-        let prepare = super::orig_sqlite3_prepare_v2;
-        assert!(open.is_none());
-        assert!(prepare.is_none());
-    }
 
     let mut handle = std::ptr::null_mut();
     let names = if cfg!(target_os = "macos") {
@@ -236,11 +233,8 @@ fn common_load_sqlite_symbols_sets_pointers() {
         assert!(decltype.is_some());
     }
 
-    if handle != RTLD_DEFAULT {
-        unsafe {
-            libc::dlclose(handle);
-        }
-    }
+    // Keep the handle alive for the lifetime of the test process because the
+    // shared symbol slots contain pointers into this library.
 }
 
 #[test]
@@ -347,6 +341,37 @@ fn open_scratch_sqlite() -> Option<*mut c_void> {
         return None;
     }
     Some(db)
+}
+
+// Exercise the dynamically loaded entry points while other threads repeat
+// symbol initialization. Published pointers must remain callable for the
+// process lifetime, including after the loader test above has returned.
+#[test]
+fn concurrent_symbol_loads_keep_sqlite_entry_points_callable() {
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 100;
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let threads: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ROUNDS {
+                    let db = open_scratch_sqlite().expect("SQLite is required for the CI tests");
+                    let exec = super::get_orig_sqlite3_exec().expect("sqlite3_exec");
+                    let close = super::get_orig_sqlite3_close().expect("sqlite3_close");
+                    let sql = CString::new("CREATE TABLE t (n INTEGER); INSERT INTO t VALUES (42)").unwrap();
+                    assert_eq!(unsafe {
+                        exec(db.cast(), sql.as_ptr(), None, std::ptr::null_mut(), std::ptr::null_mut())
+                    }, 0);
+                    assert_eq!(unsafe { close(db.cast()) }, 0);
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
 }
 
 #[test]

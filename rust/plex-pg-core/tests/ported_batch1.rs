@@ -351,19 +351,14 @@ fn function_iif_no_match() {
     );
 }
 
+// typeof(x) is plex.sqlite_typeof(x) (schema/plex_schema.sql), which answers
+// SQLite's names -- 'integer' for every integer type, 'real', 'text', 'blob',
+// 'null' -- so a comparison written against them needs no remapping.
 #[test]
 fn function_typeof() {
     let t = translate("SELECT typeof(x) FROM t").unwrap();
-    assert!(
-        t.sql.to_lowercase().contains("pg_typeof"),
-        "expected pg_typeof in: {}",
-        t.sql
-    );
-    assert!(
-        t.sql.to_lowercase().contains("::text"),
-        "expected ::TEXT cast in: {}",
-        t.sql
-    );
+    assert_eq!(t.sql, "SELECT plex.sqlite_typeof(x) FROM t");
+    assert_eq!(t.param_names.len(), 0);
 }
 
 #[test]
@@ -464,28 +459,27 @@ fn function_simplify_typeof() {
     );
 }
 
+// The IN list stays SQLite's: pg_typeof's 'bigint' and 'double precision'
+// were added to it when typeof was pg_typeof, and typeof(x) outside an IN
+// list compared pg_typeof's names against SQLite's.
 #[test]
-fn function_typeof_integer_bigint_expansion() {
-    // C: typeof type remapping — in ('integer') should also match 'bigint'
-    let t = translate("SELECT * FROM t WHERE typeof(x) IN ('integer')").unwrap();
-    let low = t.sql.to_lowercase();
-    assert!(
-        low.contains("'bigint'"),
-        "expected 'bigint' added to IN list, got: {}",
-        t.sql
+fn function_typeof_in_list_keeps_sqlites_type_names() {
+    let t = translate("SELECT * FROM t WHERE typeof(x) IN ('integer', 'real')").unwrap();
+    assert_eq!(
+        t.sql,
+        "SELECT * FROM t WHERE plex.sqlite_typeof(x) IN ('integer', 'real')"
     );
+    assert_eq!(t.param_names.len(), 0);
 }
 
 #[test]
-fn function_typeof_real_to_double_precision() {
-    // C: typeof type remapping — 'real' should also match 'double precision'
-    let t = translate("SELECT * FROM t WHERE typeof(x) IN ('real')").unwrap();
-    let low = t.sql.to_lowercase();
-    assert!(
-        low.contains("'double precision'"),
-        "expected 'double precision' added to IN list, got: {}",
-        t.sql
+fn function_typeof_compared_outside_an_in_list() {
+    let t = translate("SELECT * FROM t WHERE typeof(x) = 'integer' OR typeof(y) <> ?").unwrap();
+    assert_eq!(
+        t.sql,
+        "SELECT * FROM t WHERE plex.sqlite_typeof(x) = 'integer' OR plex.sqlite_typeof(y) <> $1"
     );
+    assert_eq!(t.param_names.len(), 1);
 }
 
 #[test]
@@ -725,4 +719,65 @@ fn type_no_patterns() {
     );
     assert!(t.sql.contains("id"), "expected id in: {}", t.sql);
     assert!(t.sql.contains("name"), "expected name in: {}", t.sql);
+}
+
+// Plex removes a collection's memberships with
+// `tg.tag IN (SELECT value FROM json_each(:C1))`. json_array_elements hands
+// each element back as JSON, so a string keeps its quotes ("A24") and the
+// IN matches nothing: a deleted collection kept every tagging and came back
+// the next time a member was touched (2026-10-16). SQLite's `value` is the
+// element's own text, which json_array_elements_text gives.
+#[test]
+fn function_json_each_value_is_the_elements_text_not_its_json() {
+    let t = translate(
+        "DELETE FROM taggings WHERE (`tag_id` IN (SELECT tg.`id` FROM tags tg WHERE (tg.`tag` IN (SELECT value FROM json_each(:C1)) AND tg.`tag_type`=:C2)) AND `metadata_item_id` IN (SELECT value FROM json_each(:C3)))",
+    )
+    .unwrap();
+    let low = t.sql.to_lowercase();
+    assert_eq!(
+        low.matches("json_array_elements_text(").count(),
+        2,
+        "both json_each tables take _text in: {}",
+        t.sql
+    );
+    assert!(
+        !low.contains("json_array_elements($"),
+        "json_array_elements would keep a string's quotes in: {}",
+        t.sql
+    );
+    assert_eq!(t.param_names.len(), 3, "sql={}", t.sql);
+}
+
+// Plex selects a smart collection's members with `metadata_items.id=''` when
+// the id list is empty (its delete, 2026-10-16). SQLite compares the integer
+// column with the unconvertible text and finds nothing; the CAST the shim
+// wrote made PostgreSQL refuse the statement, so the delete answered 500.
+#[test]
+fn an_integer_column_compared_with_an_empty_string_is_the_comparisons_constant() {
+    let t = translate(
+        "select distinct(metadata_items.id) from metadata_items where metadata_items.library_section_id in (1) and (metadata_items.id='' and metadata_items.metadata_type=1)",
+    )
+    .unwrap();
+    let low = t.sql.to_lowercase();
+    assert!(!low.contains("cast('' as integer)"), "sql={}", t.sql);
+    assert!(
+        low.contains("(false and metadata_items.metadata_type = 1)"),
+        "sql={}",
+        t.sql
+    );
+
+    let t = translate(
+        "select id from metadata_items where metadata_items.id<>'' and '' = metadata_items.id",
+    )
+    .unwrap();
+    let low = t.sql.to_lowercase();
+    assert!(low.contains("where true and false"), "sql={}", t.sql);
+
+    // A numeric string still casts, as before.
+    let t = translate("select id from metadata_items where metadata_items.id='123'").unwrap();
+    assert!(
+        t.sql.to_lowercase().contains("cast('123' as integer)"),
+        "sql={}",
+        t.sql
+    );
 }

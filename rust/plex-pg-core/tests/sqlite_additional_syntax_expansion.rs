@@ -90,9 +90,12 @@ fn category_update_delete_order_by_limit_forms() {
     for s in sqls {
         assert_pg(s);
         let out = translate_sql(s).to_ascii_lowercase();
+        // A DELETE targets its rows through a CTE; an UPDATE through a
+        // subquery after its SET, so the SET placeholders keep their order.
         assert!(
-            out.contains("with _plex_target as (select ctid from"),
-            "expected CTE ctid targeting rewrite, got: {}",
+            out.contains("with _plex_target as (select ctid from")
+                || out.contains("where ctid in (select ctid from"),
+            "expected ctid targeting rewrite, got: {}",
             out
         );
     }

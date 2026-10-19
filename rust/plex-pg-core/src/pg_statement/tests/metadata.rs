@@ -119,21 +119,15 @@ fn decltype_text_is_text() {
 }
 
 #[test]
-fn decltype_timestamp_is_integer() {
-    // TIMESTAMP → 64-bit epoch int, matching Plex SOCI's integer(8) parsing.
-    assert_eq!(
-        oid_to_sqlite_decltype(1114).to_str().unwrap(),
-        "dt_integer(8)"
-    );
+fn decltype_timestamp_is_text() {
+    // A TIMESTAMP's value is "2024-01-02 03:04:05": text, never an epoch
+    // that atoll could read (it read the year).
+    assert_eq!(oid_to_sqlite_decltype(1114).to_str().unwrap(), "TEXT");
 }
 
 #[test]
-fn decltype_timestamptz_is_integer() {
-    // TIMESTAMPTZ → 64-bit epoch int, matching Plex SOCI's integer(8) parsing.
-    assert_eq!(
-        oid_to_sqlite_decltype(1184).to_str().unwrap(),
-        "dt_integer(8)"
-    );
+fn decltype_timestamptz_is_text() {
+    assert_eq!(oid_to_sqlite_decltype(1184).to_str().unwrap(), "TEXT");
 }
 
 #[test]

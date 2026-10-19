@@ -23,7 +23,7 @@ impl LiveTypeState {
     fn decltype_guess(&self) -> &'static str {
         match self.oid {
             16 | 21 | 23 | 26 => "INTEGER",
-            20 | 1114 | 1184 => "dt_integer(8)",
+            20 => "dt_integer(8)",
             700 | 701 | 1700 => "REAL",
             17 => "BLOB",
             _ => "TEXT",
@@ -338,18 +338,17 @@ pub(super) fn column_type_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int {
     log_debug_lazy!("COLUMN_TYPE: stmt={:p} idx={}", p_stmt, idx);
     let raw_pg_stmt = pg_find_any_stmt(p_stmt);
     let dbg_sql = unsafe { column_type_debug_sql(raw_pg_stmt) };
-    let dbg_db = get_orig_sqlite3_db_handle()
-        .map(|f| unsafe { f(p_stmt) })
-        .unwrap_or(ptr::null_mut());
-    unsafe {
-        crate::db_interpose_common::note_column_phase(
-            b"column_type\0",
-            dbg_sql,
-            p_stmt as *const c_void,
-            dbg_db as *const c_void,
-            idx,
-        );
-    }
+    // The shim's own resolver: a routed statement answers its shadow or
+    // connection handle and never hands the pointer to SQLite, which a
+    // test's fake statement pointer crashed (2026-10-16).
+    let dbg_db = crate::db_interpose_metadata::rust_my_sqlite3_db_handle(p_stmt);
+    crate::db_interpose_common::note_column_phase(
+        b"column_type\0",
+        dbg_sql,
+        p_stmt as *const c_void,
+        dbg_db as *const c_void,
+        idx,
+    );
 
     if !raw_pg_stmt.is_null() && unsafe { (&*raw_pg_stmt).is_pg != 0 } {
         let pg_stmt = unsafe { &mut *raw_pg_stmt };
@@ -474,10 +473,12 @@ fn column_type_emit_log(pg_stmt: *mut PgStmt, p_stmt: *mut sqlite3_stmt, ctx: &C
 mod tests {
     use super::*;
 
+    // A timestamp's value is text ("2024-01-02 03:04:05"); read as INTEGER
+    // it was atoll'd to the year.
     #[test]
-    fn null_oid_mapping_keeps_timestamp_columns_integer() {
-        assert_eq!(sqlite_type_for_oid(1114), SQLITE_INTEGER);
-        assert_eq!(sqlite_type_for_oid(1184), SQLITE_INTEGER);
+    fn timestamp_columns_read_as_text() {
+        assert_eq!(sqlite_type_for_oid(1114), SQLITE_TEXT);
+        assert_eq!(sqlite_type_for_oid(1184), SQLITE_TEXT);
     }
 
     // A NULL column has to read as NULL whatever it was declared as. Reported
@@ -505,20 +506,14 @@ mod tests {
 #[cfg(test)]
 mod ordinary_type_tests {
     use super::*;
-    #[repr(C)]
-    struct Att { name: *mut c_char, table: u32, column: c_int, format: c_int,
-        oid: u32, len: c_int, modifier: c_int }
-    extern "C" {
-        fn PQmakeEmptyPGresult(conn: *mut c_void, status: c_int) -> *mut PgResultLibpq;
-        fn PQsetResultAttrs(res: *mut PgResultLibpq, count: c_int, attrs: *mut Att) -> c_int;
-        fn PQsetvalue(res: *mut PgResultLibpq, row: c_int, col: c_int, value: *mut c_char, len: c_int) -> c_int;
-    }
+
+    use crate::libpq_helpers::test_support::{PQmakeEmptyPGresult, PQsetResultAttrs, PgResAttDesc as Att, PQsetvalue};
     #[test]
     fn ordinary_types_match_diagnostic_path_for_values_nulls_and_bounds() {
         for oid in [16, 20, 23, 25, 17, 701, 1700, 1114] {
             let mut stmt = PgStmt::new();
             let mut attr = Att { name: b"ordinary_test\0".as_ptr() as *mut _,
-                table: 0, column: 1, format: 0, oid, len: -1, modifier: -1 };
+                tableid: 0, columnid: 1, format: 0, typid: oid, typlen: -1, atttypmod: -1 };
             unsafe {
                 stmt.result = PQmakeEmptyPGresult(ptr::null_mut(), 2);
                 assert_eq!(PQsetResultAttrs(stmt.result, 1, &mut attr), 1);

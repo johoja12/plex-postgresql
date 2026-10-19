@@ -8,9 +8,11 @@ pub(crate) const SQLITE_BLOB_CONST: i32 = 4;
 pub(crate) fn pg_oid_to_sqlite_type_impl(oid: u32) -> i32 {
     match oid {
         20 | 21 | 23 | 26 | 16 => SQLITE_INTEGER_CONST, // int8, int2, int4, oid, bool
-        1114 | 1184 => SQLITE_INTEGER_CONST,            // timestamp, timestamptz → epoch int
-        700 | 701 | 1700 => SQLITE_FLOAT_CONST,         // float4, float8, numeric
-        17 => SQLITE_BLOB_CONST,                        // bytea
+        // timestamp and timestamptz are text: their value is "2024-01-02
+        // 03:04:05", which read as INTEGER was atoll'd to 2024.
+        1114 | 1184 => SQLITE_TEXT_CONST,
+        700 | 701 | 1700 => SQLITE_FLOAT_CONST, // float4, float8, numeric
+        17 => SQLITE_BLOB_CONST,                // bytea
         _ => SQLITE_TEXT_CONST,
     }
 }

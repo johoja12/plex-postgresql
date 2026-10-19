@@ -39,6 +39,7 @@ use wrappers::{prepare16_v2_impl, prepare_impl, prepare_v2_impl, prepare_v3_impl
 
 const SQLITE_OK: c_int = 0;
 const SQLITE_ERROR: c_int = 1;
+const SQLITE_BUSY: c_int = 5;
 const SQLITE_ROW: c_int = 100;
 const SQLITE_NOMEM: c_int = 7;
 
@@ -200,5 +201,82 @@ mod tests {
     fn worker_delegation_bypass_keeps_normal_selects_enabled() {
         let sql = CString::new("SELECT 1").unwrap();
         assert!(!should_bypass_worker_delegation(sql.as_ptr()));
+    }
+
+    // A full pool used to route a library statement to the shadow SQLite:
+    // the read answered no rows and the write was lost. It is SQLITE_BUSY
+    // now, with an errmsg, and Plex retries.
+    #[test]
+    fn a_library_statement_with_no_pool_connection_is_refused_with_busy() {
+        use super::internal_flow::{refuse_without_pool_connection, NO_POOL_CONNECTION_MSG};
+        use crate::ffi_types::{conn_ref, conn_unref, sqlite3, sqlite3_stmt, PgConnection};
+        use std::ffi::CStr;
+
+        let handle =
+            unsafe { libc::calloc(1, std::mem::size_of::<PgConnection>()) as *mut PgConnection };
+        conn_ref(handle);
+        let db = 0x7b5e_0001usize as *mut sqlite3;
+        unsafe {
+            let h = &mut *handle;
+            let path = b"/x/com.plexapp.plugins.library.db\0";
+            for (i, b) in path.iter().enumerate() {
+                h.db_path[i] = *b as std::os::raw::c_char;
+            }
+            h.is_pg_active = 1;
+            h.shadow_db = db;
+        }
+        crate::pg_client::rust_pg_register_connection(handle);
+
+        let select = CString::new("SELECT id FROM metadata_items").unwrap();
+        let mut stmt: *mut sqlite3_stmt = 0x1usize as *mut sqlite3_stmt;
+        let rc = unsafe {
+            refuse_without_pool_connection(
+                db,
+                std::ptr::null_mut(),
+                select.as_ptr(),
+                &mut stmt,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, Some(super::SQLITE_BUSY));
+        assert!(stmt.is_null(), "no statement is handed out");
+        unsafe {
+            let h = &*handle;
+            assert_eq!(h.last_error_code, super::SQLITE_BUSY);
+            assert_eq!(
+                CStr::from_ptr(h.last_error.as_ptr()).to_str().unwrap(),
+                NO_POOL_CONNECTION_MSG
+            );
+        }
+
+        // What belongs to the shadow still goes there.
+        let pragma = CString::new("PRAGMA foreign_keys").unwrap();
+        let master = CString::new("SELECT name FROM sqlite_master").unwrap();
+        for sql in [&pragma, &master] {
+            let rc = unsafe {
+                refuse_without_pool_connection(
+                    db,
+                    std::ptr::null_mut(),
+                    sql.as_ptr(),
+                    &mut stmt,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, None, "{:?}", sql);
+        }
+        // And a handle with a connection is never refused.
+        let rc = unsafe {
+            refuse_without_pool_connection(
+                db,
+                handle,
+                select.as_ptr(),
+                &mut stmt,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, None);
+
+        crate::pg_client::rust_pg_unregister_connection(handle);
+        assert!(conn_unref(handle));
     }
 }

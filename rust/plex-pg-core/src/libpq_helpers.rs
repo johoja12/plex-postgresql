@@ -692,3 +692,24 @@ pub extern "C" fn rust_pg_align_idle_timeout_with_server(
     }
     idle_timeout
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{PGconn, PGresult};
+    use std::os::raw::{c_char, c_int};
+    #[repr(C)]
+    pub(crate) struct PgResAttDesc {
+        pub name: *const c_char,
+        pub tableid: u32,
+        pub columnid: c_int,
+        pub format: c_int,
+        pub typid: u32,
+        pub typlen: c_int,
+        pub atttypmod: c_int,
+    }
+    extern "C" {
+        pub(crate) fn PQmakeEmptyPGresult(conn: *mut PGconn, status: c_int) -> *mut PGresult;
+        pub(crate) fn PQsetResultAttrs(res: *mut PGresult, count: c_int, attrs: *mut PgResAttDesc) -> c_int;
+        pub(crate) fn PQsetvalue(res: *mut PGresult, row: c_int, col: c_int, value: *const c_char, len: c_int) -> c_int;
+    }
+}

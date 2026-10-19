@@ -1,21 +1,20 @@
 use super::*;
 
-fn text_decltype() -> *const c_char {
-    DECLTYPE_TEXT.as_ptr() as *const c_char
-}
-
 fn passthrough_decltype(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const c_char {
     get_orig_sqlite3_column_decltype()
         .map(|f| unsafe { f(p_stmt, idx) })
         .unwrap_or(ptr::null())
 }
 
-/// Check whether we have no result or idx is out of bounds.
+/// With no result to read a type from, or an index past the columns, the
+/// answer is NULL, as SQLite's is for an expression column: nothing is
+/// known, and saying TEXT made SOCI build a string holder for a column that
+/// turned out to hold an integer (std::bad_cast).
 /// SAFETY: Must be called while stmt mutex is held. Does NOT log to avoid
 /// deadlock with the LOGGER mutex.
 fn no_result_decltype(pg_stmt: &mut PgStmt, idx: c_int) -> Option<*const c_char> {
     if pg_stmt.result.is_null() || idx < 0 || idx >= pg_stmt.num_cols {
-        return Some(text_decltype());
+        return Some(ptr::null());
     }
     None
 }
@@ -111,7 +110,7 @@ pub(super) fn column_decltype_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *co
 /// schema cache or static storage, not the libpq result itself.
 pub(super) fn column_decltype_locked(pg_stmt: &mut PgStmt, idx: c_int) -> (*const c_char, c_int, c_int) {
     if pg_stmt.result.is_null() || idx < 0 || idx >= pg_stmt.num_cols {
-        return (text_decltype(), SQLITE_TEXT, SQLITE_TEXT);
+        return (ptr::null(), -1, SQLITE_NULL);
     }
     let epoch = crate::libpq_helpers::result_metadata_epoch();
     if pg_stmt.column_decltypes_epoch != epoch
@@ -170,17 +169,10 @@ fn resolve_column_decltype_locked(pg_stmt: &mut PgStmt, idx: c_int) -> *const c_
 #[cfg(test)]
 mod descriptor_tests {
     use super::*;
-    use crate::libpq_helpers::{PGconn, PGresult, rust_pq_clear, invalidate_result_metadata};
+    use crate::libpq_helpers::{PGresult, rust_pq_clear, invalidate_result_metadata};
 
-    #[repr(C)]
-    struct AttDesc {
-        name: *mut c_char, tableid: u32, columnid: c_int, format: c_int,
-        typid: u32, typlen: c_int, atttypmod: c_int,
-    }
-    extern "C" {
-        fn PQmakeEmptyPGresult(conn: *mut PGconn, status: c_int) -> *mut PGresult;
-        fn PQsetResultAttrs(res: *mut PGresult, count: c_int, attrs: *mut AttDesc) -> c_int;
-    }
+
+    use crate::libpq_helpers::test_support::{PQmakeEmptyPGresult, PQsetResultAttrs, PgResAttDesc as AttDesc};
     fn result(name: &str, oid: u32, table: u32) -> *mut PGresult {
         let name = CString::new(name).unwrap();
         let mut attr = AttDesc { name: name.as_ptr() as *mut _, tableid: table,
@@ -189,6 +181,17 @@ mod descriptor_tests {
         assert!(!res.is_null());
         assert_eq!(unsafe { PQsetResultAttrs(res, 1, &mut attr) }, 1);
         res
+    }
+    #[test]
+    fn absent_result_and_invalid_columns_have_no_declared_type() {
+        let mut stmt = PgStmt::new();
+        assert_eq!(column_decltype_locked(&mut stmt, 0), (ptr::null(), -1, SQLITE_NULL));
+        stmt.result = result("descriptor_missing", 25, 0);
+        stmt.num_cols = 1;
+        for idx in [-1, 1] {
+            assert_eq!(column_decltype_locked(&mut stmt, idx), (ptr::null(), -1, SQLITE_NULL));
+        }
+        rust_pq_clear(stmt.result);
     }
     #[test]
     fn null_expression_decltype_is_cached_without_changing_type() {
@@ -214,7 +217,7 @@ mod descriptor_tests {
         assert_eq!(column_decltype_locked(&mut stmt, 0).1, SQLITE_INTEGER);
         assert_eq!(column_decltype_locked(&mut stmt, 0).2, SQLITE_INTEGER);
         // Simulate reuse of the exact result address with a stale descriptor.
-        stmt.column_decltypes[0] = Some((text_decltype(), SQLITE_TEXT, SQLITE_TEXT));
+        stmt.column_decltypes[0] = Some((b"TEXT\0".as_ptr() as *const c_char, SQLITE_TEXT, SQLITE_TEXT));
         invalidate_result_metadata();
         assert_eq!(column_decltype_locked(&mut stmt, 0).1, SQLITE_INTEGER);
         assert_eq!(column_decltype_locked(&mut stmt, 0).2, SQLITE_INTEGER);

@@ -27,9 +27,8 @@ use crate::db_interpose_common::{
     get_orig_sqlite3_column_decltype, get_orig_sqlite3_column_double, get_orig_sqlite3_column_int,
     get_orig_sqlite3_column_int64, get_orig_sqlite3_column_name, get_orig_sqlite3_column_text,
     get_orig_sqlite3_column_type, get_orig_sqlite3_column_value, get_orig_sqlite3_data_count,
-    get_orig_sqlite3_db_handle, tls_column_type_calls_ptr, tls_in_resolve_tables_ptr,
-    tls_last_query_ptr, PgFakeValue, GLOBAL_COLUMN_TYPE_CALLS, MAX_FAKE_VALUES,
-    PG_FAKE_VALUE_MAGIC,
+    tls_column_type_calls_ptr, tls_in_resolve_tables_ptr, tls_last_query_ptr, PgFakeValue,
+    GLOBAL_COLUMN_TYPE_CALLS, MAX_FAKE_VALUES, PG_FAKE_VALUE_MAGIC,
 };
 use crate::db_interpose_conn_utils::{
     cstr_prefix, cstr_to_string_or, log_debug, log_error, log_info, PthreadMutexGuard,
@@ -83,7 +82,6 @@ const PG_DECLTYPE_CASE_DT_INTEGER_8: c_int = 2;
 const PMT_COLUMN_CACHED_BLOB_ALLOC: c_int = 3;
 const PMT_COLUMN_DECODED_BLOB_ALLOC: c_int = 4;
 
-static DECLTYPE_TEXT: &[u8] = b"TEXT\0";
 static DECLTYPE_DT_INTEGER_8: &[u8] = b"dt_integer(8)\0";
 static _DECLTYPE_INTEGER: &[u8] = b"INTEGER\0";
 static _DECLTYPE_BIGINT: &[u8] = b"BIGINT\0";
@@ -120,12 +118,6 @@ extern "C" {
     ) -> c_int;
     fn pg_is_duplicate_prepared_stmt(res: *mut PgResultLibpq) -> c_int;
 
-    fn pg_exception_note_phase(
-        phase: *const c_char,
-        sql: *const c_char,
-        stmt: *mut sqlite3_stmt,
-        db: *mut sqlite3,
-    );
 }
 
 #[no_mangle]
@@ -250,7 +242,9 @@ mod tests {
     #[test]
     fn column_text_returns_a_value_longer_than_its_buffer_whole() {
         let stmt = make_stmt();
-        let shadow_stmt = 0x30000usize as *mut sqlite3_stmt;
+        // Each parallel test owns a unique handle key in the shared registry.
+        let mut handle_key = Box::new(0u8);
+        let shadow_stmt = (&mut *handle_key) as *mut u8 as *mut sqlite3_stmt;
         let long = format!("{{\"pv:channelMapping\":\"{}\"}}", "M".repeat(20_000));
         let value = CString::new(long.clone()).unwrap();
         let col = CString::new("extra_data").unwrap();
@@ -305,27 +299,10 @@ mod tests {
         rust_stmt_free(stmt);
     }
 
-    #[repr(C)]
-    struct PgResAttDesc {
-        name: *const c_char,
-        tableid: u32,
-        columnid: c_int,
-        format: c_int,
-        typid: u32,
-        typlen: c_int,
-        atttypmod: c_int,
-    }
 
+
+    use crate::libpq_helpers::test_support::{PQmakeEmptyPGresult, PQsetResultAttrs, PgResAttDesc, PQsetvalue};
     extern "C" {
-        fn PQmakeEmptyPGresult(conn: *mut std::ffi::c_void, status: c_int) -> *mut PgResultLibpq;
-        fn PQsetResultAttrs(res: *mut PgResultLibpq, n: c_int, descs: *mut PgResAttDesc) -> c_int;
-        fn PQsetvalue(
-            res: *mut PgResultLibpq,
-            tup: c_int,
-            field: c_int,
-            value: *const c_char,
-            len: c_int,
-        ) -> c_int;
         fn PQclear(res: *mut PgResultLibpq);
     }
 
@@ -333,7 +310,9 @@ mod tests {
     #[test]
     fn column_text_returns_a_long_live_value_whole() {
         let stmt = make_stmt();
-        let shadow_stmt = 0x40000usize as *mut sqlite3_stmt;
+        // Each parallel test owns a unique handle key in the shared registry.
+        let mut handle_key = Box::new(0u8);
+        let shadow_stmt = (&mut *handle_key) as *mut u8 as *mut sqlite3_stmt;
         let long = format!("{{\"pv:channelMapping\":\"{}\"}}", "M".repeat(20_000));
         let value = CString::new(long.clone()).unwrap();
         let col = CString::new("extra_data").unwrap();
@@ -373,6 +352,92 @@ mod tests {
             "the whole value, not the buffer's 8,191 bytes"
         );
         assert_eq!(text, long);
+
+        rust_stmt_unregister(shadow_stmt as usize);
+        unsafe {
+            (&mut *stmt).result = std::ptr::null_mut();
+            PQclear(res);
+        }
+        rust_stmt_free(stmt);
+    }
+
+    // sqlite3_column_text's pointer lives until the statement's next step,
+    // reset or finalize. The shim's lived until its 64-slot thread ring came
+    // round, so a statement with many columns, or Plex re-reading a column
+    // after sixty others, found the first one overwritten.
+    #[test]
+    fn column_text_pointer_survives_the_ring_going_round() {
+        let stmt = make_stmt();
+        // Each parallel test owns a unique handle key in the shared registry.
+        let mut handle_key = Box::new(0u8);
+        let shadow_stmt = (&mut *handle_key) as *mut u8 as *mut sqlite3_stmt;
+        let a = CString::new("first column").unwrap();
+        let b = CString::new("second column").unwrap();
+        let col_a = CString::new("a").unwrap();
+        let col_b = CString::new("b").unwrap();
+        let res = unsafe { PQmakeEmptyPGresult(std::ptr::null_mut(), 2) };
+        assert!(!res.is_null());
+        let mut descs = [
+            PgResAttDesc {
+                name: col_a.as_ptr(),
+                tableid: 0,
+                columnid: 0,
+                format: 0,
+                typid: 25,
+                typlen: -1,
+                atttypmod: -1,
+            },
+            PgResAttDesc {
+                name: col_b.as_ptr(),
+                tableid: 0,
+                columnid: 0,
+                format: 0,
+                typid: 25,
+                typlen: -1,
+                atttypmod: -1,
+            },
+        ];
+        unsafe {
+            assert_eq!(PQsetResultAttrs(res, 2, descs.as_mut_ptr()), 1);
+            assert_eq!(PQsetvalue(res, 0, 0, a.as_ptr(), 12), 1);
+            assert_eq!(PQsetvalue(res, 0, 1, b.as_ptr(), 13), 1);
+            let s = &mut *stmt;
+            s.is_pg = 2;
+            s.result = res;
+            s.num_cols = 2;
+            s.num_rows = 1;
+            s.current_row = 0;
+        }
+        rust_stmt_register(shadow_stmt as usize, stmt as usize);
+
+        let first = rust_my_sqlite3_column_text(shadow_stmt, 0);
+        for _ in 0..(NUM_TEXT_BUFFERS * 2) {
+            rust_my_sqlite3_column_text(shadow_stmt, 1);
+        }
+        let text = unsafe { CStr::from_ptr(first as *const c_char) }
+            .to_str()
+            .unwrap();
+        assert_eq!(text, "first column", "overwritten by the ring");
+        assert_eq!(
+            rust_my_sqlite3_column_text(shadow_stmt, 0),
+            first,
+            "the same pointer for the same row, as SQLite gives"
+        );
+
+        // The next row (as a step leaves it) lets the copies go.
+        unsafe {
+            (&mut *stmt).current_row = 1;
+            (&mut *stmt).num_rows = 2;
+            assert_eq!(PQsetvalue(res, 1, 0, b.as_ptr(), 13), 1);
+            assert_eq!(PQsetvalue(res, 1, 1, a.as_ptr(), 12), 1);
+        }
+        let next = rust_my_sqlite3_column_text(shadow_stmt, 0);
+        assert_eq!(
+            unsafe { CStr::from_ptr(next as *const c_char) }
+                .to_str()
+                .unwrap(),
+            "second column"
+        );
 
         rust_stmt_unregister(shadow_stmt as usize);
         unsafe {
@@ -454,7 +519,9 @@ mod tests {
     #[test]
     fn pg_column_count_without_metadata_does_not_fall_back_to_shadow_count() {
         let stmt = make_stmt();
-        let shadow_stmt = 0x10000usize as *mut sqlite3_stmt;
+        // Each parallel test owns a unique handle key in the shared registry.
+        let mut handle_key = Box::new(0u8);
+        let shadow_stmt = (&mut *handle_key) as *mut u8 as *mut sqlite3_stmt;
         let pg_sql = CString::new(
             "SELECT plugins.*, plugin_prefixes.* FROM plugins \
              JOIN plugin_prefixes ON plugin_prefixes.plugin_id = plugins.id \
@@ -481,10 +548,14 @@ mod tests {
         rust_stmt_free(stmt);
     }
 
+    // Nothing is known about a column with no result: SQLite answers NULL
+    // for an expression column, and SOCI then types it from the value.
     #[test]
-    fn pg_column_decltype_without_metadata_does_not_use_shadow_decltype() {
+    fn pg_column_decltype_without_metadata_is_null_not_the_shadows_or_text() {
         let stmt = make_stmt();
-        let shadow_stmt = 0x20000usize as *mut sqlite3_stmt;
+        // Each parallel test owns a unique handle key in the shared registry.
+        let mut handle_key = Box::new(0u8);
+        let shadow_stmt = (&mut *handle_key) as *mut u8 as *mut sqlite3_stmt;
         let pg_sql = CString::new(
             "SELECT plugins.*, plugin_prefixes.* FROM plugins \
              JOIN plugin_prefixes ON plugin_prefixes.plugin_id = plugins.id \
@@ -502,8 +573,9 @@ mod tests {
         rust_stmt_register(shadow_stmt as usize, stmt as usize);
 
         let decl = rust_my_sqlite3_column_decltype(shadow_stmt, 0);
-        let decl = unsafe { CStr::from_ptr(decl) }.to_str().unwrap();
-        assert_eq!(decl, "TEXT");
+        assert!(decl.is_null(), "answered {:?}", unsafe {
+            CStr::from_ptr(decl)
+        });
 
         rust_stmt_unregister(shadow_stmt as usize);
         unsafe {

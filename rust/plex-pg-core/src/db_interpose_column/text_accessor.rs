@@ -60,17 +60,33 @@ unsafe fn load_cached_text_state(pg_stmt: &mut PgStmt, idx: c_int) -> Option<Cac
     })
 }
 
-/// Write cached text output into a thread-local buffer.
+/// Write cached text output into a thread-local buffer. Returns the text
+/// and whether it is in the ring (and so must be pinned to the statement).
 /// SAFETY: Must be called while stmt mutex is held. Does NOT call log_debug/log_error
 /// to avoid deadlock with the LOGGER mutex.
 unsafe fn write_cached_text_output(
     pg_stmt: &mut PgStmt,
-    _idx: c_int,
+    idx: c_int,
     state: &CachedTextState,
-) -> *const c_uchar {
+) -> (*const c_uchar, bool) {
+    if let Some(Some(owned)) = pg_stmt.owned_column_text.get(idx as usize) {
+        return (owned.as_ptr(), false);
+    }
     let str_len = libc::strlen(state.source_value) as usize;
+    // Cached transformed values need the same unbounded statement ownership
+    // as live values; a fixed ring would truncate a long rewritten URI.
+    let bytes = std::slice::from_raw_parts(state.source_value as *const u8, str_len);
+    if let Some(owned) = crate::db_interpose_helpers::column_text_transform_owned(
+        state.col_name, state.oid, pg_stmt.pg_sql, state.source_value, bytes,
+    ) {
+        pg_stmt.owned_column_text.resize_with(
+            pg_stmt.owned_column_text.len().max(idx as usize + 1), || None);
+        pg_stmt.owned_column_text[idx as usize] = Some(owned);
+        return (pg_stmt.owned_column_text[idx as usize].as_ref().unwrap().as_ptr(), false);
+    }
     let buf_idx = next_text_buffer_index();
     let mut out_ptr: *const c_uchar = ptr::null();
+    let mut from_ring = true;
     COLUMN_TEXT_BUFFERS.with(|bufs| {
         let mut bufs = bufs.borrow_mut();
         let buf = &mut bufs[buf_idx];
@@ -91,6 +107,7 @@ unsafe fn write_cached_text_output(
             // Longer than the buffer: the cached row's own copy, which lives
             // as long as SQLite keeps a column_text pointer (the row).
             out_ptr = state.source_value as *const c_uchar;
+            from_ring = false;
             return;
         }
 
@@ -101,7 +118,7 @@ unsafe fn write_cached_text_output(
         buf[copy_len] = 0;
         out_ptr = buf.as_ptr();
     });
-    out_ptr
+    (out_ptr, from_ring)
 }
 
 unsafe fn load_live_text_state(pg_stmt: &mut PgStmt, idx: c_int) -> Option<LiveTextState> {
@@ -149,9 +166,9 @@ unsafe fn write_live_text_output(
     pg_stmt: &mut PgStmt,
     idx: c_int,
     state: &LiveTextState,
-) -> *const c_uchar {
+) -> (*const c_uchar, bool) {
     if let Some(Some(owned)) = pg_stmt.owned_column_text.get(idx as usize) {
-        return owned.as_ptr();
+        return (owned.as_ptr(), false);
     }
     let mut source = ptr::null();
     let mut len = 0;
@@ -161,7 +178,7 @@ unsafe fn write_live_text_output(
         &mut source, &mut len, &mut is_null,
     );
     if ok == 0 || is_null != 0 || source.is_null() || len < 0 {
-        return b"\0".as_ptr();
+        return (b"\0".as_ptr(), false);
     }
     let bytes = std::slice::from_raw_parts(source as *const u8, len as usize);
     if let Some(owned) = crate::db_interpose_helpers::column_text_transform_owned(
@@ -169,11 +186,61 @@ unsafe fn write_live_text_output(
     ) {
         pg_stmt.owned_column_text.resize_with(pg_stmt.num_cols as usize, || None);
         pg_stmt.owned_column_text[idx as usize] = Some(owned);
-        return pg_stmt.owned_column_text[idx as usize].as_ref().unwrap().as_ptr();
+        return (pg_stmt.owned_column_text[idx as usize].as_ref().unwrap().as_ptr(), false);
     }
     // libpq owns this immutable, NUL-terminated value until PQclear. The
     // statement keeps that result alive through subsequent column accesses.
-    source as *const u8
+    (source as *const u8, false)
+}
+
+/// Keep the text the statement is handing out for `idx` on the statement
+/// itself, so the pointer lives until its next step, reset or finalize --
+/// SQLite's promise for `sqlite3_column_text`.
+///
+/// The thread-local ring the value was rendered into has 64 slots, and a
+/// statement with more columns than that, or Plex reading a column, then
+/// sixty-odd others, then the first again, found the first overwritten.
+/// `cached_text` is cleared on the next row (here and by the blob accessor,
+/// which shares it), by the streaming step, and by reset and finalize.
+///
+/// A pointer that is not the ring's -- libpq's own copy of a long value, a
+/// cached row's -- lives as long as the result does and is handed out as is.
+///
+/// SAFETY: Must be called while stmt mutex is held. Does NOT log.
+unsafe fn pin_text_to_statement(
+    pg_stmt: &mut PgStmt,
+    idx: c_int,
+    text: *const c_uchar,
+    from_ring: bool,
+) -> *const c_uchar {
+    if text.is_null() || !from_ring || idx < 0 {
+        return text;
+    }
+    let row = pg_stmt.current_row;
+    if pg_stmt.cached_row != row {
+        crate::db_interpose_helpers::rust_step_clear_row_caches(
+            pg_stmt.cached_text.as_mut_ptr(),
+            pg_stmt.cached_blob.as_mut_ptr(),
+            pg_stmt.cached_blob_len.as_mut_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            pg_stmt.cached_text.len() as c_int,
+            &mut pg_stmt.cached_row as *mut c_int,
+            ptr::null_mut(),
+        );
+        pg_stmt.cached_row = row;
+    }
+    let i = idx as usize;
+    pg_stmt.ensure_column_capacity(i + 1);
+    let copy = libc::strdup(text as *const c_char);
+    if copy.is_null() {
+        return text;
+    }
+    if !pg_stmt.cached_text[i].is_null() {
+        libc::free(pg_stmt.cached_text[i] as *mut c_void);
+    }
+    pg_stmt.cached_text[i] = copy;
+    copy as *const c_uchar
 }
 
 pub(super) fn column_text_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const c_uchar {
@@ -188,18 +255,17 @@ pub(super) fn column_text_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const 
     } else {
         ptr::null()
     };
-    let dbg_db = get_orig_sqlite3_db_handle()
-        .map(|f| unsafe { f(p_stmt) })
-        .unwrap_or(ptr::null_mut());
-    unsafe {
-        crate::db_interpose_common::note_column_phase(
-            b"column_text\0",
-            dbg_sql,
-            p_stmt as *const c_void,
-            dbg_db as *const c_void,
-            idx,
-        );
-    }
+    // The shim's own resolver: a routed statement answers its shadow or
+    // connection handle and never hands the pointer to SQLite, which a
+    // test's fake statement pointer crashed (2026-10-16).
+    let dbg_db = crate::db_interpose_metadata::rust_my_sqlite3_db_handle(p_stmt);
+    crate::db_interpose_common::note_column_phase(
+        b"column_text\0",
+        dbg_sql,
+        p_stmt as *const c_void,
+        dbg_db as *const c_void,
+        idx,
+    );
 
     validate_type_consistency(dbg_stmt, p_stmt, idx, "column_text");
 
@@ -216,29 +282,41 @@ pub(super) fn column_text_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const 
     {
         let _guard = unsafe { PgStmt::lock_mutex(dbg_stmt) };
 
-        if !pg_stmt.cached_result.is_null() {
+        // Already rendered for this row: the same pointer, as SQLite gives.
+        // Rendering again would replace, and free, the copy Plex may still
+        // be reading.
+        if idx >= 0
+            && pg_stmt.cached_row == pg_stmt.current_row
+            && (idx as usize) < pg_stmt.cached_text.len()
+            && !pg_stmt.cached_text[idx as usize].is_null()
+        {
+            return pg_stmt.cached_text[idx as usize] as *const c_uchar;
+        }
+
+        let (text, from_ring) = if !pg_stmt.cached_result.is_null() {
             match unsafe { load_cached_text_state(pg_stmt, idx) } {
                 Some(state) => unsafe { write_cached_text_output(pg_stmt, idx, &state) },
                 // SQL NULL: return empty string instead of NULL to prevent
                 // Plex's std::string(nullptr) → basic_string crash.
                 // Real SQLite returns NULL here, but Plex doesn't always check.
-                None => empty_text_buffer(),
+                None => (empty_text_buffer(), true),
             }
         } else if pg_stmt.result.is_null() {
-            empty_text_buffer()
+            (empty_text_buffer(), true)
         } else if idx < 0 || idx >= pg_stmt.num_cols {
-            empty_text_buffer()
+            (empty_text_buffer(), true)
         } else {
             let row = pg_stmt.current_row;
             if row < 0 || row >= pg_stmt.num_rows {
-                empty_text_buffer()
+                (empty_text_buffer(), true)
             } else {
                 match unsafe { load_live_text_state(pg_stmt, idx) } {
                     Some(state) => unsafe { write_live_text_output(pg_stmt, idx, &state) },
-                    None => empty_text_buffer(),
+                    None => (empty_text_buffer(), true),
                 }
             }
-        }
+        };
+        unsafe { pin_text_to_statement(pg_stmt, idx, text, from_ring) }
     }
     // Mutex released here.
 }
@@ -246,16 +324,30 @@ pub(super) fn column_text_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const 
 #[cfg(test)]
 mod lifetime_tests {
     use super::*;
-    use crate::libpq_helpers::{PGconn, PGresult};
-    #[repr(C)]
-    struct AttDesc {
-        name: *mut c_char, tableid: u32, columnid: c_int, format: c_int,
-        typid: u32, typlen: c_int, atttypmod: c_int,
-    }
-    extern "C" {
-        fn PQmakeEmptyPGresult(conn: *mut PGconn, status: c_int) -> *mut PGresult;
-        fn PQsetResultAttrs(res: *mut PGresult, count: c_int, attrs: *mut AttDesc) -> c_int;
-        fn PQsetvalue(res: *mut PGresult, row: c_int, col: c_int, value: *mut c_char, len: c_int) -> c_int;
+
+    use crate::libpq_helpers::test_support::{PQmakeEmptyPGresult, PQsetResultAttrs, PgResAttDesc as AttDesc, PQsetvalue};
+    #[test]
+    fn cached_transformed_text_is_complete_and_stable_across_columns_and_threads() {
+        let threads: Vec<_> = (0..4).map(|thread| std::thread::spawn(move || {
+            let mut stmt = PgStmt::new();
+            let name = CString::new("uri").unwrap();
+            let mut pointers = Vec::new();
+            for col in (0..70).rev() {
+                let suffix = format!("{thread}/{col}/{}", "日本".repeat(5000));
+                let input = CString::new(format!("server://m/com.plexapp.plugins.library/library/{suffix}")).unwrap();
+                let state = CachedTextState { col_name: name.as_ptr(), oid: 25, source_value: input.as_ptr() };
+                let (text, ring) = unsafe { write_cached_text_output(&mut stmt, col, &state) };
+                assert!(!ring);
+                assert_eq!(unsafe { write_cached_text_output(&mut stmt, col, &state).0 }, text);
+                pointers.push((text, format!("library://{suffix}")));
+            }
+            for (text, expected) in pointers {
+                assert_eq!(unsafe { CStr::from_ptr(text as *const c_char) }.to_bytes(), expected.as_bytes());
+            }
+            crate::pg_statement::rust_stmt_clear_result(&mut stmt);
+            assert!(stmt.owned_column_text.is_empty());
+        })).collect();
+        for thread in threads { thread.join().unwrap(); }
     }
     #[test]
     fn transformed_column_pointers_survive_other_columns_and_reset_releases_ownership() {
@@ -272,7 +364,7 @@ mod lifetime_tests {
             let input = CString::new(format!("server://m/com.plexapp.plugins.library/library/{suffix}")).unwrap();
             assert_eq!(unsafe { PQsetvalue(stmt.result, 0, col, input.as_ptr() as *mut _, input.as_bytes().len() as c_int) }, 1);
             let state = LiveTextState { row: 0, col_name: name.as_ptr(), _oid: 25, oid_u: 25 };
-            pointers.push((unsafe { write_live_text_output(&mut stmt, col, &state) }, format!("library://{suffix}")));
+            pointers.push((unsafe { write_live_text_output(&mut stmt, col, &state).0 }, format!("library://{suffix}")));
         }
         for (pointer, expected) in pointers {
             assert_eq!(unsafe { CStr::from_ptr(pointer as *const c_char) }.to_bytes(), expected.as_bytes());

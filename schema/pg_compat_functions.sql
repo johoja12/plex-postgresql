@@ -89,11 +89,14 @@ CREATE OPERATOR public.= (
 
 -- Older schema snapshots exposed only title/title_fts in the FTS views, while
 -- the translator correctly references SQLite FTS title_sort/original_title/tag.
--- Append missing source columns without changing existing column positions or
--- dropping dependent objects. Re-running this upgrade is safe.
+-- Apply only to legacy snapshots that still carry the stored-vector columns.
+-- The 2026-10-16 migration owns the newer docid/source-column views and folded
+-- expression indexes; never replace those on startup. Re-running is safe.
 DO $fts_views$
 BEGIN
-    IF to_regclass('plex.metadata_items') IS NOT NULL THEN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'plex' AND table_name = 'metadata_items'
+                 AND column_name = 'title_fts') THEN
         -- MATCH is translated against these source columns, not title_fts.
         -- Pre-create on a busy live database with CONCURRENTLY before upgrade.
         CREATE INDEX IF NOT EXISTS idx_metadata_items_title_simple_fts
@@ -107,7 +110,9 @@ BEGIN
             SELECT id AS rowid, title, title_fts, title_sort, original_title
             FROM plex.metadata_items;
     END IF;
-    IF to_regclass('plex.tags') IS NOT NULL THEN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_schema = 'plex' AND table_name = 'tags'
+                 AND column_name = 'search_vector') THEN
         -- Preserve MATCH semantics while indexing its exact source expression.
         -- Production operators can pre-create this index CONCURRENTLY before
         -- upgrading to avoid a write lock on a busy existing database.

@@ -1,4 +1,10 @@
 use super::*;
+use std::sync::Mutex;
+
+// SQLite symbols are process-wide and are loaded lazily by tests as well as
+// the runtime constructor. Serialize the first load so parallel test setup
+// cannot race while filling the shared function-pointer slots.
+static SQLITE_SYMBOLS_LOAD_LOCK: Mutex<()> = Mutex::new(());
 
 macro_rules! load_sym {
     ($slot:ident, $handle:expr, $name:expr, $ty:ty) => {{
@@ -20,6 +26,10 @@ pub fn rust_common_load_sqlite_symbols(handle: *mut c_void) {
     if handle.is_null() {
         return;
     }
+
+    let _load_guard = SQLITE_SYMBOLS_LOAD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     unsafe {
         load_sym!(orig_sqlite3_open, handle, b"sqlite3_open\0", Sqlite3OpenFn);

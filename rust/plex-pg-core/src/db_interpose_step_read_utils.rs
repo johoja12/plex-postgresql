@@ -15,6 +15,7 @@ use crate::db_interpose_conn_utils::{
 };
 use crate::ffi_types::{sqlite3, sqlite3_stmt, PgConnection, PgStmt, StmtGuard};
 use crate::libpq_helpers::PGresult;
+use crate::pg_client::PgErrorClass;
 use first_execute::first_execute_impl;
 pub(crate) use next_result::try_advance_materialized;
 use next_result::{
@@ -25,12 +26,10 @@ pub use reexecution::rust_step_read_prepare_reexecution_state;
 pub(crate) use reexecution::streaming_conn_for_this_thread;
 #[allow(unused_imports)]
 use reexecution::{
-    adopt_materialized_result_owner, should_clear_cross_thread_result, should_use_streaming,
+    adopt_materialized_result_owner, has_limit_one, should_clear_cross_thread_result,
+    should_use_streaming,
 };
-use support::{
-    cstr_to_str, is_duplicate_prepared_stmt, is_stale_prepared_stmt, owned_db_path,
-    step_read_clear_row_caches,
-};
+use support::{cstr_to_str, is_duplicate_prepared_stmt, owned_db_path, step_read_clear_row_caches};
 
 const SQLITE_DONE: c_int = 101;
 const SQLITE_ROW: c_int = 100;
@@ -49,12 +48,6 @@ use crate::c_abi::resolve_column_tables;
 
 extern "C" {
     fn sqlite3_db_handle(stmt: *mut sqlite3_stmt) -> *mut sqlite3;
-    fn log_sql_fallback(
-        original_sql: *const c_char,
-        translated_sql: *const c_char,
-        error_msg: *const c_char,
-        context: *const c_char,
-    );
     fn platform_print_backtrace(reason: *const c_char, skip_frames: c_int);
     fn pg_exception_note_query(sql: *const c_char);
     fn pg_config_get() -> *mut PgConnConfig;
@@ -114,7 +107,7 @@ mod tests {
         c
     }
     use super::{
-        adopt_materialized_result_owner, rust_step_read_prepare_reexecution_state,
+        adopt_materialized_result_owner, has_limit_one, rust_step_read_prepare_reexecution_state,
         should_clear_cross_thread_result, should_use_streaming, streaming_conn_for_this_thread,
     };
     use crate::ffi_types::{PgConnection, PgStmt};
@@ -243,6 +236,33 @@ mod tests {
 
         assert!(!should_use_streaming(stmt_ptr, false));
 
+        rust_stmt_free(stmt_ptr);
+    }
+
+    // "limit 1" as a substring matched LIMIT 10, LIMIT 100 and SQLite's
+    // `LIMIT 1, 20`, so every paginated listing was fetched eagerly.
+    #[test]
+    fn limit_one_is_a_token_not_a_substring() {
+        assert!(has_limit_one(b"SELECT * FROM t LIMIT 1"));
+        assert!(has_limit_one(b"select * from t limit 1;"));
+        assert!(has_limit_one(b"SELECT * FROM t LIMIT 1 OFFSET 5"));
+        assert!(has_limit_one(
+            b"SELECT * FROM t WHERE x IN (SELECT y FROM u LIMIT 1)"
+        ));
+        assert!(!has_limit_one(b"SELECT * FROM t LIMIT 10"));
+        assert!(!has_limit_one(b"SELECT * FROM t LIMIT 100 OFFSET 0"));
+        assert!(!has_limit_one(b"SELECT * FROM t LIMIT 1, 20"));
+        assert!(!has_limit_one(b"SELECT * FROM t LIMIT 1,20"));
+    }
+
+    #[test]
+    fn should_use_streaming_keeps_paginated_queries() {
+        let sql = CString::new("select * from metadata_items limit 100").unwrap();
+        let stmt_ptr = rust_stmt_create(std::ptr::null_mut(), sql.as_ptr(), std::ptr::null_mut());
+        let pg_sql = CString::new("SELECT * FROM metadata_items LIMIT 100").unwrap();
+        let s = unsafe { &mut *stmt_ptr };
+        s.pg_sql = unsafe { libc::strdup(pg_sql.as_ptr()) };
+        assert!(should_use_streaming(stmt_ptr, false));
         rust_stmt_free(stmt_ptr);
     }
 

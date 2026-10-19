@@ -180,12 +180,67 @@ fn maybe_log_txn_route(
     }
 }
 
+/// The errmsg a prepare answers when the pool has no connection to give.
+pub(crate) const NO_POOL_CONNECTION_MSG: &str =
+    "plex-postgresql: no PostgreSQL connection available";
+
+/// Refuse a statement on a PostgreSQL-backed library handle when the pool
+/// gave no connection, rather than prepare it on the shadow SQLite.
+///
+/// Until 2026-10-16 a full pool made `rust_pg_find_connection` answer null
+/// and the prepare carried on as for a SQLite handle: the read ran against
+/// the empty shadow and answered no rows, the write ran there and was lost.
+/// SQLITE_BUSY is what SQLite answers when the database cannot be had, and
+/// Plex already retries it.
+///
+/// Passthrough SQL (sqlite_master, fts3_tokenizer, the engine's own
+/// configuration) and skipped SQL (PRAGMA) belong to the shadow and are
+/// prepared there whatever the pool says.
+pub(super) unsafe fn refuse_without_pool_connection(
+    db: *mut sqlite3,
+    pg_conn: *mut PgConnection,
+    z_sql: *const c_char,
+    pp_stmt: *mut *mut sqlite3_stmt,
+    pz_tail: *mut *const c_char,
+) -> Option<c_int> {
+    if !pg_conn.is_null() || !crate::pg_client::handle_is_pg_library(db) {
+        return None;
+    }
+    let sql_str = crate::db_interpose_helpers::cstr_to_str_or_empty(z_sql);
+    if crate::pg_config::is_sqlite_passthrough_str(sql_str)
+        || crate::pg_config::pg_config_should_skip_sql(z_sql) != 0
+    {
+        return None;
+    }
+    log_error(&format!(
+        "PREPARE: {} -- refusing with SQLITE_BUSY rather than the shadow: {}",
+        NO_POOL_CONNECTION_MSG,
+        cstr_prefix(z_sql, 200, "NULL")
+    ));
+    let handle_conn = crate::pg_client::rust_pg_find_handle_connection(db);
+    if !handle_conn.is_null() {
+        (&mut *handle_conn).set_last_error(SQLITE_BUSY, NO_POOL_CONNECTION_MSG);
+    }
+    if !pp_stmt.is_null() {
+        *pp_stmt = ptr::null_mut();
+    }
+    if !pz_tail.is_null() {
+        *pz_tail = ptr::null();
+    }
+    Some(SQLITE_BUSY)
+}
+
 unsafe fn clear_connection_error_state(db: *mut sqlite3) {
-    let pg_conn_for_clear = crate::pg_client::rust_pg_find_connection(db);
+    // The connection the previous statement's error sits on, read without
+    // acquiring one (see peek_connection); the handle's own as well, since
+    // a refused prepare records its error there.
+    let pg_conn_for_clear = crate::pg_client::peek_connection(db);
     if !pg_conn_for_clear.is_null() {
-        let c = &mut *pg_conn_for_clear;
-        c.last_error_code = SQLITE_OK;
-        c.last_error[0] = 0;
+        (&mut *pg_conn_for_clear).clear_last_error();
+    }
+    let handle_conn = crate::pg_client::rust_pg_find_handle_connection(db);
+    if !handle_conn.is_null() && handle_conn != pg_conn_for_clear {
+        (&mut *handle_conn).clear_last_error();
     }
 }
 
@@ -315,16 +370,22 @@ pub(super) fn prepare_v2_internal_impl(
 
     maybe_log_query_shape(z_sql, bytes, skip_complex_processing);
 
-    let pg_conn = if skip_complex_processing != 0 {
-        ptr::null_mut()
-    } else {
-        crate::pg_client::rust_pg_find_connection(db)
-    };
+    // On a low stack this used to drop pg_conn, so a library statement went
+    // to the shadow SQLite; the low-stack paths above have already delegated
+    // or routed anything that can be, so what reaches here is prepared as
+    // usual, with its connection.
+    let pg_conn = crate::pg_client::rust_pg_find_connection(db);
 
     let is_write = crate::pg_config::pg_config_is_write_operation(z_sql) != 0;
     let is_read = crate::pg_config::pg_config_is_read_operation(z_sql) != 0;
 
     maybe_log_txn_route(z_sql, pg_conn, is_read, is_write);
+
+    if let Some(rc) =
+        unsafe { refuse_without_pool_connection(db, pg_conn, z_sql, pp_stmt, pz_tail) }
+    {
+        return rc;
+    }
 
     if contains_icase_ptr(z_sql, "plugins") {
         log_info_lazy!(

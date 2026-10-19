@@ -23,6 +23,14 @@ unsafe fn clear_streaming_state(stmt_ptr: *mut PgStmt, stmt: &mut PgStmt, op_nam
             "{}: streaming_conn invalid, skipping cancel/drain (stmt={:p})",
             op_name, stmt_ptr
         ));
+        // The connection is no longer in a READY slot, but this statement
+        // still holds a reference to the struct, and the flag this statement
+        // set on it was never cleared here: the next thread to be handed the
+        // slot found it "streaming" and was refused, for ever.
+        // SAFETY: the statement's reference keeps the struct alive.
+        (*stmt.streaming_conn())
+            .streaming_active
+            .store(0, Ordering::Release);
         stmt.streaming_mode = 0;
         stmt.set_streaming_conn(std::ptr::null_mut());
         return;

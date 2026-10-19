@@ -55,6 +55,37 @@ pub struct PgConnection {
     /// drifted — but appending rather than inserting keeps that true for
     /// anything that reads the older fields by offset.
     pub ref_count: AtomicI32,
+    /// Set when the last INSERT on this connection failed, so that
+    /// `sqlite3_last_insert_rowid` answers 0 until an INSERT succeeds.
+    ///
+    /// SQLite keeps the previous row id across a failed insert. The shim
+    /// deliberately does not: Plex reads the row id right after the insert
+    /// and writes it into the children it creates next, and a stale id from
+    /// the previous row linked them to the wrong parent -- which the
+    /// constraint that refused the insert then let through. 0 fails those
+    /// writes too, loudly.
+    pub last_insert_failed: AtomicI32,
+}
+
+impl PgConnection {
+    /// Record a statement's failure as this connection's `sqlite3_errcode`
+    /// and `sqlite3_errmsg`, the way SQLite keeps the last error on the
+    /// handle. The buffer is bounded; a long PostgreSQL message is cut.
+    pub fn set_last_error(&mut self, code: c_int, msg: &str) {
+        self.last_error_code = code;
+        self.last_error.fill(0);
+        let bytes = msg.as_bytes();
+        let len = bytes.len().min(self.last_error.len().saturating_sub(1));
+        for (dst, src) in self.last_error.iter_mut().zip(bytes.iter()).take(len) {
+            *dst = *src as c_char;
+        }
+    }
+
+    /// Forget the last error, as a new prepare does.
+    pub fn clear_last_error(&mut self) {
+        self.last_error_code = 0;
+        self.last_error[0] = 0;
+    }
 }
 
 /// Take a reference to a pooled connection. Null is ignored, because the

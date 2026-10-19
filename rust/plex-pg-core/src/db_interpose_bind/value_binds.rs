@@ -1,6 +1,7 @@
 use super::*;
 use crate::db_interpose_bind::support::{
     begin_bind, clear_param_value, is_pg_routed_noncached, mapped_param_index, retry_on_misuse,
+    routed_bind_rc,
 };
 
 unsafe fn store_sqlite_value_param(
@@ -72,7 +73,7 @@ pub(super) fn bind_value_impl(
     let (pg_stmt, guard) = unsafe { begin_bind(PHASE_BIND_VALUE, p_stmt) };
 
     let rc = if is_pg_routed_noncached(pg_stmt) {
-        SQLITE_OK
+        unsafe { routed_bind_rc(pg_stmt, p_stmt, idx) }
     } else {
         let mut rc = get_orig_sqlite3_bind_value()
             .map(|f| unsafe { f(p_stmt, idx, p_value) })
@@ -103,7 +104,7 @@ pub(super) fn bind_null_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int {
     let (pg_stmt, guard) = unsafe { begin_bind(PHASE_BIND_NULL, p_stmt) };
 
     let rc = if is_pg_routed_noncached(pg_stmt) {
-        SQLITE_OK
+        unsafe { routed_bind_rc(pg_stmt, p_stmt, idx) }
     } else {
         let mut rc = get_orig_sqlite3_bind_null()
             .map(|f| unsafe { f(p_stmt, idx) })

@@ -89,8 +89,12 @@ fn registry_concurrent_readers() {
 
 #[test]
 fn ffi_register_find_unregister() {
-    let s = 0x10000_usize;
-    let p = 0x20000_usize;
+    // Literal keys collided with the column accessor tests in parallel,
+    // replacing a live mapping with a sentinel PgStmt and crashing reads.
+    let mut handle_key = Box::new(0u8);
+    let s = (&mut *handle_key) as *mut u8 as usize;
+    let stmt = super::super::rust_stmt_create(std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut());
+    let p = stmt as usize;
 
     rust_stmt_register(s, p);
     assert_eq!(rust_stmt_find(s), p);
@@ -99,6 +103,7 @@ fn ffi_register_find_unregister() {
     rust_stmt_unregister(s);
     assert_eq!(rust_stmt_find(s), 0);
     assert_eq!(rust_stmt_is_ours(p), 0);
+    rust_stmt_unref(stmt);
 }
 
 #[test]
@@ -108,7 +113,8 @@ fn ffi_find_null_returns_zero() {
 
 #[test]
 fn ffi_find_any_checks_registry_first() {
-    let s = 0x30000_usize;
+    let mut handle_key = Box::new(0u8);
+    let s = (&mut *handle_key) as *mut u8 as usize;
     let stmt = Box::into_raw(Box::new(crate::ffi_types::PgStmt::new()));
     unsafe { (*stmt).ref_count.store(1, std::sync::atomic::Ordering::Release); }
     let p = stmt as usize;

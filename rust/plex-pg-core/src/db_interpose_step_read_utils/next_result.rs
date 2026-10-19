@@ -64,23 +64,24 @@ pub(super) fn streaming_next_impl(p_stmt: *mut sqlite3_stmt, stmt: *mut PgStmt) 
     let row_res =
         crate::libpq_helpers::rust_pq_get_result(unsafe { (*stmt.streaming_conn()).conn });
     if row_res.is_null() {
+        // libpq has no more results before the stream reported its end: the
+        // connection dropped mid-stream. Answering DONE here handed Plex a
+        // silently truncated list; it is an error, with the reason.
+        let sc = unsafe { &mut *stmt.streaming_conn() };
+        let message = crate::pg_client::error_class::result_message(sc.conn, std::ptr::null());
         log_error(&format!(
-            "STREAM: NULL result (unexpected!) stmt={:p} sql={:.100} streaming_conn={:p}",
+            "STREAM: NULL result mid-stream ({}) stmt={:p} sql={:.100} streaming_conn={:p}",
+            message,
             p_stmt,
             cstr_to_str(stmt.pg_sql),
             stmt.streaming_conn()
         ));
+        sc.set_last_error(SQLITE_ERROR, &message);
+        sc.streaming_active.store(0, Ordering::SeqCst);
         stmt.streaming_mode = 0;
-        if !stmt.streaming_conn().is_null() {
-            unsafe {
-                (*stmt.streaming_conn())
-                    .streaming_active
-                    .store(0, Ordering::SeqCst);
-            }
-        }
         stmt.set_streaming_conn(std::ptr::null_mut());
         stmt.read_done = 1;
-        return STEP_RESULT_DONE;
+        return STEP_RESULT_ERROR;
     }
 
     let row_status = crate::libpq_helpers::rust_pq_result_status(row_res);
@@ -114,31 +115,32 @@ pub(super) fn streaming_next_impl(p_stmt: *mut sqlite3_stmt, stmt: *mut PgStmt) 
         return STEP_RESULT_DONE;
     }
 
-    let err = crate::libpq_helpers::rust_pq_error_message(unsafe { (*stmt.streaming_conn()).conn });
+    // An error after the first row (a statement_timeout, a lost connection,
+    // a value the server could not produce). The query cannot be run again
+    // from here without handing Plex the rows it already has a second time,
+    // so this is SQLITE_ERROR whatever the class, with the reason. It used to
+    // be DONE, and Plex read a cut-off list as the whole.
+    let sc = unsafe { &mut *stmt.streaming_conn() };
+    let (class, message) = crate::pg_client::classify_result(sc.conn, row_res);
     log_error(&format!(
-        "STREAM ERROR: {} (status={}) sql={:.100}",
-        cstr_to_str(err),
+        "STREAM ERROR ({:?}): {} (status={}) sql={:.100}",
+        class,
+        message,
         row_status,
         cstr_to_str(stmt.pg_sql)
     ));
     crate::libpq_helpers::rust_pq_clear(row_res);
-    let mut drain =
-        crate::libpq_helpers::rust_pq_get_result(unsafe { (*stmt.streaming_conn()).conn });
+    let mut drain = crate::libpq_helpers::rust_pq_get_result(sc.conn);
     while !drain.is_null() {
         crate::libpq_helpers::rust_pq_clear(drain);
-        drain = crate::libpq_helpers::rust_pq_get_result(unsafe { (*stmt.streaming_conn()).conn });
+        drain = crate::libpq_helpers::rust_pq_get_result(sc.conn);
     }
+    sc.set_last_error(SQLITE_ERROR, &message);
+    sc.streaming_active.store(0, Ordering::SeqCst);
     stmt.streaming_mode = 0;
-    if !stmt.streaming_conn().is_null() {
-        unsafe {
-            (*stmt.streaming_conn())
-                .streaming_active
-                .store(0, Ordering::SeqCst);
-        }
-    }
     stmt.set_streaming_conn(std::ptr::null_mut());
     stmt.read_done = 1;
-    STEP_RESULT_DONE
+    STEP_RESULT_ERROR
 }
 
 pub(super) fn eager_next_impl(stmt: *mut PgStmt) -> c_int {

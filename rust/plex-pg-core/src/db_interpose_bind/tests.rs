@@ -192,6 +192,41 @@ fn a_null_blob_after_an_integer_sends_null() {
     assert_eq!(b.sent(1), None);
 }
 
+// A bind the translation has no parameter for -- past the translated count,
+// or a name it lost -- is SQLITE_RANGE, as SQLite answers for an index past
+// the statement's parameters. It was SQLITE_OK with the value dropped, and a
+// translation that lost a placeholder shifted Plex's later values one slot
+// left without a word.
+#[test]
+fn a_bind_past_the_translated_parameters_is_out_of_range() {
+    const SQLITE_RANGE: c_int = 25;
+    let b = Bound::new(2);
+    assert_eq!(rust_my_sqlite3_bind_int64(b.stmt(), 2, 7), SQLITE_OK);
+    assert_eq!(rust_my_sqlite3_bind_int(b.stmt(), 3, 1), SQLITE_RANGE);
+    assert_eq!(rust_my_sqlite3_bind_int64(b.stmt(), 3, 1), SQLITE_RANGE);
+    assert_eq!(rust_my_sqlite3_bind_double(b.stmt(), 3, 1.5), SQLITE_RANGE);
+    assert_eq!(rust_my_sqlite3_bind_null(b.stmt(), 3), SQLITE_RANGE);
+    let t = CString::new("x").unwrap();
+    assert_eq!(
+        rust_my_sqlite3_bind_text(b.stmt(), 3, t.as_ptr(), -1, ptr::null_mut()),
+        SQLITE_RANGE
+    );
+    assert_eq!(
+        rust_my_sqlite3_bind_text64(b.stmt(), 3, t.as_ptr(), 1, ptr::null_mut(), 1),
+        SQLITE_RANGE
+    );
+    assert_eq!(
+        rust_my_sqlite3_bind_blob(b.stmt(), 3, t.as_ptr() as *const c_void, 1, ptr::null_mut()),
+        SQLITE_RANGE
+    );
+    assert_eq!(
+        rust_my_sqlite3_bind_blob64(b.stmt(), 3, t.as_ptr() as *const c_void, 1, ptr::null_mut()),
+        SQLITE_RANGE
+    );
+    assert_eq!(rust_my_sqlite3_bind_int(b.stmt(), 0, 1), SQLITE_RANGE);
+    assert_eq!(b.sent(2).as_deref(), Some("7"), "the bind that fit is kept");
+}
+
 #[test]
 fn an_empty_blob_after_an_integer_sends_an_empty_bytea() {
     let b = Bound::new(1);

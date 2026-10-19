@@ -116,16 +116,26 @@ pub(super) unsafe fn send_query_for_read(
         return Ok(());
     }
 
-    let err = crate::libpq_helpers::rust_pq_error_message(ec_ref.conn);
+    // PQsend* refuses without a result: a dead connection, or libpq itself
+    // (a command already in flight, out of memory). The connection's status
+    // decides whether a retry can help.
+    let (class, message) = crate::pg_client::classify_result(ec_ref.conn, std::ptr::null());
     log_error(&format!(
-        "PQsend* failed: {} sql={:.200}",
-        cstr_to_str(err),
+        "PQsend* failed ({:?}): {} sql={:.200}",
+        class,
+        message,
         cstr_to_str(s.pg_sql)
     ));
-    if !err.is_null() && cstr_to_str(err).contains("does not exist") {
+    if message.contains("does not exist") {
         crate::pg_client::rust_stmt_cache_clear_local(exec_conn as *mut c_void);
     }
     conn_guard.unlock();
+    if class == PgErrorClass::Fail {
+        (&mut *exec_conn).set_last_error(SQLITE_ERROR, &message);
+        (&mut *pg_stmt).read_done = 1;
+        *stmt_guard = None; // unlock
+        return Err(STEP_RESULT_ERROR);
+    }
     crate::pg_client::rust_pool_check_health(exec_conn as *mut c_void);
     *stmt_guard = None; // unlock
     set_pg_conn_error(pg_conn_error_out);

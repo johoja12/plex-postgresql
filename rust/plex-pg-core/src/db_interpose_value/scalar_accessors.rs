@@ -183,20 +183,32 @@ pub(super) fn value_blob_impl(p_val: *mut sqlite3_value) -> *const c_void {
         return ptr::null();
     }
 
-    let buf = VALUE_BLOB_IDX.fetch_add(1, Ordering::Relaxed) & 0x3F;
     let result_ptr = pg_stmt_ref.result;
-    let len = unsafe {
-        crate::db_interpose_helpers::rust_pg_result_blob_copy(
-            helpers_result_ptr(result_ptr),
-            ctx.row,
-            ctx.col,
-            VALUE_BLOB_BUFFERS[buf].as_mut_ptr(),
-            VALUE_BLOB_BUFFERS[buf].len() - 1,
-        )
-    };
+    // The decoded blob is never longer than libpq's text for it (bytea hex
+    // is twice the bytes), so a slot of that size takes it whole; the slot
+    // is this thread's, so no other thread's call overwrites it.
+    let raw_len = crate::db_interpose_helpers::rust_pg_result_length(
+        helpers_result_ptr(result_ptr),
+        ctx.row,
+        ctx.col,
+    );
+    if raw_len <= 0 {
+        return ptr::null();
+    }
+    let (buf, capacity) = value_blob_ring_take(raw_len as usize + 1);
+    if buf.is_null() || capacity == 0 {
+        return ptr::null();
+    }
+    let len = crate::db_interpose_helpers::rust_pg_result_blob_copy(
+        helpers_result_ptr(result_ptr),
+        ctx.row,
+        ctx.col,
+        buf,
+        capacity - 1,
+    );
     if len <= 0 {
         return ptr::null();
     }
 
-    (unsafe { VALUE_BLOB_BUFFERS[buf].as_ptr() }) as *const c_void
+    buf as *const c_void
 }

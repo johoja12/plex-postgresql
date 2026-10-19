@@ -5,182 +5,116 @@ use sqlparser::ast::helpers::attached_token::AttachedToken;
 /// Rewrites SQLite function calls to their PostgreSQL equivalents:
 ///   IFNULL(a,b)           → COALESCE(a,b)
 ///   iif(cond,then,else)   → CASE WHEN cond THEN then ELSE else END
-///   typeof(x)             → pg_typeof(x)::text
+///   typeof(x)             → plex.sqlite_typeof(x) (schema/plex_schema.sql:
+///                           SQLite's names, 'integer' for every integer type)
 ///   last_insert_rowid()   → lastval()
-///   json_each(x)          → json_array_elements(x)
+///   json_each(x)          → json_array_elements_text(x) (SQLite's `value` is the
+///                           element itself, so a string comes back without JSON quotes)
+///   json_each(x,'$.a')    → jsonb_array_elements_text(x::jsonb #> '{a}')
 ///   json_extract(x,'$.a') → jsonb_extract_path_text(x::jsonb,'a')
+///   json_extract(x,$1)    → jsonb_path_query_first(x::jsonb,$1::jsonpath) #>> '{}'
 ///   json_set(x,'$.a',v)   → jsonb_set(x::jsonb, string_to_array('a',','), to_jsonb(v), true)
-///   SUBSTR(a,b,c)         → SUBSTRING(a,b,c)
+///   group_concat(…)       → string_agg(…::text, sep), DISTINCT and ORDER BY kept
+///   SUBSTR(a,b,c)         → SUBSTRING(a,b,c); SUBSTR(a,-n[,m]) → [LEFT(]RIGHT(a,n)[,m)]
 ///   instr(a,b)            → STRPOS(a,b)   (same arg order)
+///   hex(x)                → UPPER(ENCODE(x::bytea,'hex')), numbers encoded from their text
+///   round(x,n)            → ROUND(x::numeric,n)
+///   printf('%d',x)        → format('%s',x::bigint)
 ///   strftime('%s',…)      → EXTRACT(EPOCH FROM …)::bigint
 ///   strftime('%Y-%m-%d',…)→ TO_CHAR(…, 'YYYY-MM-DD')
 ///   unixepoch(…)          → EXTRACT(EPOCH FROM …)::bigint
-///   datetime('now')       → NOW()
+///   datetime('now',…)     → NOW() …; datetime(x,…) → TO_CHAR(…, 'YYYY-MM-DD HH24:MI:SS')
+///   date(x,…)             → (…)::date::text; time(x,…) → TO_CHAR(…, 'HH24:MI:SS')
+///
+/// The time functions share one reading of SQLite's modifiers: `±N unit`,
+/// `start of day|month|year`, `weekday N`, `unixepoch`, `utc` and `localtime`
+/// (no-ops: Plex keeps UTC), `subsec`. A modifier or format the rewrite does
+/// not know leaves the call as written, logged, never half-translated.
+///
+/// The walk is sqlparser's `VisitorMut`, so a call is rewritten in every
+/// position: under IS NULL, a LIKE operand, any join's ON, ON CONFLICT DO
+/// UPDATE, LIMIT, a subquery, a CASE arm, a window clause. A rewrite works on
+/// a copy of the arguments and replaces the call only when it has a result:
+/// the old walk drained them first, so `json_extract(extra_data, ?)` reached
+/// PostgreSQL as `json_extract()` (2026-10-16 audit, items 11, 17, 18).
 use sqlparser::ast::*;
 use sqlparser::tokenizer::Span;
+use std::ops::ControlFlow;
 
 use crate::rewriter::ast_utils::{take_expr, wrap_double_colon_cast};
 
 pub fn transform(stmt: &mut Statement) {
-    transform_stmt(stmt);
+    let _ = stmt.visit(&mut Rewriter);
 }
 
-fn transform_stmt(stmt: &mut Statement) {
-    match stmt {
-        Statement::Query(q) => transform_query(q),
-        Statement::Insert(ins) => {
-            if let Some(src) = &mut ins.source {
-                transform_query(src);
-            }
-        }
-        Statement::Update(update) => {
-            for assign in &mut update.assignments {
-                transform_expr(&mut assign.value);
-            }
-            if let Some(sel) = &mut update.selection {
-                transform_expr(sel);
-            }
-        }
-        Statement::Delete(del) => {
-            if let Some(sel) = &mut del.selection {
-                transform_expr(sel);
-            }
-        }
-        _ => {}
-    }
-}
+struct Rewriter;
 
-fn transform_query(q: &mut Query) {
-    if let Some(with) = &mut q.with {
-        for cte in &mut with.cte_tables {
-            transform_query(&mut cte.query);
-        }
-    }
-    transform_set_expr(&mut q.body);
-    if let Some(ob) = &mut q.order_by {
-        if let OrderByKind::Expressions(exprs) = &mut ob.kind {
-            for oe in exprs {
-                transform_expr(&mut oe.expr);
-            }
-        }
-    }
-}
+impl VisitorMut for Rewriter {
+    type Break = ();
 
-fn transform_set_expr(se: &mut SetExpr) {
-    match se {
-        SetExpr::Select(s) => transform_select(s),
-        SetExpr::Query(q) => transform_query(q),
-        SetExpr::SetOperation { left, right, .. } => {
-            transform_set_expr(left);
-            transform_set_expr(right);
-        }
-        SetExpr::Values(vals) => {
-            for row in &mut vals.rows {
-                for e in row {
-                    transform_expr(e);
+    /// iif(typeof(X) in (...), X, ...) → X, before the children are rewritten
+    /// (the typeof inside is the pattern).
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        if let Expr::Function(func) = expr {
+            if function_name(func).as_deref() == Some("iif") {
+                if let Some(simplified) = try_simplify_typeof(func) {
+                    *expr = simplified;
                 }
             }
         }
-        _ => {}
+        ControlFlow::Continue(())
     }
-}
 
-fn transform_select(sel: &mut Select) {
-    for item in &mut sel.projection {
-        match item {
-            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                transform_expr(e);
-            }
+    /// Children first, so a call's arguments are already PostgreSQL's.
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        match expr {
+            Expr::Function(_) => rewrite_function(expr),
+            // SUBSTR(a,b,c) is parsed as Expr::Substring { shorthand: true };
+            // SUBSTRING output is forced by clearing the flag.
+            Expr::Substring { .. } => rewrite_substring(expr),
             _ => {}
         }
-    }
-    for table in &mut sel.from {
-        transform_table_with_joins(table);
+        ControlFlow::Continue(())
     }
 
-    // After FROM transformation, check if json_array_elements is present.
-    // If so, cast bare `value` references in projection to ::text.
-    if has_json_array_elements_in_from(&sel.from) {
-        for item in &mut sel.projection {
-            match item {
-                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                    cast_json_value_to_text(e);
-                }
-                _ => {}
-            }
-        }
+    fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
+        transform_table_factor(factor);
+        ControlFlow::Continue(())
     }
 
-    if let Some(sel_where) = &mut sel.selection {
-        transform_expr(sel_where);
-    }
-    match &mut sel.group_by {
-        GroupByExpr::Expressions(exprs, _) => {
-            for e in exprs {
-                transform_expr(e);
-            }
+    /// After the FROM clause's json_each became json_array_elements_text: a
+    /// bare `value` in the projection is cast to text, and a `key` resolves
+    /// to the element's 0-based index through WITH ORDINALITY.
+    fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<()> {
+        if let SetExpr::Select(select) = query.body.as_mut() {
+            resolve_json_each_columns(select);
         }
-        _ => {}
-    }
-    if let Some(having) = &mut sel.having {
-        transform_expr(having);
+        ControlFlow::Continue(())
     }
 }
 
-/// Check if any FROM table is json_array_elements (was json_each before transformation)
-fn has_json_array_elements_in_from(from: &[TableWithJoins]) -> bool {
-    for twj in from {
-        if is_json_array_elements_table(&twj.relation) {
-            return true;
-        }
-        for join in &twj.joins {
-            if is_json_array_elements_table(&join.relation) {
-                return true;
-            }
-        }
+/// The lowercase name of an unqualified call.
+fn function_name(func: &Function) -> Option<String> {
+    match func.name.0.as_slice() {
+        [ObjectNamePart::Identifier(i)] => Some(i.value.to_lowercase()),
+        _ => None,
     }
-    false
 }
+
+fn log_untranslated(what: &str, call: &Function) {
+    crate::log_info_lazy!("functions: {} left untranslated: {}", what, call);
+}
+
+// ─── json_each / json_tree in FROM ───────────────────────────────────────────
 
 fn is_json_array_elements_table(tf: &TableFactor) -> bool {
     if let TableFactor::Table { name, .. } = tf {
-        let table_name = name
-            .0
-            .last()
-            .and_then(|p| match p {
-                ObjectNamePart::Identifier(i) => Some(i.value.to_lowercase()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        return table_name == "json_array_elements";
+        return matches!(
+            object_last_ident_lower(name).as_deref(),
+            Some("json_array_elements" | "json_array_elements_text" | "jsonb_array_elements_text")
+        );
     }
     false
-}
-
-/// Cast bare `value` identifiers to ::text (for json_array_elements output)
-fn cast_json_value_to_text(expr: &mut Expr) {
-    if let Expr::Identifier(ref ident) = expr {
-        if ident.value.to_lowercase() == "value" {
-            *expr = wrap_double_colon_cast(take_expr(expr), DataType::Text);
-        }
-    }
-}
-
-fn transform_table_with_joins(t: &mut TableWithJoins) {
-    transform_table_factor(&mut t.relation);
-    for join in &mut t.joins {
-        transform_table_factor(&mut join.relation);
-        match &mut join.join_operator {
-            JoinOperator::Join(JoinConstraint::On(e))
-            | JoinOperator::Inner(JoinConstraint::On(e))
-            | JoinOperator::LeftOuter(JoinConstraint::On(e))
-            | JoinOperator::RightOuter(JoinConstraint::On(e))
-            | JoinOperator::FullOuter(JoinConstraint::On(e)) => {
-                transform_expr(e);
-            }
-            _ => {}
-        }
-    }
 }
 
 fn object_last_ident_lower(name: &ObjectName) -> Option<String> {
@@ -193,42 +127,230 @@ fn object_last_ident_lower(name: &ObjectName) -> Option<String> {
 fn rename_sqlite_json_table_fn_name_if_present(name: &mut ObjectName) -> Option<&'static str> {
     let source = object_last_ident_lower(name)?;
     let target = match source.as_str() {
-        "json_each" => "json_array_elements",
+        // json_array_elements would hand back each element as JSON, so a
+        // string keeps its quotes and `tg.tag IN (SELECT value FROM
+        // json_each(:C1))` -- Plex's collection delete -- matched nothing
+        // (2026-10-16). _text yields the element's text, as SQLite does.
+        "json_each" => "json_array_elements_text",
         "json_tree" => "jsonb_each_text",
         _ => return None,
     };
-    if let Some(last) = name.0.last_mut() {
-        if let ObjectNamePart::Identifier(i) = last {
-            i.value = target.to_string();
-            return Some(target);
-        }
+    if let Some(ObjectNamePart::Identifier(i)) = name.0.last_mut() {
+        i.value = target.to_string();
+        return Some(target);
     }
     None
 }
 
-fn cast_expr_to_json_inplace(expr: &mut Expr) {
-    *expr = wrap_double_colon_cast(take_expr(expr), DataType::JSON);
-}
-
-fn cast_unnamed_function_args_to_json(args: &mut [FunctionArg]) {
+fn cast_unnamed_function_args_to(args: &mut [FunctionArg], data_type: DataType) {
     for arg in args.iter_mut() {
         if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-            cast_expr_to_json_inplace(e);
+            *e = wrap_double_colon_cast(take_expr(e), data_type.clone());
         }
     }
 }
 
-fn cast_expr_to_jsonb_inplace(expr: &mut Expr) {
-    *expr = wrap_double_colon_cast(take_expr(expr), DataType::JSONB);
+/// `json_each(x, path)`: the array at the path, so the elements are its.
+fn json_each_path_args(args: &mut Vec<FunctionArg>) -> bool {
+    let exprs: Vec<Expr> = args
+        .iter()
+        .filter_map(|a| match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
+            _ => None,
+        })
+        .collect();
+    let [doc, path] = exprs.as_slice() else {
+        return false;
+    };
+    let doc = make_jsonb_cast(doc.clone());
+    let at_path = match get_literal_json_path(path) {
+        Some(segs) if segs.is_empty() => doc,
+        Some(segs) => make_binary(
+            doc,
+            BinaryOperator::HashArrow,
+            make_path_text_array_expr(&segs),
+        ),
+        None => make_function_call(
+            "jsonb_path_query_first",
+            vec![doc, make_jsonpath_cast(path.clone())],
+        ),
+    };
+    *args = vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(at_path))];
+    true
 }
 
-fn cast_unnamed_function_args_to_jsonb(args: &mut [FunctionArg]) {
-    for arg in args.iter_mut() {
-        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-            cast_expr_to_jsonb_inplace(e);
+fn rename_json_table_function(name: &mut ObjectName, args: &mut Vec<FunctionArg>) {
+    let Some(target) = rename_sqlite_json_table_fn_name_if_present(name) else {
+        return;
+    };
+    if target == "jsonb_each_text" {
+        cast_unnamed_function_args_to(args, DataType::JSONB);
+    } else if json_each_path_args(args) {
+        if let Some(ObjectNamePart::Identifier(i)) = name.0.last_mut() {
+            i.value = "jsonb_array_elements_text".to_string();
+        }
+    } else {
+        cast_unnamed_function_args_to(args, DataType::JSON);
+    }
+}
+
+fn transform_table_factor(f: &mut TableFactor) {
+    match f {
+        TableFactor::Table {
+            name, args, alias, ..
+        } => {
+            if let Some(TableFunctionArgs { args, .. }) = args {
+                let was_json_each = object_last_ident_lower(name).as_deref() == Some("json_each");
+                rename_json_table_function(name, args);
+                // `json_each.value` names the function's table in SQLite;
+                // the alias keeps that name on PostgreSQL's.
+                if was_json_each {
+                    let table_alias = alias.get_or_insert_with(|| TableAlias {
+                        explicit: true,
+                        name: Ident::new("json_each"),
+                        columns: vec![],
+                    });
+                    // A table alias alone leaves PostgreSQL's output column
+                    // named json_array_elements_text. SQLite callers use value,
+                    // including collection DELETE subqueries without a key.
+                    if table_alias.columns.is_empty() {
+                        table_alias.columns = vec![TableAliasColumnDef::from_name("value")];
+                    }
+                }
+            }
+        }
+        TableFactor::Function { name, args, .. } => {
+            rename_json_table_function(name, args);
+        }
+        TableFactor::TableFunction { expr, .. } => {
+            if let Expr::Function(func) = expr {
+                if let FunctionArguments::List(arg_list) = &mut func.args {
+                    rename_json_table_function(&mut func.name, &mut arg_list.args);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A `key` reference of a json_each table: SQLite's 0-based index of the
+/// element, which WITH ORDINALITY gives 1-based.
+struct KeyShift<'a> {
+    alias: &'a str,
+}
+
+impl KeyShift<'_> {
+    fn refers_to_key(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(i) => i.value.eq_ignore_ascii_case("key"),
+            Expr::CompoundIdentifier(parts) => {
+                parts.len() == 2
+                    && parts[0].value.eq_ignore_ascii_case(self.alias)
+                    && parts[1].value.eq_ignore_ascii_case("key")
+            }
+            _ => false,
         }
     }
 }
+
+impl VisitorMut for KeyShift<'_> {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        if self.refers_to_key(expr) {
+            let key = take_expr(expr);
+            *expr = Expr::Nested(Box::new(Expr::BinaryOp {
+                left: Box::new(key),
+                op: BinaryOperator::Minus,
+                right: Box::new(make_number_literal("1")),
+            }));
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+fn resolve_json_each_columns(select: &mut Select) {
+    let Some(alias) = select.from.iter().find_map(|twj| {
+        std::iter::once(&twj.relation)
+            .chain(twj.joins.iter().map(|j| &j.relation))
+            .find(|tf| is_json_array_elements_table(tf))
+            .and_then(|tf| match tf {
+                TableFactor::Table { alias, .. } => {
+                    Some(alias.as_ref().map(|a| a.name.value.clone()))
+                }
+                _ => None,
+            })
+    }) else {
+        return;
+    };
+    for item in &mut select.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+            cast_json_value_to_text(e);
+        }
+    }
+
+    let Some(alias) = alias else {
+        return;
+    };
+    let shift = KeyShift { alias: &alias };
+    let mut refers = false;
+    let _ = visit_expressions(&*select, |e| {
+        if shift.refers_to_key(e) {
+            refers = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    if !refers {
+        return;
+    }
+    for item in &mut select.projection {
+        if let SelectItem::UnnamedExpr(e) = item {
+            if shift.refers_to_key(e) {
+                *item = SelectItem::ExprWithAlias {
+                    expr: take_expr(e),
+                    alias: Ident::new("key"),
+                };
+            }
+        }
+    }
+    let mut shift = KeyShift { alias: &alias };
+    let _ = select.visit(&mut shift);
+    for twj in &mut select.from {
+        for tf in
+            std::iter::once(&mut twj.relation).chain(twj.joins.iter_mut().map(|j| &mut j.relation))
+        {
+            if !is_json_array_elements_table(tf) {
+                continue;
+            }
+            if let TableFactor::Table {
+                with_ordinality,
+                alias: Some(table_alias),
+                ..
+            } = tf
+            {
+                if table_alias.name.value.eq_ignore_ascii_case(&alias) {
+                    *with_ordinality = true;
+                    table_alias.columns = vec![
+                        TableAliasColumnDef::from_name("value"),
+                        TableAliasColumnDef::from_name("key"),
+                    ];
+                }
+            }
+        }
+    }
+}
+
+/// Cast bare `value` identifiers to ::text (for json_array_elements output)
+fn cast_json_value_to_text(expr: &mut Expr) {
+    if let Expr::Identifier(ref ident) = expr {
+        if ident.value.to_lowercase() == "value" {
+            *expr = wrap_double_colon_cast(take_expr(expr), DataType::Text);
+        }
+    }
+}
+
+// ─── Expression builders ─────────────────────────────────────────────────────
 
 fn make_function_call(name: &str, args: Vec<Expr>) -> Expr {
     Expr::Function(Function {
@@ -250,12 +372,12 @@ fn make_function_call(name: &str, args: Vec<Expr>) -> Expr {
     })
 }
 
-fn make_jsonb_cast(expr: Expr) -> Expr {
+fn make_custom_cast(expr: Expr, type_name: &str) -> Expr {
     Expr::Cast {
         kind: CastKind::DoubleColon,
         expr: Box::new(expr),
         data_type: DataType::Custom(
-            ObjectName(vec![ObjectNamePart::Identifier(Ident::new("jsonb"))]),
+            ObjectName(vec![ObjectNamePart::Identifier(Ident::new(type_name))]),
             vec![],
         ),
         array: false,
@@ -263,7 +385,21 @@ fn make_jsonb_cast(expr: Expr) -> Expr {
     }
 }
 
+fn make_jsonb_cast(expr: Expr) -> Expr {
+    make_custom_cast(expr, "jsonb")
+}
+
+fn make_jsonpath_cast(expr: Expr) -> Expr {
+    make_custom_cast(expr, "jsonpath")
+}
+
 fn make_to_jsonb(expr: Expr) -> Expr {
+    // to_jsonb(anyelement) cannot take an untyped literal or parameter.
+    let expr = if is_placeholder(&expr) || get_literal_single_quoted_string(&expr).is_some() {
+        wrap_double_colon_cast(expr, DataType::Text)
+    } else {
+        expr
+    };
     make_function_call("to_jsonb", vec![expr])
 }
 
@@ -294,6 +430,45 @@ fn make_case_when(condition: Expr, then_expr: Expr, else_expr: Expr) -> Expr {
     }
 }
 
+fn make_binary(left: Expr, op: BinaryOperator, right: Expr) -> Expr {
+    Expr::BinaryOp {
+        left: Box::new(left),
+        op,
+        right: Box::new(right),
+    }
+}
+
+fn is_placeholder(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Value(ValueWithSpan {
+            value: Value::Placeholder(_),
+            ..
+        })
+    )
+}
+
+/// A number, as `3` or `-3`.
+fn numeric_literal(expr: &Expr) -> Option<(bool, String)> {
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(n, _),
+            ..
+        }) => Some((n.starts_with('-'), n.trim_start_matches('-').to_string())),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => numeric_literal(expr).map(|(neg, n)| (!neg, n)),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => numeric_literal(expr),
+        _ => None,
+    }
+}
+
+// ─── JSON paths ──────────────────────────────────────────────────────────────
+
 fn is_integer_path_segment(seg: &str) -> bool {
     seg.parse::<i64>().is_ok()
 }
@@ -316,16 +491,6 @@ fn jsonpath_from_segments(path_segments: &[String]) -> String {
         }
     }
     out
-}
-
-fn make_jsonb_path_exists(doc: Expr, path_segments: &[String]) -> Expr {
-    make_function_call(
-        "jsonb_path_exists",
-        vec![
-            doc,
-            make_string_literal(&jsonpath_from_segments(path_segments)),
-        ],
-    )
 }
 
 /// Parse a limited SQLite JSON path syntax into segments:
@@ -456,14 +621,7 @@ fn parse_json_path_segments(path: &str) -> Option<Vec<String>> {
 }
 
 fn get_literal_json_path(expr: &Expr) -> Option<Vec<String>> {
-    if let Expr::Value(ValueWithSpan {
-        value: Value::SingleQuotedString(path),
-        ..
-    }) = expr
-    {
-        return parse_json_path_segments(path);
-    }
-    None
+    parse_json_path_segments(&get_literal_single_quoted_string(expr)?)
 }
 
 fn get_literal_single_quoted_string(expr: &Expr) -> Option<String> {
@@ -485,82 +643,90 @@ fn make_path_text_array_expr(path_segments: &[String]) -> Expr {
     )
 }
 
-fn rewrite_json_extract_call(mut args: Vec<Expr>) -> Option<Expr> {
-    if args.len() < 2 {
-        return None;
+/// The text[] of a path known only at run time (a bound `$.a.b`):
+/// string_to_array(ltrim(path, '$.'), '.').
+fn make_bound_path_text_array_expr(path: Expr) -> Expr {
+    make_function_call(
+        "string_to_array",
+        vec![
+            make_function_call("ltrim", vec![path, make_string_literal("$.")]),
+            make_string_literal("."),
+        ],
+    )
+}
+
+/// `jsonb_path_exists(doc, path)` for a literal or a bound path.
+fn make_jsonb_path_exists(doc: Expr, path: &Expr) -> Expr {
+    let path_expr = match get_literal_json_path(path) {
+        Some(segs) => make_string_literal(&jsonpath_from_segments(&segs)),
+        None => make_jsonpath_cast(path.clone()),
+    };
+    make_function_call("jsonb_path_exists", vec![doc, path_expr])
+}
+
+/// The JSON at a path: `jsonb_extract_path(doc, 'a', 'b')` for a literal
+/// path, `jsonb_path_query_first(doc, path::jsonpath)` otherwise.
+fn make_json_at_path(doc: Expr, path: &Expr) -> Expr {
+    if let Some(segs) = get_literal_json_path(path) {
+        let mut p = vec![doc];
+        p.extend(segs.iter().map(|s| make_string_literal(s)));
+        return make_function_call("jsonb_extract_path", p);
     }
-    let doc = make_jsonb_cast(args.remove(0));
-    let path = args.remove(0);
-    if let Some(segs) = get_literal_json_path(&path) {
+    let path = match get_literal_single_quoted_string(path) {
+        Some(s) => make_string_literal(&s),
+        None => make_jsonpath_cast(path.clone()),
+    };
+    make_function_call("jsonb_path_query_first", vec![doc, path])
+}
+
+fn rewrite_json_extract_call(args: &[Expr]) -> Option<Expr> {
+    let [doc, path, ..] = args else {
+        return None;
+    };
+    let doc = make_jsonb_cast(doc.clone());
+    if let Some(segs) = get_literal_json_path(path) {
         if segs.is_empty() {
             return Some(wrap_double_colon_cast(doc, DataType::Text));
         }
-
         let mut fn_args = vec![doc];
         fn_args.extend(segs.iter().map(|s| make_string_literal(s)));
         return Some(make_function_call("jsonb_extract_path_text", fn_args));
     }
-
-    // Fallback for richer SQLite JSON paths (wildcards/filters/etc.):
-    // use PostgreSQL jsonpath execution and cast to text.
-    let path_str = get_literal_single_quoted_string(&path)?;
-    let jsonpath_call = make_function_call(
-        "jsonb_path_query_first",
-        vec![doc, make_string_literal(&path_str)],
-    );
-    Some(wrap_double_colon_cast(jsonpath_call, DataType::Text))
-}
-
-fn rewrite_json_type_call(mut args: Vec<Expr>) -> Option<Expr> {
-    if args.is_empty() {
-        return None;
-    }
-    let doc = make_jsonb_cast(args.remove(0));
-    if args.is_empty() {
-        return Some(make_function_call("jsonb_typeof", vec![doc]));
-    }
-    if let Some(segs) = get_literal_json_path(&args[0]) {
-        let mut p = vec![doc];
-        p.extend(segs.iter().map(|s| make_string_literal(s)));
-        return Some(make_function_call(
-            "jsonb_typeof",
-            vec![make_function_call("jsonb_extract_path", p)],
-        ));
-    }
-    let path_str = get_literal_single_quoted_string(&args[0])?;
-    Some(make_function_call(
-        "jsonb_typeof",
-        vec![make_function_call(
-            "jsonb_path_query_first",
-            vec![doc, make_string_literal(&path_str)],
-        )],
+    // A richer SQLite path (wildcards, filters) or one bound at run time:
+    // PostgreSQL's jsonpath, then the text of the value (`#>> '{}'`, so a
+    // string comes back without its quotes, as SQLite's json_extract does).
+    // The `::jsonb` on the (already jsonb) value is the mark query.rs's
+    // guard of the JSON operators reads: without it the operand is wrapped
+    // in a json_valid(...) CASE over its text.
+    Some(make_binary(
+        make_jsonb_cast(make_json_at_path(doc, path)),
+        BinaryOperator::HashLongArrow,
+        make_string_literal("{}"),
     ))
 }
 
-fn rewrite_json_array_length_call(mut args: Vec<Expr>) -> Option<Expr> {
-    if args.is_empty() {
+fn rewrite_json_type_call(args: &[Expr]) -> Option<Expr> {
+    let [doc, rest @ ..] = args else {
         return None;
-    }
-    let doc = make_jsonb_cast(args.remove(0));
-    if args.is_empty() {
-        return Some(make_function_call("jsonb_array_length", vec![doc]));
-    }
-    if let Some(segs) = get_literal_json_path(&args[0]) {
-        let mut p = vec![doc];
-        p.extend(segs.iter().map(|s| make_string_literal(s)));
-        return Some(make_function_call(
-            "jsonb_array_length",
-            vec![make_function_call("jsonb_extract_path", p)],
-        ));
-    }
-    let path_str = get_literal_single_quoted_string(&args[0])?;
-    Some(make_function_call(
-        "jsonb_array_length",
-        vec![make_function_call(
-            "jsonb_path_query_first",
-            vec![doc, make_string_literal(&path_str)],
-        )],
-    ))
+    };
+    let doc = make_jsonb_cast(doc.clone());
+    let at = match rest.first() {
+        None => doc,
+        Some(path) => make_json_at_path(doc, path),
+    };
+    Some(make_function_call("jsonb_typeof", vec![at]))
+}
+
+fn rewrite_json_array_length_call(args: &[Expr]) -> Option<Expr> {
+    let [doc, rest @ ..] = args else {
+        return None;
+    };
+    let doc = make_jsonb_cast(doc.clone());
+    let at = match rest.first() {
+        None => doc,
+        Some(path) => make_json_at_path(doc, path),
+    };
+    Some(make_function_call("jsonb_array_length", vec![at]))
 }
 
 enum JsonSetMode {
@@ -569,109 +735,120 @@ enum JsonSetMode {
     Replace,
 }
 
-fn rewrite_json_set_like_call(args: Vec<Expr>, mode: JsonSetMode) -> Option<Expr> {
-    if args.len() < 3 {
+/// A path's text[] for jsonb_set: from a literal, or from the bound value.
+fn path_text_array(path: &Expr) -> Option<Expr> {
+    if let Some(segs) = get_literal_json_path(path) {
+        return (!segs.is_empty()).then(|| make_path_text_array_expr(&segs));
+    }
+    if get_literal_single_quoted_string(path).is_some() {
+        // A literal the segment parser refused (a wildcard): not a jsonb_set path.
         return None;
     }
-    let mut iter = args.into_iter();
-    let first = iter.next()?;
-    let mut current = make_jsonb_cast(first);
-    let rest: Vec<Expr> = iter.collect();
-    let mut i = 0usize;
-    let mut rewrote_any = false;
-    while i + 1 < rest.len() {
-        let path_expr = &rest[i];
-        let value_expr = rest[i + 1].clone();
-        if let Some(path_segments) = get_literal_json_path(path_expr) {
-            let should_create = matches!(mode, JsonSetMode::Set | JsonSetMode::Insert);
-            let rewritten = make_function_call(
-                "jsonb_set",
-                vec![
-                    current.clone(),
-                    make_path_text_array_expr(&path_segments),
-                    make_to_jsonb(value_expr),
-                    Expr::Value(ValueWithSpan {
-                        value: Value::Boolean(should_create),
-                        span: Span::empty(),
-                    }),
-                ],
-            );
-            current = match mode {
-                JsonSetMode::Set => rewritten,
-                JsonSetMode::Insert => make_case_when(
-                    make_jsonb_path_exists(current.clone(), &path_segments),
-                    current,
-                    rewritten,
-                ),
-                JsonSetMode::Replace => make_case_when(
-                    make_jsonb_path_exists(current.clone(), &path_segments),
-                    rewritten,
-                    current,
-                ),
-            };
-            rewrote_any = true;
-        }
-        i += 2;
-    }
-    if rewrote_any {
-        Some(current)
-    } else {
-        None
-    }
+    Some(make_bound_path_text_array_expr(path.clone()))
 }
 
-fn rewrite_json_remove_call(args: Vec<Expr>) -> Option<Expr> {
-    if args.len() < 2 {
+fn rewrite_json_set_like_call(args: &[Expr], mode: JsonSetMode) -> Option<Expr> {
+    let [doc, rest @ ..] = args else {
+        return None;
+    };
+    if rest.len() < 2 {
         return None;
     }
-    let mut iter = args.into_iter();
-    let first = iter.next()?;
-    let mut current = make_jsonb_cast(first);
-    let mut rewrote_any = false;
-    for path_expr in iter {
-        if let Some(path_segments) = get_literal_json_path(&path_expr) {
-            if path_segments.is_empty() {
+    let mut current = make_jsonb_cast(doc.clone());
+    for pair in rest.chunks(2) {
+        let [path_expr, value_expr] = pair else {
+            break;
+        };
+        let path_array = path_text_array(path_expr)?;
+        let should_create = matches!(mode, JsonSetMode::Set | JsonSetMode::Insert);
+        let rewritten = make_function_call(
+            "jsonb_set",
+            vec![
+                current.clone(),
+                path_array,
+                make_to_jsonb(value_expr.clone()),
+                Expr::Value(ValueWithSpan {
+                    value: Value::Boolean(should_create),
+                    span: Span::empty(),
+                }),
+            ],
+        );
+        current = match mode {
+            JsonSetMode::Set => rewritten,
+            JsonSetMode::Insert => make_case_when(
+                make_jsonb_path_exists(current.clone(), path_expr),
+                current,
+                rewritten,
+            ),
+            JsonSetMode::Replace => make_case_when(
+                make_jsonb_path_exists(current.clone(), path_expr),
+                rewritten,
+                current,
+            ),
+        };
+    }
+    Some(current)
+}
+
+fn rewrite_json_remove_call(args: &[Expr]) -> Option<Expr> {
+    let [doc, paths @ ..] = args else {
+        return None;
+    };
+    if paths.is_empty() {
+        return None;
+    }
+    let mut current = make_jsonb_cast(doc.clone());
+    for path_expr in paths {
+        let Some(path_array) = path_text_array(path_expr) else {
+            if get_literal_json_path(path_expr).is_some_and(|segs| segs.is_empty()) {
                 continue;
             }
-            current = Expr::BinaryOp {
-                left: Box::new(current),
-                op: BinaryOperator::PGCustomBinaryOperator(vec!["#-".to_string()]),
-                right: Box::new(make_path_text_array_expr(&path_segments)),
-            };
-            rewrote_any = true;
-        }
+            return None;
+        };
+        current = make_binary(current, BinaryOperator::HashMinus, path_array);
     }
-    if rewrote_any {
-        Some(current)
-    } else {
-        None
-    }
+    Some(current)
 }
 
-fn rewrite_json_patch_call(args: Vec<Expr>) -> Option<Expr> {
-    if args.len() != 2 {
+fn rewrite_json_patch_call(args: &[Expr]) -> Option<Expr> {
+    let [left, right] = args else {
         return None;
-    }
-    let left = make_jsonb_cast(args[0].clone());
-    let right = make_jsonb_cast(args[1].clone());
-    Some(make_function_call("jsonb_mergepatch", vec![left, right]))
-}
-
-fn rewrite_group_concat_call(args: Vec<Expr>) -> Option<Expr> {
-    if args.is_empty() {
-        return None;
-    }
-    let value_expr = wrap_double_colon_cast(args[0].clone(), DataType::Text);
-    let sep_expr = if args.len() > 1 {
-        args[1].clone()
-    } else {
-        make_string_literal(",")
     };
-    Some(make_function_call("string_agg", vec![value_expr, sep_expr]))
+    Some(make_function_call(
+        "jsonb_mergepatch",
+        vec![
+            make_jsonb_cast(left.clone()),
+            make_jsonb_cast(right.clone()),
+        ],
+    ))
 }
 
-fn rewrite_julianday_call(args: Vec<Expr>) -> Option<Expr> {
-    let source = args.into_iter().next().unwrap_or_else(make_now_call);
+// ─── Other builtins ──────────────────────────────────────────────────────────
+
+/// group_concat(x[, sep]) → string_agg(x::text, sep), in place, so DISTINCT,
+/// ORDER BY and FILTER stay where they are (they were lost before).
+fn rewrite_group_concat(func: &mut Function) {
+    let FunctionArguments::List(list) = &mut func.args else {
+        return;
+    };
+    let mut unnamed = list.args.iter_mut().filter_map(|a| match a {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+        _ => None,
+    });
+    let Some(value) = unnamed.next() else {
+        return;
+    };
+    *value = wrap_double_colon_cast(take_expr(value), DataType::Text);
+    if unnamed.next().is_none() {
+        list.args.push(FunctionArg::Unnamed(FunctionArgExpr::Expr(
+            make_string_literal(","),
+        )));
+    }
+    rename_function(func, "string_agg");
+}
+
+fn rewrite_julianday_call(args: &[Expr]) -> Option<Expr> {
+    let source = args.first().cloned().unwrap_or_else(make_now_call);
     let source = if is_now_literal(&source) {
         make_now_call()
     } else {
@@ -689,20 +866,20 @@ fn rewrite_julianday_call(args: Vec<Expr>) -> Option<Expr> {
         array: false,
         format: None,
     };
-    let days = Expr::BinaryOp {
-        left: Box::new(epoch_double),
-        op: BinaryOperator::Divide,
-        right: Box::new(make_number_literal("86400.0")),
-    };
-    Some(Expr::BinaryOp {
-        left: Box::new(days),
-        op: BinaryOperator::Plus,
-        right: Box::new(make_number_literal("2440587.5")),
-    })
+    let days = make_binary(
+        epoch_double,
+        BinaryOperator::Divide,
+        make_number_literal("86400.0"),
+    );
+    Some(make_binary(
+        days,
+        BinaryOperator::Plus,
+        make_number_literal("2440587.5"),
+    ))
 }
 
-fn rewrite_total_call(args: Vec<Expr>) -> Option<Expr> {
-    let value = args.into_iter().next()?;
+fn rewrite_total_call(args: &[Expr]) -> Option<Expr> {
+    let value = args.first()?.clone();
     let sum_expr = make_function_call("SUM", vec![value]);
     Some(make_function_call(
         "COALESCE",
@@ -710,397 +887,652 @@ fn rewrite_total_call(args: Vec<Expr>) -> Option<Expr> {
     ))
 }
 
-fn transform_table_factor(f: &mut TableFactor) {
-    match f {
-        TableFactor::Derived { subquery, .. } => {
-            transform_query(subquery);
+/// hex(x): upper-case byte encoding; SQLite first renders numbers as text.
+fn rewrite_hex_call(args: &[Expr]) -> Option<Expr> {
+    let [value] = args else {
+        return None;
+    };
+    let bytes = if numeric_literal(value).is_some() {
+        wrap_double_colon_cast(value.clone(), DataType::Text)
+    } else {
+        value.clone()
+    };
+    let hex = make_function_call(
+        "ENCODE",
+        vec![wrap_double_colon_cast(bytes, DataType::Bytea), make_string_literal("hex")],
+    );
+    Some(make_function_call("UPPER", vec![hex]))
+}
+
+/// round(x, n): PostgreSQL rounds a double only to whole numbers.
+fn rewrite_round_call(args: &[Expr]) -> Option<Expr> {
+    let [value, digits] = args else {
+        return None;
+    };
+    Some(make_function_call(
+        "ROUND",
+        vec![
+            wrap_double_colon_cast(value.clone(), DataType::Numeric(ExactNumberInfo::None)),
+            digits.clone(),
+        ],
+    ))
+}
+
+/// printf(fmt, ...) → format(fmt, ...): PostgreSQL's format knows %s, %I
+/// and %L, so every other conversion becomes %s over a cast or a rendering
+/// of its argument. A conversion that has no rendering leaves the call.
+fn rewrite_printf_call(args: &[Expr]) -> Option<Expr> {
+    let [fmt, values @ ..] = args else {
+        return None;
+    };
+    let fmt = get_literal_single_quoted_string(fmt)?;
+    let mut out = String::new();
+    let mut new_args = Vec::new();
+    let mut next_value = values.iter();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
         }
-        TableFactor::Table { name, args, .. } => {
-            // SQLite JSON SRFs in FROM clause:
-            // - json_each(x) -> json_array_elements(x::json)
-            // - json_tree(x) -> jsonb_each_text(x::jsonb)
-            if let Some(target) = rename_sqlite_json_table_fn_name_if_present(name) {
-                if let Some(TableFunctionArgs { args, .. }) = args {
-                    if target == "jsonb_each_text" {
-                        cast_unnamed_function_args_to_jsonb(args);
-                    } else {
-                        cast_unnamed_function_args_to_json(args);
-                    }
-                }
+        if chars.peek() == Some(&'%') {
+            chars.next();
+            out.push_str("%%");
+            continue;
+        }
+        let mut flags = String::new();
+        while let Some(&f) = chars.peek() {
+            if "-+ 0#".contains(f) {
+                flags.push(f);
+                chars.next();
+            } else {
+                break;
             }
         }
-        TableFactor::Function { name, args, .. } => {
-            if let Some(target) = rename_sqlite_json_table_fn_name_if_present(name) {
-                if target == "jsonb_each_text" {
-                    cast_unnamed_function_args_to_jsonb(args);
+        let mut width = String::new();
+        while let Some(&d) = chars.peek() {
+            if d.is_ascii_digit() {
+                width.push(d);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let mut precision: Option<String> = None;
+        if chars.peek() == Some(&'.') {
+            chars.next();
+            let mut p = String::new();
+            while let Some(&d) = chars.peek() {
+                if d.is_ascii_digit() {
+                    p.push(d);
+                    chars.next();
                 } else {
-                    cast_unnamed_function_args_to_json(args);
+                    break;
                 }
             }
+            precision = Some(p);
         }
-        TableFactor::TableFunction { expr, .. } => {
-            if let Expr::Function(func) = expr {
-                if let Some(target) = rename_sqlite_json_table_fn_name_if_present(&mut func.name) {
-                    if let FunctionArguments::List(arg_list) = &mut func.args {
-                        if target == "jsonb_each_text" {
-                            cast_unnamed_function_args_to_jsonb(&mut arg_list.args);
-                        } else {
-                            cast_unnamed_function_args_to_json(&mut arg_list.args);
-                        }
-                    }
+        while matches!(chars.peek(), Some('l') | Some('h')) {
+            chars.next();
+        }
+        let conversion = chars.next()?;
+        let value = next_value.next()?.clone();
+        // format supports the `-` flag and a width, nothing else.
+        if flags.chars().any(|f| f != '-') {
+            return None;
+        }
+        let rendered = match conversion {
+            's' if precision.is_none() => value,
+            'd' | 'i' | 'u' if precision.is_none() => {
+                wrap_double_colon_cast(value, DataType::BigInt(None))
+            }
+            'f' => {
+                let decimals: usize = match precision.as_deref() {
+                    None => 6,
+                    Some(p) => p.parse().ok()?,
+                };
+                let mut pattern = String::from("FM999999999999999990");
+                if decimals > 0 {
+                    pattern.push('.');
+                    pattern.extend(std::iter::repeat_n('0', decimals));
+                }
+                make_function_call(
+                    "TO_CHAR",
+                    vec![
+                        wrap_double_colon_cast(value, DataType::Numeric(ExactNumberInfo::None)),
+                        make_string_literal(&pattern),
+                    ],
+                )
+            }
+            'x' | 'X' if precision.is_none() => {
+                let hex = make_function_call(
+                    "TO_HEX",
+                    vec![wrap_double_colon_cast(value, DataType::BigInt(None))],
+                );
+                if conversion == 'X' {
+                    make_function_call("UPPER", vec![hex])
+                } else {
+                    hex
                 }
             }
-        }
-        _ => {}
+            'c' if precision.is_none() => make_function_call(
+                "CHR",
+                vec![wrap_double_colon_cast(value, DataType::Int(None))],
+            ),
+            _ => return None,
+        };
+        out.push('%');
+        out.push_str(&flags);
+        out.push_str(&width);
+        out.push('s');
+        new_args.push(rendered);
+    }
+    let mut call_args = vec![make_string_literal(&out)];
+    call_args.extend(new_args);
+    Some(make_function_call("format", call_args))
+}
+
+/// SUBSTR(x, -n[, m]): SQLite counts a negative start from the end.
+fn rewrite_substring(expr: &mut Expr) {
+    let Expr::Substring {
+        expr: inner,
+        substring_from,
+        substring_for,
+        shorthand,
+        ..
+    } = expr
+    else {
+        return;
+    };
+    if let Some((true, n)) = substring_from.as_deref().and_then(numeric_literal) {
+        let from_end = make_function_call("RIGHT", vec![take_expr(inner), make_number_literal(&n)]);
+        *expr = match substring_for.take() {
+            Some(len) => make_function_call("LEFT", vec![from_end, *len]),
+            None => from_end,
+        };
+        return;
+    }
+    if *shorthand {
+        *shorthand = false; // force SUBSTRING output
     }
 }
 
-/// Recursively transform an expression in place, rewriting SQLite function
-/// calls to their PostgreSQL equivalents.
-fn transform_expr(expr: &mut Expr) {
-    match expr {
-        Expr::Function(ref mut func) => {
-            // Get the lowercase function name for matching
-            let fn_name = func
-                .name
-                .0
-                .first()
-                .and_then(|p| match p {
-                    ObjectNamePart::Identifier(i) => Some(i.value.to_lowercase()),
-                    _ => None,
-                })
-                .unwrap_or_default();
+// ─── Time functions ──────────────────────────────────────────────────────────
 
-            // simplify_typeof_fixup: iif(typeof(X) in ('integer','real'), X, ...) → X
-            // Must run BEFORE iif→CASE conversion
-            if fn_name == "iif" {
-                if let Some(simplified) = try_simplify_typeof(func) {
-                    *expr = simplified;
-                    transform_expr(expr);
-                    return;
+/// What SQLite's time value is, which decides how it becomes a timestamp.
+enum TimeSource {
+    /// `'now'`
+    Now,
+    /// A date or time written out, `'2024-01-01 10:00:00'`.
+    Text(String),
+    /// Seconds since the epoch: Plex's columns, a number, a bound value,
+    /// anything the `'unixepoch'` modifier names.
+    Epoch(Box<Expr>),
+}
+
+/// A timestamp built from SQLite's time value and modifiers.
+struct TimeValue {
+    ts: Expr,
+    /// Whether `ts` carries a zone (NOW() and to_timestamp do; a literal
+    /// does not), so text output is formatted in UTC as SQLite's is.
+    zoned: bool,
+    /// `'subsec'`: text output keeps the fraction of a second.
+    subsec: bool,
+}
+
+impl TimeValue {
+    /// The timestamp as UTC wall-clock time, for formatting.
+    fn utc(&self) -> Expr {
+        if !self.zoned {
+            return self.ts.clone();
+        }
+        Expr::AtTimeZone {
+            timestamp: Box::new(self.ts.clone()),
+            time_zone: Box::new(make_string_literal("UTC")),
+        }
+    }
+}
+
+/// None when a modifier is not understood: the call is left as written.
+fn time_value(args: &[Expr]) -> Option<TimeValue> {
+    let (source, modifiers) = match args.split_first() {
+        Some((first, rest)) => (first.clone(), rest),
+        None => (make_string_literal("now"), &[][..]),
+    };
+    let modifiers: Option<Vec<String>> = modifiers
+        .iter()
+        .map(|m| get_literal_single_quoted_string(m).map(|s| s.trim().to_lowercase()))
+        .collect();
+    let modifiers = modifiers?;
+    let unixepoch = modifiers.iter().any(|m| m == "unixepoch");
+
+    let source = if is_now_literal(&source) {
+        TimeSource::Now
+    } else if unixepoch {
+        TimeSource::Epoch(Box::new(source))
+    } else if let Some(text) = get_literal_single_quoted_string(&source) {
+        TimeSource::Text(text)
+    } else {
+        TimeSource::Epoch(Box::new(source))
+    };
+    let (mut ts, zoned) = match source {
+        TimeSource::Now => (make_now_call(), true),
+        TimeSource::Text(text) => (
+            wrap_double_colon_cast(
+                make_string_literal(&text),
+                DataType::Timestamp(None, TimezoneInfo::None),
+            ),
+            false,
+        ),
+        TimeSource::Epoch(e) => (make_to_timestamp(*e), true),
+    };
+    let mut subsec = false;
+    for modifier in &modifiers {
+        match modifier.as_str() {
+            "unixepoch" | "utc" | "localtime" => {}
+            "subsec" | "subsecond" => subsec = true,
+            "start of day" => ts = make_date_trunc("day", ts),
+            "start of month" => ts = make_date_trunc("month", ts),
+            "start of year" => ts = make_date_trunc("year", ts),
+            _ => {
+                if let Some(weekday) = modifier.strip_prefix("weekday ") {
+                    let n: u8 = weekday.trim().parse().ok().filter(|n| *n <= 6)?;
+                    ts = make_weekday_advance(ts, n);
+                } else {
+                    ts = apply_interval(ts, modifier)?;
                 }
             }
+        }
+    }
+    Some(TimeValue { ts, zoned, subsec })
+}
 
-            // First recurse into the args
+fn make_date_trunc(field: &str, ts: Expr) -> Expr {
+    make_function_call("date_trunc", vec![make_string_literal(field), ts])
+}
+
+/// `weekday N`: forward to the next day whose day of week is N (Sunday 0),
+/// the same day when it already is:
+/// ts + ((N - EXTRACT(DOW FROM ts)::int + 7) % 7) * INTERVAL '1 day'.
+fn make_weekday_advance(ts: Expr, n: u8) -> Expr {
+    let dow = Expr::Cast {
+        kind: CastKind::DoubleColon,
+        expr: Box::new(Expr::Extract {
+            field: DateTimeField::Dow,
+            syntax: ExtractSyntax::From,
+            expr: Box::new(ts.clone()),
+        }),
+        data_type: DataType::Int(None),
+        array: false,
+        format: None,
+    };
+    let ahead = make_binary(
+        make_binary(
+            make_number_literal(&n.to_string()),
+            BinaryOperator::Minus,
+            dow,
+        ),
+        BinaryOperator::Plus,
+        make_number_literal("7"),
+    );
+    let days = make_binary(
+        Expr::Nested(Box::new(ahead)),
+        BinaryOperator::Modulo,
+        make_number_literal("7"),
+    );
+    make_binary(
+        ts,
+        BinaryOperator::Plus,
+        make_binary(
+            Expr::Nested(Box::new(days)),
+            BinaryOperator::Multiply,
+            make_interval("1 day"),
+        ),
+    )
+}
+
+fn make_interval(value: &str) -> Expr {
+    Expr::Interval(Interval {
+        value: Box::new(make_string_literal(value)),
+        leading_field: None,
+        leading_precision: None,
+        last_field: None,
+        fractional_seconds_precision: None,
+    })
+}
+
+/// SQLite's `[+-]NNN units` modifier as `source ± INTERVAL 'NNN units'`.
+/// None for any other word: `INTERVAL 'utc'` is an error, not a translation.
+fn apply_interval(source: Expr, modifier: &str) -> Option<Expr> {
+    let (op, rest) = if let Some(rest) = modifier.strip_prefix('-') {
+        (BinaryOperator::Minus, rest)
+    } else if let Some(rest) = modifier.strip_prefix('+') {
+        (BinaryOperator::Plus, rest)
+    } else {
+        (BinaryOperator::Plus, modifier)
+    };
+    let (amount, unit) = rest.trim().split_once(' ')?;
+    if amount.is_empty()
+        || !amount.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        || amount.parse::<f64>().is_err()
+    {
+        return None;
+    }
+    let unit = unit.trim();
+    if !matches!(
+        unit,
+        "day"
+            | "days"
+            | "hour"
+            | "hours"
+            | "minute"
+            | "minutes"
+            | "second"
+            | "seconds"
+            | "month"
+            | "months"
+            | "year"
+            | "years"
+    ) {
+        return None;
+    }
+    Some(make_binary(
+        source,
+        op,
+        make_interval(&format!("{amount} {unit}")),
+    ))
+}
+
+fn is_now_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) if s.to_lowercase() == "now")
+}
+
+fn make_now_call() -> Expr {
+    make_function_call("NOW", vec![])
+}
+
+/// Build a TO_TIMESTAMP(expr) function call.
+fn make_to_timestamp(source: Expr) -> Expr {
+    make_function_call("TO_TIMESTAMP", vec![source])
+}
+
+/// Build a TO_CHAR(expr, 'fmt') function call.
+fn make_to_char(source: Expr, pg_fmt: &str) -> Expr {
+    make_function_call("TO_CHAR", vec![source, make_string_literal(pg_fmt)])
+}
+
+fn make_epoch(ts: Expr, whole: bool) -> Expr {
+    let epoch = Expr::Extract {
+        field: DateTimeField::Epoch,
+        syntax: ExtractSyntax::From,
+        expr: Box::new(ts),
+    };
+    if whole {
+        wrap_double_colon_cast(epoch, DataType::BigInt(None))
+    } else {
+        epoch
+    }
+}
+
+/// A piece of a strftime format: TO_CHAR patterns, or an expression TO_CHAR
+/// has no pattern for (`%w`, `%u`).
+enum FormatPiece {
+    Pattern(String),
+    Weekday(DateTimeField),
+}
+
+/// Translate a SQLite strftime format into TO_CHAR pieces. None for a
+/// conversion TO_CHAR cannot render.
+fn translate_strftime_format(fmt: &str, subsec: bool) -> Option<Vec<FormatPiece>> {
+    let mut pieces: Vec<FormatPiece> = Vec::new();
+    let mut pattern = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            if c.is_ascii_alphabetic() || c == '"' {
+                // A letter is a TO_CHAR pattern unless quoted.
+                pattern.push('"');
+                if c == '"' {
+                    pattern.push('\\');
+                }
+                pattern.push(c);
+                pattern.push('"');
+            } else {
+                pattern.push(c);
+            }
+            continue;
+        }
+        let spec = chars.next()?;
+        let mapped = match spec {
+            'Y' => "YYYY",
+            'm' => "MM",
+            'd' => "DD",
+            'e' => "FMDD",
+            'H' | 'k' => "HH24",
+            'I' | 'l' => "HH12",
+            'M' => "MI",
+            'S' if subsec => "SS.MS",
+            'S' => "SS",
+            'f' => "SS.MS",
+            'j' => "DDD",
+            'W' => "WW",
+            'p' => "AM",
+            'F' => "YYYY-MM-DD",
+            'T' => "HH24:MI:SS",
+            'R' => "HH24:MI",
+            'G' => "IYYY",
+            'g' => "IY",
+            'V' => "IW",
+            '%' => "%",
+            'w' | 'u' => {
+                if !pattern.is_empty() {
+                    pieces.push(FormatPiece::Pattern(std::mem::take(&mut pattern)));
+                }
+                pieces.push(FormatPiece::Weekday(if spec == 'w' {
+                    DateTimeField::Dow
+                } else {
+                    DateTimeField::Isodow
+                }));
+                continue;
+            }
+            _ => return None,
+        };
+        pattern.push_str(mapped);
+    }
+    if !pattern.is_empty() {
+        pieces.push(FormatPiece::Pattern(pattern));
+    }
+    Some(pieces)
+}
+
+fn render_format(value: &TimeValue, pieces: Vec<FormatPiece>) -> Expr {
+    let utc = value.utc();
+    let mut rendered = pieces.into_iter().map(|piece| match piece {
+        FormatPiece::Pattern(p) => make_to_char(utc.clone(), &p),
+        FormatPiece::Weekday(field) => wrap_double_colon_cast(
+            wrap_double_colon_cast(
+                Expr::Extract {
+                    field,
+                    syntax: ExtractSyntax::From,
+                    expr: Box::new(utc.clone()),
+                },
+                DataType::Int(None),
+            ),
+            DataType::Text,
+        ),
+    });
+    let Some(first) = rendered.next() else {
+        return make_string_literal("");
+    };
+    rendered.fold(first, |acc, next| {
+        make_binary(acc, BinaryOperator::StringConcat, next)
+    })
+}
+
+/// strftime(fmt, time[, modifiers...])
+fn rewrite_strftime_call(args: &[Expr]) -> Option<Expr> {
+    let [fmt, rest @ ..] = args else {
+        return None;
+    };
+    let fmt = get_literal_single_quoted_string(fmt)?;
+    let value = time_value(rest)?;
+    if fmt == "%s" {
+        return Some(make_epoch(value.ts, !value.subsec));
+    }
+    let pieces = translate_strftime_format(&fmt, value.subsec)?;
+    Some(render_format(&value, pieces))
+}
+
+fn rewrite_unixepoch_call(args: &[Expr]) -> Option<Expr> {
+    let value = time_value(args)?;
+    Some(make_epoch(value.ts, !value.subsec))
+}
+
+/// datetime('now', ...) stays a timestamp (NOW() - INTERVAL ...); any other
+/// time value is formatted as SQLite's text.
+fn rewrite_datetime_call(args: &[Expr]) -> Option<Expr> {
+    let value = time_value(args)?;
+    if args.first().is_none_or(is_now_literal) {
+        return Some(value.ts);
+    }
+    let fmt = if value.subsec {
+        "YYYY-MM-DD HH24:MI:SS.MS"
+    } else {
+        "YYYY-MM-DD HH24:MI:SS"
+    };
+    Some(make_to_char(value.utc(), fmt))
+}
+
+fn rewrite_date_call(args: &[Expr]) -> Option<Expr> {
+    let value = time_value(args)?;
+    Some(wrap_double_colon_cast(
+        wrap_double_colon_cast(Expr::Nested(Box::new(value.utc())), DataType::Date),
+        DataType::Text,
+    ))
+}
+
+fn rewrite_time_call(args: &[Expr]) -> Option<Expr> {
+    let value = time_value(args)?;
+    let fmt = if value.subsec {
+        "HH24:MI:SS.MS"
+    } else {
+        "HH24:MI:SS"
+    };
+    Some(make_to_char(value.utc(), fmt))
+}
+
+// ─── The function dispatch ───────────────────────────────────────────────────
+
+fn rewrite_function(expr: &mut Expr) {
+    let Expr::Function(func) = expr else {
+        return;
+    };
+    let Some(fn_name) = function_name(func) else {
+        return;
+    };
+    // The rewrites below read a copy of the arguments and replace the call
+    // only with a result; one that bails leaves the call as written.
+    let args = unnamed_args(func);
+    let replacement = match fn_name.as_str() {
+        "ifnull" => {
+            rename_function(func, "COALESCE");
+            return;
+        }
+        "iif" => {
+            let [cond, then, else_e, ..] = args.as_slice() else {
+                return;
+            };
+            Some(make_case_when(cond.clone(), then.clone(), else_e.clone()))
+        }
+        "typeof" => {
+            func.name = ObjectName(vec![
+                ObjectNamePart::Identifier(Ident::new("plex")),
+                ObjectNamePart::Identifier(Ident::new("sqlite_typeof")),
+            ]);
+            return;
+        }
+        "last_insert_rowid" => {
+            rename_function(func, "lastval");
+            return;
+        }
+        "json_each" => {
+            rename_function(func, "json_array_elements");
+            return;
+        }
+        "unicode" => {
+            rename_function(func, "ASCII");
+            return;
+        }
+        "json_tree" => {
+            rename_function(func, "jsonb_each_text");
             if let FunctionArguments::List(ref mut arg_list) = func.args {
-                for arg in &mut arg_list.args {
-                    match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                            transform_expr(e);
-                        }
-                        FunctionArg::Named {
-                            arg: FunctionArgExpr::Expr(e),
-                            ..
-                        } => {
-                            transform_expr(e);
-                        }
-                        _ => {}
-                    }
-                }
+                cast_unnamed_function_args_to(&mut arg_list.args, DataType::JSONB);
             }
-
-            match fn_name.as_str() {
-                // IFNULL → COALESCE
-                "ifnull" => {
-                    rename_function(func, "COALESCE");
-                }
-
-                // iif(cond, then, else) → CASE WHEN cond THEN then ELSE else END
-                "iif" => {
-                    let args = extract_unnamed_args(func);
-                    if args.len() >= 3 {
-                        let mut iter = args.into_iter();
-                        let cond = iter.next().unwrap();
-                        let then = iter.next().unwrap();
-                        let else_e = iter.next().unwrap();
-                        *expr = Expr::Case {
-                            case_token: AttachedToken::empty(),
-                            end_token: AttachedToken::empty(),
-                            operand: None,
-                            conditions: vec![CaseWhen {
-                                condition: cond,
-                                result: then,
-                            }],
-                            else_result: Some(Box::new(else_e)),
-                        };
-                    }
-                }
-
-                // typeof(x) → pg_typeof(x)::text
-                "typeof" => {
-                    rename_function(func, "pg_typeof");
-                    *expr = wrap_double_colon_cast(take_expr(expr), DataType::Text);
-                }
-
-                // last_insert_rowid() → lastval()
-                "last_insert_rowid" => {
-                    rename_function(func, "lastval");
-                }
-
-                // json_each(x) → json_array_elements(x)
-                "json_each" => {
-                    rename_function(func, "json_array_elements");
-                }
-
-                // unicode(x) → ASCII(x)
-                "unicode" => {
-                    rename_function(func, "ASCII");
-                }
-
-                // json_tree(x) → jsonb_each_text(x::jsonb)
-                "json_tree" => {
-                    rename_function(func, "jsonb_each_text");
-                    if let FunctionArguments::List(ref mut arg_list) = func.args {
-                        cast_unnamed_function_args_to_jsonb(&mut arg_list.args);
-                    }
-                }
-
-                // json_extract(x, '$.a.b') -> jsonb_extract_path_text(x::jsonb, 'a', 'b')
-                "json_extract" => {
-                    let args = extract_unnamed_args(func);
-                    if let Some(new_expr) = rewrite_json_extract_call(args) {
-                        *expr = new_expr;
-                    }
-                }
-
-                // json_type(x[, '$.a']) -> jsonb_typeof(...)
-                "json_type" => {
-                    let args = extract_unnamed_args(func);
-                    if let Some(new_expr) = rewrite_json_type_call(args) {
-                        *expr = new_expr;
-                    }
-                }
-
-                // json_array_length(x[, '$.a']) -> jsonb_array_length(...)
-                "json_array_length" => {
-                    let args = extract_unnamed_args(func);
-                    if let Some(new_expr) = rewrite_json_array_length_call(args) {
-                        *expr = new_expr;
-                    }
-                }
-
-                // json_set/json_insert/json_replace -> jsonb_set(...)
-                "json_set" => {
-                    let args = extract_unnamed_args(func);
-                    if let Some(new_expr) = rewrite_json_set_like_call(args, JsonSetMode::Set) {
-                        *expr = new_expr;
-                    }
-                }
-                "json_insert" => {
-                    let args = extract_unnamed_args(func);
-                    if let Some(new_expr) = rewrite_json_set_like_call(args, JsonSetMode::Insert) {
-                        *expr = new_expr;
-                    }
-                }
-                "json_replace" => {
-                    let args = extract_unnamed_args(func);
-                    if let Some(new_expr) = rewrite_json_set_like_call(args, JsonSetMode::Replace) {
-                        *expr = new_expr;
-                    }
-                }
-                "json_remove" => {
-                    let args = extract_unnamed_args(func);
-                    if let Some(new_expr) = rewrite_json_remove_call(args) {
-                        *expr = new_expr;
-                    }
-                }
-                "json_patch" => {
-                    let args = extract_unnamed_args(func);
-                    if let Some(new_expr) = rewrite_json_patch_call(args) {
-                        *expr = new_expr;
-                    }
-                }
-                "json_object" => {
-                    rename_function(func, "jsonb_build_object");
-                }
-                "json_array" => {
-                    rename_function(func, "jsonb_build_array");
-                }
-                "json_group_array" => {
-                    rename_function(func, "jsonb_agg");
-                }
-                "json_group_object" => {
-                    rename_function(func, "jsonb_object_agg");
-                }
-                "group_concat" => {
-                    let args = extract_unnamed_args(func);
-                    if let Some(new_expr) = rewrite_group_concat_call(args) {
-                        *expr = new_expr;
-                    }
-                }
-                "printf" => {
-                    rename_function(func, "format");
-                }
-                "julianday" => {
-                    let args = extract_unnamed_args(func);
-                    if let Some(new_expr) = rewrite_julianday_call(args) {
-                        *expr = new_expr;
-                    }
-                }
-                "total" => {
-                    let args = extract_unnamed_args(func);
-                    if let Some(new_expr) = rewrite_total_call(args) {
-                        *expr = new_expr;
-                    }
-                }
-
-                // json_quote(x) -> to_json(x)::text
-                "json_quote" => {
-                    let args = extract_unnamed_args(func);
-                    if let Some(first) = args.into_iter().next() {
-                        *expr = wrap_double_colon_cast(
-                            make_function_call("to_json", vec![first]),
-                            DataType::Text,
-                        );
-                    }
-                }
-
-                // SUBSTR → SUBSTRING
-                "substr" => {
-                    rename_function(func, "SUBSTRING");
-                }
-
-                // instr(haystack, needle) → STRPOS(haystack, needle)  (same arg order)
-                "instr" => {
-                    rename_function(func, "STRPOS");
-                }
-
-                // strftime('%s', expr) → EXTRACT(EPOCH FROM expr)::bigint
-                // strftime('%Y-%m-%d', expr) → TO_CHAR(expr, 'YYYY-MM-DD')
-                "strftime" => {
-                    // Need to take the func out to pass to transform_strftime
-                    let func_node = match take_expr(expr) {
-                        Expr::Function(f) => f,
-                        _ => unreachable!(),
-                    };
-                    *expr = transform_strftime(func_node);
-                }
-
-                // unixepoch(expr) → EXTRACT(EPOCH FROM expr)::bigint
-                // unixepoch('now', '-7 day') → EXTRACT(EPOCH FROM NOW() - INTERVAL '7 day')::bigint
-                "unixepoch" => {
-                    let args = extract_unnamed_args(func);
-                    let mut iter = args.into_iter();
-                    let inner_expr = iter.next().unwrap_or_else(make_now_call);
-                    let mut source = if is_now_literal(&inner_expr) {
-                        make_now_call()
-                    } else {
-                        inner_expr
-                    };
-                    if let Some(interval_expr) = iter.next() {
-                        source = apply_interval(source, interval_expr);
-                    }
-                    *expr = Expr::Cast {
-                        kind: CastKind::DoubleColon,
-                        expr: Box::new(Expr::Extract {
-                            field: DateTimeField::Epoch,
-                            syntax: ExtractSyntax::From,
-                            expr: Box::new(source),
-                        }),
-                        data_type: DataType::BigInt(None),
-                        array: false,
-                        format: None,
-                    };
-                }
-
-                // datetime('now') → NOW()
-                "datetime" => {
-                    let args = extract_unnamed_args(func);
-                    let inner = args.into_iter().next().unwrap_or_else(make_now_call);
-                    if is_now_literal(&inner) {
-                        *expr = make_now_call();
-                    } else {
-                        *expr = inner;
-                    }
-                }
-
-                _ => {}
-            }
+            return;
         }
-
-        // Recurse into other expression forms
-        Expr::BinaryOp { left, right, .. } => {
-            transform_expr(left);
-            transform_expr(right);
+        "json_extract" => rewrite_json_extract_call(&args),
+        "json_type" => rewrite_json_type_call(&args),
+        "json_array_length" => rewrite_json_array_length_call(&args),
+        "json_set" => rewrite_json_set_like_call(&args, JsonSetMode::Set),
+        "json_insert" => rewrite_json_set_like_call(&args, JsonSetMode::Insert),
+        "json_replace" => rewrite_json_set_like_call(&args, JsonSetMode::Replace),
+        "json_remove" => rewrite_json_remove_call(&args),
+        "json_patch" => rewrite_json_patch_call(&args),
+        "json_object" => {
+            rename_function(func, "jsonb_build_object");
+            return;
         }
-        Expr::UnaryOp { expr: inner, .. } => transform_expr(inner),
-        Expr::Nested(inner) => transform_expr(inner),
-        Expr::Cast { expr: inner, .. } => transform_expr(inner),
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            if let Some(op) = operand {
-                transform_expr(op);
-            }
-            for cw in conditions {
-                transform_expr(&mut cw.condition);
-                transform_expr(&mut cw.result);
-            }
-            if let Some(er) = else_result {
-                transform_expr(er);
-            }
+        "json_array" => {
+            rename_function(func, "jsonb_build_array");
+            return;
         }
-        Expr::InList {
-            expr: inner, list, ..
-        } => {
-            transform_expr(inner);
-            for e in list.iter_mut() {
-                transform_expr(e);
+        "json_group_array" => {
+            rename_function(func, "jsonb_agg");
+            return;
+        }
+        "json_group_object" => {
+            rename_function(func, "jsonb_object_agg");
+            return;
+        }
+        "group_concat" => {
+            rewrite_group_concat(func);
+            return;
+        }
+        "printf" | "format" => rewrite_printf_call(&args),
+        "hex" => rewrite_hex_call(&args),
+        "round" => {
+            if args.len() != 2 {
+                return;
             }
-            // typeof type remapping: when expr is pg_typeof(...)::text,
-            // add PostgreSQL type aliases to the IN list
-            if is_pg_typeof_cast(inner) {
-                add_typeof_remappings(list);
-            }
+            rewrite_round_call(&args)
         }
-        Expr::InSubquery {
-            expr: inner,
-            subquery,
-            ..
-        } => {
-            transform_expr(inner);
-            transform_query(subquery);
+        "julianday" => rewrite_julianday_call(&args),
+        "total" => rewrite_total_call(&args),
+        // json_quote(x) -> to_json(x)::text
+        "json_quote" => args.first().map(|first| {
+            wrap_double_colon_cast(
+                make_function_call("to_json", vec![first.clone()]),
+                DataType::Text,
+            )
+        }),
+        "substr" => {
+            rename_function(func, "SUBSTRING");
+            return;
         }
-        Expr::Between {
-            expr: inner,
-            low,
-            high,
-            ..
-        } => {
-            transform_expr(inner);
-            transform_expr(low);
-            transform_expr(high);
+        "instr" => {
+            rename_function(func, "STRPOS");
+            return;
         }
-        // SUBSTR(a,b,c) is parsed as Expr::Substring { shorthand: true }
-        // We convert it to SUBSTRING by clearing the shorthand flag
-        Expr::Substring {
-            expr: inner,
-            substring_from,
-            substring_for,
-            shorthand,
-            ..
-        } => {
-            transform_expr(inner);
-            if let Some(f) = substring_from {
-                transform_expr(f);
-            }
-            if let Some(f) = substring_for {
-                transform_expr(f);
-            }
-            if *shorthand {
-                *shorthand = false; // force SUBSTRING output
-            }
-        }
-        Expr::Exists { subquery, .. } => {
-            transform_query(subquery);
-        }
-        Expr::Subquery(q) => {
-            transform_query(q);
-        }
-        _ => {}
+        "strftime" => rewrite_strftime_call(&args),
+        "unixepoch" => rewrite_unixepoch_call(&args),
+        "datetime" => rewrite_datetime_call(&args),
+        "date" => rewrite_date_call(&args),
+        "time" => rewrite_time_call(&args),
+        _ => return,
+    };
+    match replacement {
+        Some(new_expr) => *expr = new_expr,
+        None => log_untranslated(&fn_name, func),
     }
 }
 
@@ -1110,292 +1542,44 @@ fn rename_function(func: &mut Function, new_name: &str) {
     func.name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(new_name))]);
 }
 
-/// Check if an expression is pg_typeof(...)::text (the result of typeof → pg_typeof conversion)
-fn is_pg_typeof_cast(expr: &Expr) -> bool {
-    if let Expr::Cast {
-        expr: inner,
-        data_type: DataType::Text,
-        ..
-    } = expr
-    {
-        if let Expr::Function(func) = inner.as_ref() {
-            let name = func
-                .name
-                .0
-                .first()
-                .and_then(|p| match p {
-                    ObjectNamePart::Identifier(i) => Some(i.value.to_lowercase()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            return name == "pg_typeof";
-        }
-    }
-    false
-}
-
-/// Remap PostgreSQL type names in an IN list for pg_typeof comparisons.
-/// SQLite typeof returns 'integer', 'real', etc. PostgreSQL pg_typeof returns
-/// 'bigint', 'double precision', etc.
-/// - 'integer' → keep AND add 'bigint'
-/// - 'real' → REPLACE with 'double precision'
-fn add_typeof_remappings(list: &mut Vec<Expr>) {
-    let mut additions = Vec::new();
-    for item in list.iter_mut() {
-        if let Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(ref mut s),
-            ..
-        }) = item
-        {
-            match s.to_lowercase().as_str() {
-                "integer" => {
-                    additions.push(make_string_literal("bigint"));
-                }
-                "real" => {
-                    // Replace 'real' with 'double precision' (not alongside)
-                    *s = "double precision".to_string();
-                }
-                _ => {}
-            }
-        }
-    }
-    list.extend(additions);
-}
-
 /// Detect the pattern: iif(typeof(X) in ('integer','real'), X, strftime('%s', X, 'utc'))
 /// and simplify to just X. In PostgreSQL, columns have fixed types so the
 /// conditional typeof check is unnecessary.
 fn try_simplify_typeof(func: &Function) -> Option<Expr> {
-    if let FunctionArguments::List(ref al) = func.args {
-        if al.args.len() >= 2 {
-            // First arg should be: typeof(X) IN ('integer', 'real', ...)
-            let first = match &al.args[0] {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
-                _ => return None,
-            };
-            // Check if first arg is typeof(...) IN (...)
-            if let Expr::InList { expr, .. } = first {
-                if let Expr::Function(inner_func) = expr.as_ref() {
-                    let inner_name = inner_func
-                        .name
-                        .0
-                        .first()
-                        .and_then(|p| match p {
-                            ObjectNamePart::Identifier(i) => Some(i.value.to_lowercase()),
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    if inner_name == "typeof" {
-                        // Second arg is the "then" value — just return it
-                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(then_expr)) = &al.args[1]
-                        {
-                            return Some(then_expr.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Extract all `FunctionArg::Unnamed(FunctionArgExpr::Expr(…))` args.
-fn extract_unnamed_args(func: &mut Function) -> Vec<Expr> {
-    let mut result = Vec::new();
-    if let FunctionArguments::List(ref mut al) = func.args {
-        for arg in al.args.drain(..) {
-            if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                result.push(e);
-            }
-        }
-    }
-    result
-}
-
-fn is_now_literal(expr: &Expr) -> bool {
-    matches!(expr, Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) if s.to_lowercase() == "now")
-}
-
-fn make_now_call() -> Expr {
-    Expr::Function(Function {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("NOW"))]),
-        uses_odbc_syntax: false,
-        parameters: FunctionArguments::None,
-        args: FunctionArguments::List(FunctionArgumentList {
-            duplicate_treatment: None,
-            args: vec![],
-            clauses: vec![],
-        }),
-        filter: None,
-        null_treatment: None,
-        over: None,
-        within_group: vec![],
-    })
-}
-
-/// Apply a SQLite interval modifier (e.g. `'-7 day'`) to a source expression.
-/// Produces `source + INTERVAL '...'` or `source - INTERVAL '...'` depending on sign.
-fn apply_interval(source: Expr, interval_expr: Expr) -> Expr {
-    let interval_str = match &interval_expr {
-        Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(s),
-            ..
-        }) => s.clone(),
-        _ => return source,
+    let FunctionArguments::List(ref al) = func.args else {
+        return None;
     };
-
-    let (op, cleaned) = if let Some(rest) = interval_str.strip_prefix('-') {
-        (BinaryOperator::Minus, rest.trim().to_string())
-    } else if let Some(rest) = interval_str.strip_prefix('+') {
-        (BinaryOperator::Plus, rest.trim().to_string())
-    } else {
-        (BinaryOperator::Plus, interval_str.trim().to_string())
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(first)), FunctionArg::Unnamed(FunctionArgExpr::Expr(then_expr)), ..] =
+        al.args.as_slice()
+    else {
+        return None;
     };
-
-    let interval = Expr::Interval(Interval {
-        value: Box::new(Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(cleaned),
-            span: Span::empty(),
-        })),
-        leading_field: None,
-        leading_precision: None,
-        last_field: None,
-        fractional_seconds_precision: None,
-    });
-
-    Expr::BinaryOp {
-        left: Box::new(source),
-        op,
-        right: Box::new(interval),
-    }
-}
-
-fn transform_strftime(mut func: Function) -> Expr {
-    let args = extract_unnamed_args(&mut func);
-    if args.len() < 2 {
-        return Expr::Function(func);
-    }
-    let mut iter = args.into_iter();
-    let fmt_arg = iter.next().unwrap();
-    let time_arg = iter.next().unwrap();
-    let interval_arg = iter.next();
-
-    let fmt_str = match &fmt_arg {
-        Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(s),
-            ..
-        }) => s.clone(),
-        _ => return Expr::Function(func),
+    // First arg should be: typeof(X) IN ('integer', 'real', ...)
+    let Expr::InList { expr, .. } = first else {
+        return None;
     };
-
-    let is_now = is_now_literal(&time_arg);
-    let mut source = if is_now { make_now_call() } else { time_arg };
-
-    // Apply interval if 3rd arg present
-    if let Some(interval_expr) = interval_arg {
-        source = apply_interval(source, interval_expr);
+    let Expr::Function(inner_func) = expr.as_ref() else {
+        return None;
+    };
+    if function_name(inner_func).as_deref() != Some("typeof") {
+        return None;
     }
-
-    match fmt_str.as_str() {
-        "%s" => {
-            // For non-NOW column sources, wrap in TO_TIMESTAMP() first
-            // because the column likely stores a Unix timestamp integer
-            if !is_now {
-                source = make_to_timestamp(source);
-            }
-            // → EXTRACT(EPOCH FROM source)::bigint
-            Expr::Cast {
-                kind: CastKind::DoubleColon,
-                expr: Box::new(Expr::Extract {
-                    field: DateTimeField::Epoch,
-                    syntax: ExtractSyntax::From,
-                    expr: Box::new(source),
-                }),
-                data_type: DataType::BigInt(None),
-                array: false,
-                format: None,
-            }
-        }
-        _ => {
-            // Translate strftime format to PostgreSQL TO_CHAR format
-            let pg_fmt_str = translate_strftime_format(&fmt_str);
-            make_to_char(source, &pg_fmt_str)
-        }
-    }
+    // Second arg is the "then" value — just return it
+    Some(then_expr.clone())
 }
 
-/// Translate a SQLite strftime format string to a PostgreSQL TO_CHAR format string.
-fn translate_strftime_format(fmt: &str) -> String {
-    let mut result = String::new();
-    let mut chars = fmt.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            if let Some(&spec) = chars.peek() {
-                chars.next();
-                match spec {
-                    'Y' => result.push_str("YYYY"),
-                    'm' => result.push_str("MM"),
-                    'd' => result.push_str("DD"),
-                    'H' => result.push_str("HH24"),
-                    'M' => result.push_str("MI"),
-                    'S' => result.push_str("SS"),
-                    '%' => result.push('%'),
-                    other => {
-                        result.push('%');
-                        result.push(other);
-                    }
-                }
-            } else {
-                result.push('%');
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
-/// Build a TO_TIMESTAMP(expr) function call.
-fn make_to_timestamp(source: Expr) -> Expr {
-    Expr::Function(Function {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("TO_TIMESTAMP"))]),
-        uses_odbc_syntax: false,
-        parameters: FunctionArguments::None,
-        args: FunctionArguments::List(FunctionArgumentList {
-            duplicate_treatment: None,
-            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(source))],
-            clauses: vec![],
-        }),
-        filter: None,
-        null_treatment: None,
-        over: None,
-        within_group: vec![],
-    })
-}
-
-/// Build a TO_CHAR(expr, 'fmt') function call.
-fn make_to_char(source: Expr, pg_fmt: &str) -> Expr {
-    let fmt_expr = Expr::Value(ValueWithSpan {
-        value: Value::SingleQuotedString(pg_fmt.to_string()),
-        span: sqlparser::tokenizer::Span::empty(),
-    });
-    Expr::Function(Function {
-        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("TO_CHAR"))]),
-        uses_odbc_syntax: false,
-        parameters: FunctionArguments::None,
-        args: FunctionArguments::List(FunctionArgumentList {
-            duplicate_treatment: None,
-            args: vec![
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(source)),
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(fmt_expr)),
-            ],
-            clauses: vec![],
-        }),
-        filter: None,
-        null_treatment: None,
-        over: None,
-        within_group: vec![],
-    })
+/// A copy of every `FunctionArg::Unnamed(FunctionArgExpr::Expr(…))` arg.
+fn unnamed_args(func: &Function) -> Vec<Expr> {
+    let FunctionArguments::List(ref al) = func.args else {
+        return Vec::new();
+    };
+    al.args
+        .iter()
+        .filter_map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1422,9 +1606,9 @@ mod tests {
     }
 
     #[test]
-    fn subset_core__function_typeof_to_pg_typeof() {
+    fn subset_core__function_typeof_to_sqlite_typeof() {
         let r = translate("SELECT typeof(x) FROM t").unwrap();
-        assert!(r.sql.contains("pg_typeof") || r.sql.contains("PG_TYPEOF"));
+        assert_eq!(r.sql, "SELECT plex.sqlite_typeof(x) FROM t");
     }
 
     #[test]
@@ -1608,24 +1792,6 @@ mod tests {
         assert!(low.contains("coalesce"), "{}", r.sql);
         assert!(low.contains("sum"), "{}", r.sql);
         assert!(low.contains("0.0"), "{}", r.sql);
-    }
-
-    #[test]
-    fn debug_parse() {
-        use sqlparser::dialect::SQLiteDialect;
-        use sqlparser::parser::Parser;
-
-        let sql1 = "SELECT strftime('%Y-%m-%d %H:%M:%S', created_at) FROM t";
-        let stmts = Parser::parse_sql(&SQLiteDialect {}, sql1);
-        eprintln!("Parse1: {:?}", stmts);
-
-        let sql2 = "SELECT strftime('%s', 'now', '-7 day')";
-        let stmts2 = Parser::parse_sql(&SQLiteDialect {}, sql2);
-        eprintln!("Parse2: {:?}", stmts2);
-
-        let sql3 = "SELECT datetime('now') FROM t";
-        let stmts3 = Parser::parse_sql(&SQLiteDialect {}, sql3);
-        eprintln!("Parse3: {:?}", stmts3);
     }
 
     #[test]

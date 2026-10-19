@@ -85,8 +85,8 @@ fn gap_fts5_match_phrase_syntax_should_be_pg_tsquery() {
     let out = translate_sql("SELECT * FROM docs WHERE docs MATCH '\"star wars\" NEAR action'");
     let low = out.to_lowercase();
     assert!(
-        low.contains("to_tsquery(") || low.contains("plainto_tsquery("),
-        "expected MATCH rewrite to tsquery, got: {}",
+        low.contains("@@ plex.fts_query("),
+        "expected MATCH rewrite to a tsquery through plex.fts_query, got: {}",
         out
     );
     assert_output_is_valid_postgres(&out);
