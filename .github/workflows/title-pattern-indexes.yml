@@ -1,0 +1,67 @@
+name: Title pattern index regressions
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+
+jobs:
+  postgres-15:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres-test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Fresh index definitions and repeated migrations as database owner
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Exercise the exact fresh-schema block without depending on the
+          # dump's unrelated sqlite_column_types load-order prerequisite.
+          python3 - <<'PYTEST'
+          from pathlib import Path
+          text = Path('schema/plex_schema.sql').read_text()
+          start = text.index('DO $title_patterns$')
+          end = text.index('$title_patterns$;', start) + len('$title_patterns$;')
+          Path('/tmp/title-pattern-fresh.sql').write_text(text[start:end])
+          PYTEST
+          psql -v ON_ERROR_STOP=1 -d postgres -c "CREATE ROLE plex LOGIN PASSWORD 'plex-test';"
+          for extension_schema in plex public; do
+            db="pattern_${extension_schema}"
+            psql -v ON_ERROR_STOP=1 -d postgres -c "CREATE DATABASE $db OWNER plex;"
+            if [ "$extension_schema" = public ]; then
+              psql -v ON_ERROR_STOP=1 -d "$db" -c 'CREATE EXTENSION pg_trgm WITH SCHEMA public;'
+            fi
+            export PGUSER=plex PGPASSWORD=plex-test
+            psql -q -v ON_ERROR_STOP=1 -d "$db" <<'SQL'
+          CREATE SCHEMA plex;
+          CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA plex;
+          CREATE COLLATION plex.nocase (provider=icu, locale='und-u-ks-level2', deterministic=false);
+          CREATE COLLATION plex.icu_root (provider=icu, locale='und');
+          CREATE TABLE plex.metadata_items (id integer PRIMARY KEY, title text, title_sort text COLLATE plex.nocase, original_title text);
+          SQL
+            psql -q -v ON_ERROR_STOP=1 -d "$db" -f /tmp/title-pattern-fresh.sql
+            psql -q -v ON_ERROR_STOP=1 -d "$db" -f tests/sql/title_pattern_indexes.sql
+            # Simulate the previous layout, retaining its existing title index.
+            psql -q -v ON_ERROR_STOP=1 -d "$db" -c 'DROP INDEX plex.idx_metadata_items_title_sort_trgm; DROP INDEX plex.idx_metadata_items_original_title_trgm;'
+            psql -q -v ON_ERROR_STOP=1 -d "$db" -f schema/migrations/2026-10-20-title-pattern-indexes.sql
+            psql -q -v ON_ERROR_STOP=1 -d "$db" -f schema/migrations/2026-10-20-title-pattern-indexes.sql
+            psql -q -v ON_ERROR_STOP=1 -d "$db" -f tests/sql/title_pattern_indexes.sql
+            export PGUSER=postgres PGPASSWORD=postgres-test
+          done

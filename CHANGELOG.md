@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Index ordinary case-insensitive Plex title searches across `title`,
+  `title_sort COLLATE plex.icu_root`, and `original_title`, preserving matching
+  behavior while avoiding a type-wide pattern scan. Existing databases apply
+  `schema/migrations/2026-10-20-title-pattern-indexes.sql` after the 2026-10-16
+  migration; fresh schemas include the same indexes. Trigram operator classes
+  are resolved from the installed extension's schema.
+
 ### v1.3.17-clusterplex.33 (2026-10-16)
 
 The clusterplex.31 regressions seen on talos, each reproduced on the standalone rig (`docker-compose.standalone.yml`) and fixed: a MATCH followed by AND or OR keeps the conjunction outside `plex.fts_query`; no pool slot is given back at thread exit; a CASE whose branch is a condition makes its 0/1 booleans and an integer CASE read as a condition compares with 0; the rtree stays out of the shadow schema; a DISTINCT keeps a GROUP BY an aggregate reads; `errcode`/`errmsg` on a redirected handle never read the shadow SQLite's stale error, and a successful step clears the connection's last error (Plex polls errcode on its error path, and one failed statement used to make every later request throw). The migration hands its objects to the `plex` role when applied as a superuser.
