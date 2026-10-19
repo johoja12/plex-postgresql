@@ -59,6 +59,36 @@ resolved.
 
 ## Migrations
 
+### 2026-10-20-title-pattern-indexes.sql
+
+Apply after the 2026-10-16 migration, with Plex stopped. Run as the owner of
+`plex.metadata_items` (or a superuser). The migration adds the two missing
+trigram GIN indexes for `original_title` and `title_sort COLLATE plex.icu_root`,
+and retains or creates the existing `title` trigram index. It resolves the
+`pg_trgm` extension's schema instead of assuming it is installed in `plex`.
+
+Plex's ordinary `/search` uses `ILIKE 'term%'` and `ILIKE '% term%'` across
+all three columns. The MATCH/tsvector indexes serve a different predicate;
+without all three pattern indexes PostgreSQL may scan every item of the
+requested type and evaluate the ICU/case-insensitive comparisons row by row.
+The explicit collation on `title_sort` matches the translator exactly.
+Matching, Unicode handling, sort order, and catalogue data are unchanged.
+Very short or non-selective patterns may still require a scan.
+
+This migration is transactional and re-runnable. Index creation blocks writes
+and adds disk space and index maintenance on title edits. There is no automatic
+migration application; fresh databases receive the same indexes from
+`schema/plex_schema.sql`. An installation needing an online build can create
+these same indexes with `CREATE INDEX CONCURRENTLY` outside a transaction,
+then apply the migration to confirm they exist.
+
+Regression check after applying (in an isolated database):
+
+```sh
+psql -v ON_ERROR_STOP=1 -f tests/sql/title_pattern_indexes.sql
+```
+
+
 ### 2026-10-16-fts-collations-indexes.sql
 
 Audit items #1, #24, #25, #26, #27 of `docs/audits/2026-10-16-shim-audit.md`:
