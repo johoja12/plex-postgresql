@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.34 (2026-10-20)
+
 - `pg_stmt_clear_result`'s "streaming_conn invalid" line, a burst of which followed every collection write on talos under clusterplex.33, is INFO rather than ERROR (the flag is cleared and the statement lets go either way) and now says where the connection is: its pool slot, the slot's state, whether this thread owns it and the handle references on it, or "not pooled".
 - A statement letting go of its stream settles a handle's own connection as it does a READY slot's (`PoolManager::stream_settles_on`). Plex's blobs database streams on its handle's connection, which no slot holds, so every reset of its cached `SELECT COUNT(*) FROM blobs` was the "streaming_conn invalid" line: 2,022 of plex-0's 2,272 log lines on talos in four hours (2026-10-20). Settling cancels only a query still sending rows. It clears the results already received first, so a reset after a one-row COUNT opens no cancel connection to the server.
 
