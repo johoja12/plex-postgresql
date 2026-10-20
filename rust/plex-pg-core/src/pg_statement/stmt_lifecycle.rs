@@ -3,28 +3,43 @@ use std::sync::atomic::Ordering;
 
 use crate::db_interpose_conn_utils::{log_debug, log_error, PthreadMutexGuard};
 use crate::db_interpose_helpers::cstr_to_str_or_empty;
-use crate::ffi_types::{PgConnection, PgStmt};
+use crate::ffi_types::PgStmt;
+use crate::libpq_helpers::PGconn;
 use crate::log_debug_lazy;
 use crate::log_info_lazy;
 
-extern "C" {
-    fn pg_pool_validate_connection(conn: *mut PgConnection) -> c_int;
-}
-
 const PMT_STMT_SWEEP_EXTRA_FREE: i32 = 6;
+
+/// Clear the results a stream has already received, and say whether the
+/// server is still sending rows. Only then is a cancel worth it: PQcancel
+/// opens a connection of its own to the server, and a stream whose rows have
+/// all arrived (Plex resets a one-row COUNT without stepping to its end) has
+/// nothing left to cancel.
+unsafe fn clear_received_results(conn: *mut PGconn) -> bool {
+    loop {
+        crate::libpq_helpers::rust_pq_consume_input(conn);
+        if crate::libpq_helpers::rust_pq_is_busy(conn) != 0 {
+            return true;
+        }
+        let res = crate::libpq_helpers::rust_pq_get_result(conn);
+        if res.is_null() {
+            return false;
+        }
+        crate::libpq_helpers::rust_pq_clear(res);
+    }
+}
 
 unsafe fn clear_streaming_state(stmt_ptr: *mut PgStmt, stmt: &mut PgStmt, op_name: &str) {
     if stmt.streaming_mode == 0 || stmt.streaming_conn().is_null() {
         return;
     }
 
-    if pg_pool_validate_connection(stmt.streaming_conn()) == 0 {
+    if !crate::pg_client::pool().stream_settles_on(stmt.streaming_conn() as *const c_void) {
         // Handled below (the flag is cleared and the statement lets go), so
         // this is information, not an error: what it says is where the
-        // connection went, which is what a burst of these on talos
-        // (2026-10-16, during collection writes) could not tell.
+        // connection went.
         log_info_lazy!(
-            "{}: streaming_conn not in a READY slot ({}), skipping cancel/drain (stmt={:p})",
+            "{}: streaming_conn neither in a READY slot nor a handle's own ({}), skipping cancel/drain (stmt={:p})",
             op_name,
             crate::pg_client::pool().describe_connection(
                 stmt.streaming_conn() as *const c_void,
@@ -45,11 +60,11 @@ unsafe fn clear_streaming_state(stmt_ptr: *mut PgStmt, stmt: &mut PgStmt, op_nam
         return;
     }
 
-    // SAFETY: streaming_conn is non-null (checked above) and validated by
-    // pg_pool_validate_connection.
+    // SAFETY: streaming_conn is non-null (checked above), and the
+    // statement's reference keeps the struct alive.
     let sconn = &mut *stmt.streaming_conn();
     let _conn_guard = PthreadMutexGuard::lock(&mut sconn.mutex as *mut _);
-    if !sconn.conn.is_null() {
+    if !sconn.conn.is_null() && clear_received_results(sconn.conn) {
         let cancel = crate::libpq_helpers::rust_pq_get_cancel(sconn.conn);
         if !cancel.is_null() {
             let mut errbuf = [0 as c_char; 256];

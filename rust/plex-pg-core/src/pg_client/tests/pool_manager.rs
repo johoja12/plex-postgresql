@@ -169,6 +169,42 @@ fn pool_manager_validate_connection_not_ready() {
     assert!(!pm.validate_connection(fake_conn));
 }
 
+// A stream is settled on a READY slot's connection and on a handle's own
+// connection (Plex's blobs database never streams on a pooled one), and on
+// nothing else: a slot that has left READY may be reconnecting or already
+// another thread's, and a connection the registry no longer lists belongs to
+// a closed handle.
+#[test]
+fn pool_manager_stream_settles_on_a_ready_slot_or_a_handles_own_connection() {
+    let pm = PoolManager::new(5, 64);
+    let ready = 0xBEE0 as *mut c_void;
+    pm.slots[1].conn.store(ready, Ordering::Relaxed);
+    pm.slots[1].state.store(SLOT_READY, Ordering::Relaxed);
+    assert!(pm.stream_settles_on(ready), "a READY slot's connection");
+
+    let left = 0xBEE1 as *mut c_void;
+    pm.slots[2].conn.store(left, Ordering::Relaxed);
+    pm.slots[2].state.store(SLOT_FREE, Ordering::Relaxed);
+    pm.registry.register(0x200, left as usize);
+    assert!(
+        !pm.stream_settles_on(left),
+        "a pooled connection whose slot left READY, registered or not"
+    );
+
+    let handle = 0xBEE2 as *const c_void;
+    pm.registry.register(0x100, handle as usize);
+    assert!(pm.stream_settles_on(handle), "a handle's own connection");
+    assert!(
+        !pm.validate_connection(handle),
+        "which validate_connection refuses: the blobs streams on talos"
+    );
+
+    pm.registry.unregister(0x100);
+    assert!(!pm.stream_settles_on(handle), "a closed handle's");
+    assert!(!pm.stream_settles_on(0xBEE3 as *const c_void), "an unknown one");
+    assert!(!pm.stream_settles_on(std::ptr::null()));
+}
+
 #[test]
 fn pool_manager_clear_streaming_active_returns_false_for_unknown_conn() {
     let pm = PoolManager::new(5, 64);

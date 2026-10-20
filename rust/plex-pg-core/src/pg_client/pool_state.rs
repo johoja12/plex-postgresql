@@ -264,6 +264,26 @@ impl PoolManager {
         matches!(self.find_connection_slot(conn_ptr), Some((_, SLOT_READY)))
     }
 
+    /// Whether a statement letting go of its stream may settle the
+    /// connection it streamed on (drain it, cancelling a query still sending
+    /// rows): a READY slot's connection, or a handle's own connection, which
+    /// no slot holds and the registry still lists.
+    ///
+    /// Plex's blobs database streams on its handle's own connection, never a
+    /// pooled one, so `validate_connection` alone refused every one of its
+    /// streams: 2,022 "streaming_conn invalid" lines in four hours on talos
+    /// (2026-10-20), nearly all one cached `SELECT COUNT(*) FROM blobs`
+    /// that Plex resets after its one row.
+    pub fn stream_settles_on(&self, conn_ptr: *const c_void) -> bool {
+        if conn_ptr.is_null() {
+            return false;
+        }
+        match self.find_connection_slot(conn_ptr) {
+            Some((_, state)) => state == SLOT_READY,
+            None => self.registry.contains_conn(conn_ptr as usize),
+        }
+    }
+
     /// Best-effort release of a stale streaming flag for a tracked pool connection.
     ///
     /// This is intentionally more permissive than `validate_connection`: it scans all
