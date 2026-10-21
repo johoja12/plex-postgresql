@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.35 (2026-10-21)
+
 - A Live TV guide database, `tv.plex.providers.epg.<provider>-<DVR uuid>.db`, is served from PostgreSQL, from the schema `epg_<uuid without dashes>` in the library's database. Each guide handle gets a connection of its own, as the blobs do, and that connection and every reconnect run with the guide's schema as `search_path`. A guide whose schema does not exist stays SQLite. cluster-plex makes the schemas before PMS starts. PMS's load file, `<guide>-loading.db`, is never redirected: PMS fills it in SQLite and renames it onto the guide (talos, 2026-10-21), and cluster-plex copies each load into the schema.
 - The thread's query result cache keys a guide's statements by the guide's schema, so the same SELECT against a guide and against the library never shares an answer.
 
