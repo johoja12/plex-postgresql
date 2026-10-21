@@ -1256,11 +1256,14 @@ fn make_now_call() -> Expr {
 
 /// A bound time value as a timestamp, decided on its text when the
 /// statement runs: a number is seconds since the epoch, TO_TIMESTAMP's
-/// reading; anything else is a date or time, which SQLite reads as UTC:
+/// reading; a date or time in one of SQLite's forms is read as UTC; anything
+/// else is NULL, as SQLite reads a time value it cannot parse:
 /// CASE WHEN $n::TEXT ~ '<number>' THEN TO_TIMESTAMP($n::TEXT::DOUBLE
-/// PRECISION) ELSE $n::TEXT::TIMESTAMP AT TIME ZONE 'UTC' END. Both are
-/// zoned. The casts to TEXT also fix the parameter's type, which TO_TIMESTAMP
-/// alone made double precision.
+/// PRECISION) WHEN $n::TEXT ~* '<time>' THEN $n::TEXT::TIMESTAMP AT TIME ZONE
+/// 'UTC' END. Both are zoned. The casts to TEXT also fix the parameter's
+/// type, which TO_TIMESTAMP alone made double precision. A WHEN whose
+/// condition folds to false when the plan is made for the bound value is
+/// dropped unevaluated, so neither cast sees text it would refuse.
 fn make_bound_timestamp(param: Expr) -> Expr {
     let text = wrap_double_colon_cast(param, DataType::Text);
     let is_number = make_binary(
@@ -1272,6 +1275,11 @@ fn make_bound_timestamp(param: Expr) -> Expr {
         text.clone(),
         DataType::DoublePrecision,
     ));
+    let is_time = make_binary(
+        text.clone(),
+        BinaryOperator::PGRegexIMatch,
+        make_string_literal(SQLITE_TIME_VALUE),
+    );
     let date = Expr::AtTimeZone {
         timestamp: Box::new(wrap_double_colon_cast(
             text,
@@ -1279,8 +1287,30 @@ fn make_bound_timestamp(param: Expr) -> Expr {
         )),
         time_zone: Box::new(make_string_literal("UTC")),
     };
-    make_case_when(is_number, seconds, date)
+    Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![
+            CaseWhen {
+                condition: is_number,
+                result: seconds,
+            },
+            CaseWhen {
+                condition: is_time,
+                result: date,
+            },
+        ],
+        else_result: None,
+    }
 }
+
+/// The time values SQLite reads besides a number (its date and time
+/// functions' "Time Values"): YYYY-MM-DD, then optionally T or a space and
+/// HH:MM, :SS and .SSS, then optionally Z or ±HH:MM; or "now". A time of
+/// day alone, which SQLite puts on 2000-01-01, is NULL here: PostgreSQL's
+/// timestamp refuses one.
+const SQLITE_TIME_VALUE: &str = r"^\s*(now|[0-9]{4}-[0-9]{2}-[0-9]{2}([ T][0-9]{2}:[0-9]{2}(:[0-9]{2}(\.[0-9]+)?)?)?\s*(z|[-+][0-9]{2}:[0-9]{2})?)\s*$";
 
 /// Build a TO_TIMESTAMP(expr) function call.
 fn make_to_timestamp(source: Expr) -> Expr {

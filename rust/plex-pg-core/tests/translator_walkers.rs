@@ -329,20 +329,41 @@ fn a_bound_time_value_is_read_as_a_date_or_as_seconds() {
     let (sql, n) = t(
         "SELECT id FROM media_items WHERE begins_at < strftime('%s', ?, '+1 days') AND ends_at > strftime('%s', ?)",
     );
-    let bound = |p: &str| {
-        format!(
-            "CASE WHEN {p}::TEXT ~ '^\\s*[-+]?[0-9]+(\\.[0-9]*)?\\s*$' THEN TO_TIMESTAMP({p}::TEXT::DOUBLE PRECISION) ELSE {p}::TEXT::TIMESTAMP AT TIME ZONE 'UTC' END"
-        )
-    };
     assert_eq!(
         sql,
         format!(
             "SELECT id FROM media_items WHERE begins_at < EXTRACT(EPOCH FROM {} + INTERVAL '1 days')::BIGINT AND ends_at > EXTRACT(EPOCH FROM {})::BIGINT",
-            bound("$1"),
-            bound("$2")
+            bound_time("$1"),
+            bound_time("$2")
         )
     );
     assert_eq!(n, 2);
+}
+
+// A Plex client asked a guide for the day "Invalid Date" (talos,
+// 2026-10-21). SQLite reads a time value it cannot parse as NULL, so the
+// guide has no airings for it; PostgreSQL refused the cast and the request
+// failed. Only SQLite's own forms are cast -- a date, a date and time with T
+// or a space, seconds, fractions and a zone optional, or "now" -- and
+// anything else is NULL.
+#[test]
+fn a_bound_time_value_that_is_no_time_is_null() {
+    let (sql, n) = t("SELECT strftime('%s', ?)");
+    assert_eq!(
+        sql,
+        format!("SELECT EXTRACT(EPOCH FROM {})::BIGINT", bound_time("$1"))
+    );
+    assert_eq!(n, 1);
+}
+
+/// What a bound time value `p` translates to.
+fn bound_time(p: &str) -> String {
+    let number = r"^\s*[-+]?[0-9]+(\.[0-9]*)?\s*$";
+    let time = r"^\s*(now|[0-9]{4}-[0-9]{2}-[0-9]{2}([ T][0-9]{2}:[0-9]{2}(:[0-9]{2}(\.[0-9]+)?)?)?\s*(z|[-+][0-9]{2}:[0-9]{2})?)\s*$";
+    format!(
+        "CASE WHEN {p}::TEXT ~ '{number}' THEN TO_TIMESTAMP({p}::TEXT::DOUBLE PRECISION) \
+         WHEN {p}::TEXT ~* '{time}' THEN {p}::TEXT::TIMESTAMP AT TIME ZONE 'UTC' END"
+    )
 }
 
 #[test]
