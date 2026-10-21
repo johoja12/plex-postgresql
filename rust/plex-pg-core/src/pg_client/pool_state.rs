@@ -228,9 +228,60 @@ impl PoolManager {
         None
     }
 
+    /// Where a connection pointer sits in the pool, for a log line: its slot,
+    /// the slot's state, whether this thread owns it and whether a handle is
+    /// still recorded on it; "not pooled" when no slot holds it.
+    pub fn describe_connection(&self, conn_ptr: *const c_void, this_thread: u64) -> String {
+        match self.find_connection_slot(conn_ptr) {
+            None => "not pooled".to_string(),
+            Some((i, state)) => {
+                let state = match state {
+                    SLOT_FREE => "FREE",
+                    SLOT_RESERVED => "RESERVED",
+                    SLOT_READY => "READY",
+                    SLOT_RECONNECTING => "RECONNECTING",
+                    SLOT_ERROR => "ERROR",
+                    _ => "?",
+                };
+                let owner = self.slots[i].owner_thread.load(Ordering::Acquire);
+                format!(
+                    "slot {} {} owner={} refs={}",
+                    i,
+                    state,
+                    if owner == this_thread {
+                        "this thread"
+                    } else {
+                        "another thread"
+                    },
+                    self.db_to_pool.references(i)
+                )
+            }
+        }
+    }
+
     /// Check if a connection pointer is in any READY pool slot.
     pub fn validate_connection(&self, conn_ptr: *const c_void) -> bool {
         matches!(self.find_connection_slot(conn_ptr), Some((_, SLOT_READY)))
+    }
+
+    /// Whether a statement letting go of its stream may settle the
+    /// connection it streamed on (drain it, cancelling a query still sending
+    /// rows): a READY slot's connection, or a handle's own connection, which
+    /// no slot holds and the registry still lists.
+    ///
+    /// Plex's blobs database streams on its handle's own connection, never a
+    /// pooled one, so `validate_connection` alone refused every one of its
+    /// streams: 2,022 "streaming_conn invalid" lines in four hours on talos
+    /// (2026-10-20), nearly all one cached `SELECT COUNT(*) FROM blobs`
+    /// that Plex resets after its one row.
+    pub fn stream_settles_on(&self, conn_ptr: *const c_void) -> bool {
+        if conn_ptr.is_null() {
+            return false;
+        }
+        match self.find_connection_slot(conn_ptr) {
+            Some((_, state)) => state == SLOT_READY,
+            None => self.registry.contains_conn(conn_ptr as usize),
+        }
     }
 
     /// Best-effort release of a stale streaming flag for a tracked pool connection.

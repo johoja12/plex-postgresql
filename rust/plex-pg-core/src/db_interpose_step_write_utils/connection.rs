@@ -198,7 +198,7 @@ pub extern "C" fn rust_step_write_prepare_connection(
                     ec.conn = new_write_conn;
                     ec.is_pg_active = 1;
                     log_info("STEP WRITE: fresh connection succeeded (reconnected)");
-                    apply_pg_session_settings(ec.conn, &*cfg);
+                    apply_pg_session_settings(ec.conn, &*cfg, ec.db_path.as_ptr());
                 } else {
                     let reset_err = crate::libpq_helpers::rust_pq_error_message(new_write_conn);
                     log_error(&format!(

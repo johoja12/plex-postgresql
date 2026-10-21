@@ -176,6 +176,8 @@ fn a_registered_library_handle_is_pg_backed() {
 fn a_redirected_handle_without_a_peekable_connection_reports_no_error() {
     let handle = fake_conn("/x/com.plexapp.plugins.library.db");
     unsafe { (*handle).is_pg_active = 0 };
+    // The process-wide registry is shared by parallel tests. Keep this
+    // allocation alive until unregistering so no other test can reuse it.
     let db_storage = Box::new(0_u8);
     let db = (&*db_storage as *const u8).cast::<sqlite3>();
     unsafe { (*handle).shadow_db = db as *mut sqlite3 };

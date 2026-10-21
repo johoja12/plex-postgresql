@@ -6,13 +6,14 @@ use crate::db_interpose_conn_utils::{log_error, log_info, PthreadMutexGuard};
 use crate::db_interpose_helpers::cstr_to_str_or_empty;
 use crate::ffi_types::{conn_ref, conn_unref, sqlite3, PgConnection};
 use crate::libpq_helpers::{
-    rust_pq_connectdb, rust_pq_error_message, rust_pq_finish, rust_pq_reset, rust_pq_status,
-    rust_pq_transaction_status, PGconn,
+    rust_pq_clear, rust_pq_connectdb, rust_pq_error_message, rust_pq_exec, rust_pq_finish,
+    rust_pq_ntuples, rust_pq_reset, rust_pq_result_status, rust_pq_status,
+    rust_pq_transaction_status, PGconn, PGRES_TUPLES_OK,
 };
 
 use super::session::{apply_session_settings, exec_tuples, pg_set_socket_timeout, CONNECTION_OK};
 use super::{
-    conn_config, is_library_db, pool, rust_stmt_cache_clear, rust_stmt_cache_drop,
+    conn_config, conn_db_path, is_library_db, pool, rust_stmt_cache_clear, rust_stmt_cache_drop,
     write_str_to_cbuf, ConnConfig,
 };
 use crate::log_debug_lazy;
@@ -349,13 +350,51 @@ pub extern "C" fn rust_pg_connect(
         }
         conn.conn = std::ptr::null_mut();
     } else {
+        // A guide whose schema nobody has made yet (its DVR was created
+        // since the last start) stays the SQLite file it is: no handle is
+        // registered, so every statement reaches SQLite as before the shim
+        // served guides.
+        if let Some(schema) = crate::db_interpose_helpers::epg_schema_for_path(db_path_str) {
+            if !schema_exists(conn.conn, &schema) {
+                log_info(&format!(
+                    "Live TV guide {} has no schema {} in PostgreSQL: it stays SQLite",
+                    db_path_str, schema
+                ));
+                rust_pq_finish(conn.conn);
+                conn.conn = std::ptr::null_mut();
+                destroy_connection_struct(conn_ptr);
+                return std::ptr::null_mut();
+            }
+        }
         log_info_lazy!("PostgreSQL connected for: {}", db_path_str);
         pg_set_socket_timeout(conn.conn);
-        apply_session_settings(conn.conn, &cfg.schema, false);
+        apply_session_settings(conn.conn, &handle_schema(db_path_str, cfg), false);
         conn.is_pg_active = 1;
     }
 
     conn_ptr
+}
+
+/// The schema a handle's own connection runs in: a Live TV guide's, or the
+/// library's for every other database.
+fn handle_schema(db_path: &str, cfg: &ConnConfig) -> String {
+    crate::db_interpose_helpers::epg_schema_for_path(db_path).unwrap_or_else(|| cfg.schema.clone())
+}
+
+/// Whether `schema` exists. Only called with an `epg_<hex>` name, which
+/// needs no quoting.
+fn schema_exists(pg_conn: *mut PGconn, schema: &str) -> bool {
+    let sql = format!("SELECT 1 FROM pg_namespace WHERE nspname = '{}'", schema);
+    let Ok(cs) = CString::new(sql) else {
+        return false;
+    };
+    let res = rust_pq_exec(pg_conn, cs.as_ptr());
+    let found =
+        !res.is_null() && rust_pq_result_status(res) == PGRES_TUPLES_OK && rust_pq_ntuples(res) > 0;
+    if !res.is_null() {
+        rust_pq_clear(res);
+    }
+    found
 }
 
 #[no_mangle]
@@ -410,7 +449,7 @@ pub extern "C" fn rust_pg_ensure_connection(conn_ptr: *mut PgConnection) -> i32 
 
     log_info("PostgreSQL reconnected successfully");
     pg_set_socket_timeout(conn.conn);
-    apply_session_settings(conn.conn, &cfg.schema, false);
+    apply_session_settings(conn.conn, &handle_schema(&conn_db_path(conn), cfg), false);
     conn.is_pg_active = 1;
     unsafe { conn_guard.unlock() };
     1

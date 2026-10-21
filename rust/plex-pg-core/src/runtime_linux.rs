@@ -403,14 +403,9 @@ pub extern "C" fn ensure_real_sqlite_loaded() {
 // /proc/self/cmdline is NUL-separated. Arguments may contain slashes (for
 // example the scanner's --content-type=application/json); only argv[0]
 // identifies the executable whose database calls we must interpose.
-fn executable_basename(cmdline: &[u8]) -> &[u8] {
-    let executable = cmdline.split(|&b| b == 0).next().unwrap_or_default();
-    executable.rsplit(|&b| b == b'/').next().unwrap_or_default()
-}
-
 #[cfg(test)]
 mod process_name_tests {
-    use super::executable_basename;
+    use crate::runtime_common::process_label as executable_basename;
 
     #[test]
     fn scanner_json_argument_does_not_disable_interposition() {
@@ -449,7 +444,7 @@ unsafe extern "C" fn shim_init() {
         || {
             // Process name filtering: skip non-server/scanner processes.
             if let Ok(cmdline) = std::fs::read("/proc/self/cmdline") {
-                let base = executable_basename(&cmdline);
+                let base = crate::runtime_common::process_label(&cmdline);
                 let base_str = std::str::from_utf8(base).unwrap_or_default();
                 if !base_str.contains("Plex Media Server")
                     && !base_str.contains("Plex Media Scanner")

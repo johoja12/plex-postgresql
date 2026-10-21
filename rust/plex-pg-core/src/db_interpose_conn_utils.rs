@@ -190,11 +190,25 @@ pub(crate) unsafe fn connect_new(cfg: &PgConnConfig) -> *mut PGconn {
     crate::libpq_helpers::rust_pq_connectdb(conninfo.as_ptr())
 }
 
-pub(crate) unsafe fn apply_pg_session_settings(conn: *mut PGconn, cfg: &PgConnConfig) {
+/// Sets a fresh or reset connection's session up for the database at
+/// `db_path`: a Live TV guide's own schema, or the library's.
+pub(crate) unsafe fn apply_pg_session_settings(
+    conn: *mut PGconn,
+    cfg: &PgConnConfig,
+    db_path: *const c_char,
+) {
     if conn.is_null() {
         return;
     }
-    let schema_cmd = format!("SET search_path TO {}, public", cbuf_to_str(&cfg.schema));
+    let guide = if db_path.is_null() {
+        None
+    } else {
+        crate::db_interpose_helpers::epg_schema_for_path(
+            crate::db_interpose_helpers::cstr_to_str_or_empty(db_path),
+        )
+    };
+    let schema = guide.unwrap_or_else(|| cbuf_to_str(&cfg.schema).to_string());
+    let schema_cmd = format!("SET search_path TO {}, public", schema);
     if let Ok(schema_c) = CString::new(schema_cmd) {
         let res = crate::libpq_helpers::rust_pq_exec(conn, schema_c.as_ptr());
         if !res.is_null() {

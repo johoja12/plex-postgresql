@@ -22,10 +22,18 @@ BEGIN
        OR (to_tsvector('simple', plex.fold('other')) @@ plex.fts_query('é* OR 日本*'))
        OR NOT (to_tsvector('simple', plex.fold('a O日')) @@ plex.fts_query('a O日'))
     THEN RAISE EXCEPTION 'FTS prefix, OR or Unicode regression'; END IF;
-    IF (SELECT count(*) FROM pg_indexes WHERE schemaname = 'plex'
-        AND indexname IN ('idx_metadata_items_title_fts', 'idx_metadata_items_title_sort_fts',
-                         'idx_metadata_items_original_title_fts', 'idx_tags_tag_fts')
-        AND indexdef LIKE '%plex.fold(%') <> 4
+    -- pg_get_indexdef omits "plex." when that schema is on search_path,
+    -- as it is by default for the production database owner named plex.
+    -- Check the function dependency instead of its rendered spelling.
+    IF (SELECT count(*) FROM pg_indexes i
+        WHERE i.schemaname = 'plex'
+        AND i.indexname IN ('idx_metadata_items_title_fts', 'idx_metadata_items_title_sort_fts',
+                           'idx_metadata_items_original_title_fts', 'idx_tags_tag_fts')
+        AND EXISTS (SELECT 1 FROM pg_depend d
+                    WHERE d.classid = 'pg_class'::regclass
+                      AND d.objid = format('%I.%I', i.schemaname, i.indexname)::regclass
+                      AND d.refclassid = 'pg_proc'::regclass
+                      AND d.refobjid = 'plex.fold(text)'::regprocedure)) <> 4
     THEN RAISE EXCEPTION 'FTS expressions lack matching indexes'; END IF;
 END;
 $test$;

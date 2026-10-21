@@ -443,6 +443,59 @@ fn common_helpers_is_library_db_path_rejects_non_library_paths() {
     assert!(!is_library_db_path_impl("library.db"));
 }
 
+const GUIDE: &str = "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases/tv.plex.providers.epg.xmltv-adfe4a6f-79d0-4135-93d5-edf0235ec02b.db";
+
+#[test]
+fn a_live_tv_guide_is_served_from_a_schema_named_for_its_dvr() {
+    // The file name talos's DVR 2 gave its guide (2026-10-20).
+    assert_eq!(
+        epg_schema_for_path_impl(GUIDE).as_deref(),
+        Some("epg_adfe4a6f79d0413593d5edf0235ec02b")
+    );
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert_eq!(
+            epg_schema_for_path_impl(&format!("{GUIDE}{suffix}")).as_deref(),
+            Some("epg_adfe4a6f79d0413593d5edf0235ec02b"),
+            "{suffix}"
+        );
+    }
+    assert_eq!(
+        epg_schema_for_path_impl(
+            "tv.plex.providers.epg.cloud-ADFE4A6F-79D0-4135-93D5-EDF0235EC02B.db"
+        )
+        .as_deref(),
+        Some("epg_adfe4a6f79d0413593d5edf0235ec02b"),
+        "lower-cased"
+    );
+}
+
+#[test]
+fn only_a_guide_with_a_real_uuid_has_a_schema() {
+    for path in [
+        "/x/com.plexapp.plugins.library.db",
+        "/x/tv.plex.providers.epg.xmltv.db",
+        "/x/tv.plex.providers.epg.xmltv-not-a-uuid.db",
+        "/x/tv.plex.providers.epg.xmltv-adfe4a6f-79d0-4135-93d5-edf0235ec02z.db",
+        "/x/tv.plex.providers.epg.xmltv-adfe4a6f79d0413593d5edf0235ec02b0000.db",
+        "/x/tv.plex.providers.epg.-adfe4a6f-79d0-4135-93d5-edf0235ec02b.db",
+        "/x/tv.plex.providers.epg.x;y-adfe4a6f-79d0-4135-93d5-edf0235ec02b.db",
+        "/x/tv.plex.providers.epg.xmltv-adfe4a6f-79d0-4135-93d5-edf0235ec02b.db.bak",
+        "/x/other.tv.plex.providers.epg.xmltv-adfe4a6f-79d0-4135-93d5-edf0235ec02b.db",
+        "",
+    ] {
+        assert_eq!(epg_schema_for_path_impl(path), None, "{path}");
+    }
+}
+
+#[test]
+fn a_live_tv_guide_is_served_from_postgresql_like_the_library() {
+    assert!(is_library_db_path_impl(GUIDE));
+    assert!(is_library_or_blobs_db_path_impl(GUIDE));
+    assert!(!is_library_db_path_impl(
+        "/x/tv.plex.providers.epg.xmltv-nope.db"
+    ));
+}
+
 #[test]
 fn common_helpers_is_library_db_path_accepts_wal_suffix() {
     assert!(is_library_db_path_impl(

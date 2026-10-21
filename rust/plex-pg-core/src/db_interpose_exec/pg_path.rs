@@ -112,7 +112,7 @@ pub(crate) fn exec_via_postgres(
                         pg.conn = new_conn;
                         pg.is_pg_active = 1;
                         log_info("EXEC: fresh connection succeeded (reconnected)");
-                        apply_pg_session_settings(pg.conn, cfg);
+                        apply_pg_session_settings(pg.conn, cfg, pg.db_path.as_ptr());
                     } else {
                         log_error(&format!(
                             "EXEC: fresh connection also failed: {}",
@@ -132,7 +132,7 @@ pub(crate) fn exec_via_postgres(
                 }
                 let cfg = pg_config_get();
                 if !cfg.is_null() {
-                    apply_pg_session_settings(pg.conn, &*cfg);
+                    apply_pg_session_settings(pg.conn, &*cfg, pg.db_path.as_ptr());
                 }
             } else {
                 let rcfg = pg_config_get();
@@ -150,7 +150,7 @@ pub(crate) fn exec_via_postgres(
                     log_error("EXEC: fresh connection from NULL succeeded");
                     let cfg2 = pg_config_get();
                     if !cfg2.is_null() {
-                        apply_pg_session_settings(pg.conn, &*cfg2);
+                        apply_pg_session_settings(pg.conn, &*cfg2, pg.db_path.as_ptr());
                     }
                 } else {
                     log_error(&format!(

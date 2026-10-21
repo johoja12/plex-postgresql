@@ -509,6 +509,19 @@ pub fn rust_query_cache_key(
     compute_cache_key(sql_bytes, &params)
 }
 
+/// A cache key moved into a schema of its own: the key of the same statement
+/// run in `schema`, never 0 and never the library's.
+pub fn rust_query_cache_key_in_schema(key: u64, schema: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    schema.hash(&mut h);
+    match h.finish() {
+        0 => 1,
+        k => k,
+    }
+}
+
 /// Look up a cached result by cache key.
 ///
 /// Returns a pointer to the `cached_result_t` if found and not expired,
@@ -930,6 +943,25 @@ pub fn rust_query_cache_stats(hits: *mut u64, misses: *mut u64) {
 }
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod schema_key_tests {
+    use super::rust_query_cache_key_in_schema;
+
+    #[test]
+    fn a_guides_statement_never_shares_the_librarys_cache_entry() {
+        let library = 0x1234_5678_9abc_def0u64;
+        let guide = rust_query_cache_key_in_schema(library, "epg_adfe4a6f79d0413593d5edf0235ec02b");
+        let other = rust_query_cache_key_in_schema(library, "epg_00000000000000000000000000000001");
+        assert_ne!(guide, library);
+        assert_ne!(guide, other, "each guide has its own entries");
+        assert_ne!(guide, 0, "0 means no cache");
+        assert_eq!(
+            guide,
+            rust_query_cache_key_in_schema(library, "epg_adfe4a6f79d0413593d5edf0235ec02b")
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

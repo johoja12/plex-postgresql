@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration; fresh schemas include the same indexes. Trigram operator classes
   are resolved from the installed extension's schema.
 
+### v1.3.17-clusterplex.35 (2026-10-21)
+
+- A Live TV guide database, `tv.plex.providers.epg.<provider>-<DVR uuid>.db`, is served from PostgreSQL, from the schema `epg_<uuid without dashes>` in the library's database. Each guide handle gets a connection of its own, as the blobs do, and that connection and every reconnect run with the guide's schema as `search_path`. A guide whose schema does not exist stays SQLite. cluster-plex makes the schemas before PMS starts. PMS's load file, `<guide>-loading.db`, is never redirected: PMS fills it in SQLite and renames it onto the guide (talos, 2026-10-21), and cluster-plex copies each load into the schema.
+- The thread's query result cache keys a guide's statements by the guide's schema, so the same SELECT against a guide and against the library never shares an answer.
+
+### v1.3.17-clusterplex.34 (2026-10-20)
+
+- `pg_stmt_clear_result`'s "streaming_conn invalid" line, a burst of which followed every collection write on talos under clusterplex.33, is INFO rather than ERROR (the flag is cleared and the statement lets go either way) and now says where the connection is: its pool slot, the slot's state, whether this thread owns it and the handle references on it, or "not pooled".
+- A statement letting go of its stream settles a handle's own connection as it does a READY slot's (`PoolManager::stream_settles_on`). Plex's blobs database streams on its handle's connection, which no slot holds, so every reset of its cached `SELECT COUNT(*) FROM blobs` was the "streaming_conn invalid" line: 2,022 of plex-0's 2,272 log lines on talos in four hours (2026-10-20). Settling cancels only a query still sending rows. It clears the results already received first, so a reset after a one-row COUNT opens no cancel connection to the server.
+
 ### v1.3.17-clusterplex.33 (2026-10-16)
 
 The clusterplex.31 regressions seen on talos, each reproduced on the standalone rig (`docker-compose.standalone.yml`) and fixed: a MATCH followed by AND or OR keeps the conjunction outside `plex.fts_query`; no pool slot is given back at thread exit; a CASE whose branch is a condition makes its 0/1 booleans and an integer CASE read as a condition compares with 0; the rtree stays out of the shadow schema; a DISTINCT keeps a GROUP BY an aggregate reads; `errcode`/`errmsg` on a redirected handle never read the shadow SQLite's stale error, and a successful step clears the connection's last error (Plex polls errcode on its error path, and one failed statement used to make every later request throw). The migration hands its objects to the `plex` role when applied as a superuser.

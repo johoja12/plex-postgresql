@@ -114,3 +114,53 @@ pub(crate) fn handle_exception_with_tls(
     });
     (handled, should_call_original)
 }
+
+/// Identify the executable without letting paths in later arguments change
+/// its identity. A subreaper wrapper names its child in argv[1].
+pub(crate) fn process_label(cmdline: &[u8]) -> &[u8] {
+    fn basename(arg: &[u8]) -> &[u8] {
+        arg.rsplit(|&b| b == b'/').next().unwrap_or_default()
+    }
+    let mut args = cmdline.split(|&b| b == 0);
+    let executable = basename(args.next().unwrap_or_default());
+    if executable == b"subreaper" {
+        return basename(args.next().unwrap_or_default());
+    }
+    executable
+}
+
+#[cfg(test)]
+mod process_label_tests {
+    use super::process_label;
+
+    #[test]
+    fn a_process_is_named_by_its_executable_or_subreaper_child() {
+        assert_eq!(
+            process_label(
+                b"/usr/local/bin/subreaper\0/usr/lib/plexmediaserver/Plex Media Server\0"
+            ),
+            b"Plex Media Server"
+        );
+        assert_eq!(
+            process_label(b"/usr/lib/plexmediaserver/Plex Media Server\0"),
+            b"Plex Media Server"
+        );
+        assert_eq!(process_label(b"Plex Media Server\0"), b"Plex Media Server");
+        assert_eq!(
+            process_label(b"/usr/lib/plexmediaserver/Plex Tuner Service\0--port\0"),
+            b"Plex Tuner Service"
+        );
+        assert_eq!(process_label(b""), b"");
+        assert_eq!(process_label(b"subreaper\0"), b"");
+        assert_eq!(
+            process_label(b"/bin/subreaper\0/usr/lib/Plex Media Server\0/mnt/media/Movies\0"),
+            b"Plex Media Server"
+        );
+        assert_eq!(
+            process_label(
+                b"/usr/lib/Plex Transcoder\0https://host/manifest?X-Plex-Http-Pipeline=infinite\0"
+            ),
+            b"Plex Transcoder"
+        );
+    }
+}
