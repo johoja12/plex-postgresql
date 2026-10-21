@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.37 (unreleased)
+
+- A join whose ON clause names a later inner join's alias gets that join moved ahead of it, its own definers first (`hoist_forward_referenced_joins`). SQLite resolves an ON clause against the whole FROM clause; PostgreSQL against the joins before it. PMS builds the Live TV "What's On" hub (`/tv.plex.providers.epg.xmltv:N/hubs/discover`) by joining the hub's items on `grandchildren.id` four joins before it joins `metadata_items AS children` and `AS grandchildren`, so once the guide was served from PostgreSQL every "What's On" answered 500 with `missing FROM-clause entry for table "grandchildren"` (450 in twelve hours on talos, 2026-10-21). A LEFT JOIN is never moved, and a statement that would need one moved is left as it came.
+
 ### v1.3.17-clusterplex.36 (2026-10-21)
 
 - A bound time value in strftime, datetime, date, time or unixepoch without `'unixepoch'` is read as a date when its text is one, and as seconds since the epoch when it is a number. A number keeps the shim's existing reading. PMS asks a Live TV guide for a day's airings with the day bound as text (`strftime('%s', ?, '+1 days')` with `'2026-10-21'`), and `TO_TIMESTAMP($n)` refused it: once the guide was served from PostgreSQL (clusterplex.35), every such query failed with "invalid input syntax for type double precision", 4,341 in ten minutes on talos.

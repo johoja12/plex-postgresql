@@ -559,3 +559,100 @@ fn a_distinct_over_a_group_by_with_an_aggregate_keeps_the_group_by() {
     let t = translate("select distinct tags.id from tags group by tags.id").unwrap();
     assert_eq!(t.sql, "SELECT DISTINCT tags.id FROM tags");
 }
+
+// ─── a join that names a later join's alias ──────────────────────────────────
+//
+// SQLite resolves an ON clause against the whole FROM clause; PostgreSQL
+// against the joins before it. Plex's Live TV "What's On" hub joined a hub's
+// items on grandchildren.id four joins before it joined grandchildren
+// (talos, 2026-10-21: every /hubs/discover answered 500, "missing
+// FROM-clause entry for table "grandchildren"").
+
+const WHATS_ON: &str = "select distinct metadata_items.id as \"metadata_items_id\" from metadata_items \
+ join media_items on media_items.metadata_item_id=grandchildren.id \
+ join media_parts on media_parts.media_item_id=media_items.id \
+ join play_queue_generators on play_queue_generators.metadata_item_id=grandchildren.id and play_queue_generators.playlist_id=1667 \
+ left join metadata_item_settings on metadata_item_settings.guid=metadata_items.guid and metadata_item_settings.account_id=1 \
+ join metadata_items as children on children.parent_id=metadata_items.id \
+ join metadata_items as grandchildren on grandchildren.parent_id=children.id \
+ where metadata_items.id in (1, 2) order by metadata_items.title_sort";
+
+#[test]
+fn a_join_that_names_a_later_alias_gets_that_join_moved_ahead_of_it() {
+    let out = sql(WHATS_ON);
+    assert_eq!(
+        out,
+        "SELECT DISTINCT metadata_items.id AS \"metadata_items_id\", metadata_items.title_sort FROM metadata_items \
+         JOIN metadata_items AS children ON children.parent_id = metadata_items.id \
+         JOIN metadata_items AS grandchildren ON grandchildren.parent_id = children.id \
+         JOIN media_items ON media_items.metadata_item_id = grandchildren.id \
+         JOIN media_parts ON media_parts.media_item_id = media_items.id \
+         JOIN play_queue_generators ON play_queue_generators.metadata_item_id = grandchildren.id AND play_queue_generators.playlist_id = 1667 \
+         LEFT JOIN metadata_item_settings ON metadata_item_settings.guid = metadata_items.guid AND metadata_item_settings.account_id = 1 \
+         WHERE metadata_items.id IN (1, 2) ORDER BY metadata_items.title_sort"
+    );
+}
+
+#[test]
+fn joins_in_scope_order_are_left_in_their_order() {
+    let out = sql(
+        "select media_items.id from metadata_items \
+         left join metadata_item_settings on metadata_item_settings.guid=metadata_items.guid \
+         join media_items on media_items.metadata_item_id=metadata_items.id \
+         join media_parts on media_parts.media_item_id=media_items.id where media_parts.id=?",
+    );
+    assert_eq!(
+        out,
+        "SELECT media_items.id FROM metadata_items \
+         LEFT JOIN metadata_item_settings ON metadata_item_settings.guid = metadata_items.guid \
+         JOIN media_items ON media_items.metadata_item_id = metadata_items.id \
+         JOIN media_parts ON media_parts.media_item_id = media_items.id WHERE media_parts.id = $1"
+    );
+}
+
+#[test]
+fn a_join_that_needs_a_later_left_join_is_left_as_it_came() {
+    // Moving a LEFT JOIN changes which rows survive; PostgreSQL's error is
+    // better than a quietly different answer.
+    let input = "select 1 from metadata_items \
+                 join media_items on media_items.metadata_item_id=s.metadata_item_id \
+                 left join metadata_item_settings as s on s.guid=metadata_items.guid";
+    assert_eq!(
+        sql(input),
+        "SELECT 1 FROM metadata_items \
+         JOIN media_items ON media_items.metadata_item_id = s.metadata_item_id \
+         LEFT JOIN metadata_item_settings AS s ON s.guid = metadata_items.guid"
+    );
+}
+
+#[test]
+fn a_qualifier_no_join_defines_moves_nothing() {
+    // An outer query's alias, or a typo: not this rule's to fix.
+    let input = "select 1 from metadata_items \
+                 join media_items on media_items.metadata_item_id=outer_q.id \
+                 join media_parts on media_parts.media_item_id=media_items.id";
+    assert_eq!(
+        sql(input),
+        "SELECT 1 FROM metadata_items \
+         JOIN media_items ON media_items.metadata_item_id = outer_q.id \
+         JOIN media_parts ON media_parts.media_item_id = media_items.id"
+    );
+}
+
+#[test]
+fn a_hoisted_join_takes_its_own_definers_with_it() {
+    // grandchildren needs children, which is defined after it too.
+    let out = sql(
+        "select 1 from metadata_items \
+         join media_items on media_items.metadata_item_id=grandchildren.id \
+         join metadata_items as grandchildren on grandchildren.parent_id=children.id \
+         join metadata_items as children on children.parent_id=metadata_items.id",
+    );
+    assert_eq!(
+        out,
+        "SELECT 1 FROM metadata_items \
+         JOIN metadata_items AS children ON children.parent_id = metadata_items.id \
+         JOIN metadata_items AS grandchildren ON grandchildren.parent_id = children.id \
+         JOIN media_items ON media_items.metadata_item_id = grandchildren.id"
+    );
+}
