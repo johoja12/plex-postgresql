@@ -85,4 +85,42 @@ CREATE OPERATOR public.= (
   COMMUTATOR = OPERATOR(public.=)
 );
 
+-- The plex schema's integer/text = (plex_schema.sql), in public as well: a
+-- Live TV guide's connection runs on the guide's own schema and public, so
+-- it could not see plex's, and PostgreSQL refused every comparison of an
+-- integer with text there ("operator does not exist: integer = text", talos,
+-- 2026-10-21). The library's search path finds plex's first, which is the
+-- same function.
+CREATE OR REPLACE FUNCTION public.integer_equals_text(integer, text)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT $1 = $2::integer;
+$$;
+
+CREATE OR REPLACE FUNCTION public.text_equals_integer(text, integer)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT $1::integer = $2;
+$$;
+
+DROP OPERATOR IF EXISTS public.= (integer, text);
+CREATE OPERATOR public.= (
+  FUNCTION = public.integer_equals_text,
+  LEFTARG = integer,
+  RIGHTARG = text,
+  COMMUTATOR = OPERATOR(public.=)
+);
+
+DROP OPERATOR IF EXISTS public.= (text, integer);
+CREATE OPERATOR public.= (
+  FUNCTION = public.text_equals_integer,
+  LEFTARG = text,
+  RIGHTARG = integer,
+  COMMUTATOR = OPERATOR(public.=)
+);
+
 
