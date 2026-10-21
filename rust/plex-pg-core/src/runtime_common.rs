@@ -115,40 +115,47 @@ pub(crate) fn handle_exception_with_tls(
     (handled, should_call_original)
 }
 
-/// The program's own name from `/proc/self/cmdline`: argv[0]'s base name.
-///
-/// Not the text after the last `/` of the whole command line, which is what
-/// the shim read until 2026-10-20: an argument holding a slash named the
-/// process after itself. Plex Transcoder logged as
-/// `manifest?X-Plex-Http-Pipeline=infinite`, its manifest URL's tail, and a
-/// Plex Media Scanner given a directory would have lost the shim and read
-/// the empty SQLite shadow.
-pub(crate) fn process_base_name(cmdline: &[u8]) -> &[u8] {
-    let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or(&[]);
-    match argv0.iter().rposition(|&b| b == b'/') {
-        Some(pos) => &argv0[pos + 1..],
-        None => argv0,
+/// The name the process check reads from `/proc/self/cmdline`: the text
+/// after the command line's last `/`, up to the next argument. That is
+/// argv[0]'s base name unless an argument holds a `/`, which then names the
+/// process: Plex Transcoder's manifest URL ends in
+/// `manifest?X-Plex-Http-Pipeline=infinite`, and the wrapper Plex runs under,
+/// `subreaper "/usr/lib/plexmediaserver/Plex Media Server"`, reads as Plex
+/// Media Server (talos's is a static binary, which the shim never loads in).
+/// Which processes argv[0] alone would change has not been looked into on
+/// PMS, so the check reads what it always has.
+pub(crate) fn process_label(cmdline: &[u8]) -> &[u8] {
+    let mut label = cmdline;
+    if let Some(pos) = cmdline.iter().rposition(|&b| b == b'/') {
+        label = &cmdline[pos + 1..];
+    }
+    match label.iter().position(|&b| b == 0) {
+        Some(pos) => &label[..pos],
+        None => label,
     }
 }
 
 #[cfg(test)]
-mod process_name_tests {
-    use super::process_base_name;
+mod process_label_tests {
+    use super::process_label;
 
     #[test]
-    fn a_process_is_named_by_its_own_program_not_an_argument() {
-        let transcoder = b"/usr/lib/plexmediaserver/Plex Transcoder\0-codec:0\0h264\0http://127.0.0.1:32400/video/:/transcode/session/x/progress\0/transcode/Transcode/Sessions/plex-transcode-x/manifest?X-Plex-Http-Pipeline=infinite\0";
-        assert_eq!(process_base_name(transcoder), b"Plex Transcoder");
-        let scanner = b"/usr/lib/plexmediaserver/Plex Media Scanner\0--directory\0/media/movies/Heat (1995)\0";
-        assert_eq!(process_base_name(scanner), b"Plex Media Scanner");
+    fn a_process_is_named_by_the_text_after_its_command_lines_last_slash() {
         assert_eq!(
-            process_base_name(b"/usr/lib/plexmediaserver/Plex Media Server\0"),
+            process_label(
+                b"/usr/local/bin/subreaper\0/usr/lib/plexmediaserver/Plex Media Server\0"
+            ),
             b"Plex Media Server"
         );
         assert_eq!(
-            process_base_name(b"Plex Media Server\0"),
+            process_label(b"/usr/lib/plexmediaserver/Plex Media Server\0"),
             b"Plex Media Server"
         );
-        assert_eq!(process_base_name(b""), b"");
+        assert_eq!(process_label(b"Plex Media Server\0"), b"Plex Media Server");
+        assert_eq!(
+            process_label(b"/usr/lib/plexmediaserver/Plex Tuner Service\0--port\0"),
+            b"Plex Tuner Service"
+        );
+        assert_eq!(process_label(b""), b"");
     }
 }
