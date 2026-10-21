@@ -656,3 +656,65 @@ fn a_hoisted_join_takes_its_own_definers_with_it() {
          JOIN media_items ON media_items.metadata_item_id = grandchildren.id"
     );
 }
+
+// ─── json_each against an integer column ─────────────────────────────────────
+//
+// PMS asks for an item's streams with `st.media_item_id IN (SELECT value FROM
+// json_each(:C2))`. json_each is json_array_elements_text, whose value is
+// text, and PostgreSQL compares an integer with text only through the plex
+// schema's own operator, which a Live TV guide's connection, on the guide's
+// schema and public, cannot see (talos, 2026-10-21: "operator does not
+// exist: integer = text"). SQLite gives the elements the column's integer
+// affinity, so one that is no integer never matches: the list keeps its
+// integers, as bigints.
+
+/// The json_each list an integer column is compared with.
+const INTEGER_ELEMENTS: &str =
+    "SELECT value::BIGINT FROM json_array_elements_text($2::JSON) AS json_each \
+     WHERE value ~ '^\\s*[-+]?[0-9]{1,18}\\s*$'";
+
+#[test]
+fn an_integer_column_in_a_json_each_list_takes_its_integer_elements() {
+    let out = sql(
+        "SELECT st.`id`,st.`url` FROM media_streams st WHERE (st.`url` LIKE :C1 AND st.`media_item_id` IN (SELECT value FROM json_each(:C2)))",
+    );
+    assert_eq!(
+        out,
+        format!(
+            "SELECT st.\"id\", st.\"url\" FROM media_streams st \
+             WHERE (st.\"url\" ILIKE $1 AND st.\"media_item_id\" IN ({INTEGER_ELEMENTS}))"
+        )
+    );
+}
+
+#[test]
+fn an_integer_column_not_in_a_json_each_list_drops_the_other_elements_too() {
+    // NOT IN: an element that is no integer matches nothing, so it excludes
+    // nothing either.
+    let out = sql(
+        "SELECT st.`id` FROM media_streams st WHERE st.`url` LIKE :C1 AND st.`media_item_id` NOT IN (SELECT value FROM json_each(:C2))",
+    );
+    assert_eq!(
+        out,
+        format!(
+            "SELECT st.\"id\" FROM media_streams st \
+             WHERE st.\"url\" ILIKE $1 AND st.\"media_item_id\" NOT IN ({INTEGER_ELEMENTS})"
+        )
+    );
+}
+
+#[test]
+fn a_text_column_in_a_json_each_list_keeps_the_elements_text() {
+    // Plex's collection delete compares both kinds in one statement.
+    let out = sql(
+        "DELETE FROM taggings WHERE (`tag_id` IN (SELECT tg.`id` FROM tags tg WHERE (tg.`tag` IN (SELECT value FROM json_each(:C1)) AND tg.`tag_type`=:C2)) AND `metadata_item_id` IN (SELECT value FROM json_each(:C3)))",
+    );
+    assert_eq!(
+        out,
+        "DELETE FROM taggings WHERE (\"tag_id\" IN (SELECT tg.\"id\" FROM tags tg \
+         WHERE (tg.\"tag\" IN (SELECT value::TEXT FROM json_array_elements_text($1::JSON) AS json_each) \
+         AND tg.\"tag_type\" = $2)) \
+         AND \"metadata_item_id\" IN (SELECT value::BIGINT FROM json_array_elements_text($3::JSON) AS json_each \
+         WHERE value ~ '^\\s*[-+]?[0-9]{1,18}\\s*$'))"
+    );
+}

@@ -872,6 +872,9 @@ fn transform_expr_in(expr: &mut Expr, boolean: bool) {
         } => {
             transform_expr(inner);
             transform_query(subquery);
+            if column_kind(inner) == Some(ColumnKind::Integer) {
+                integer_json_each_elements(subquery);
+            }
         }
         Expr::Exists { subquery, .. } => transform_query(subquery),
         Expr::Subquery(subquery) => transform_query(subquery),
@@ -1888,6 +1891,79 @@ fn fix_affinity_in_list(inner: &Expr, list: &mut Vec<Expr>, negated: bool) -> Op
     }
     *list = members;
     None
+}
+
+/// `int_col IN (SELECT value FROM json_each(?))`: the elements take the
+/// column's affinity as a literal list's members do, so the subquery yields
+/// each element that is an integer, as a bigint, and drops the rest. Its
+/// `value` is json_array_elements_text's text by now, which PostgreSQL
+/// compares with an integer only through the plex schema's `=`, invisible to
+/// a Live TV guide's connection.
+fn integer_json_each_elements(subquery: &mut Query) {
+    let SetExpr::Select(select) = subquery.body.as_mut() else {
+        return;
+    };
+    let [twj] = select.from.as_slice() else {
+        return;
+    };
+    if !twj.joins.is_empty() || !is_json_elements_text_table(&twj.relation) {
+        return;
+    }
+    let [SelectItem::UnnamedExpr(projected)] = select.projection.as_mut_slice() else {
+        return;
+    };
+    if !is_json_each_value(projected) {
+        return;
+    }
+    *projected = wrap_double_colon_cast(json_each_value(), DataType::BigInt(None));
+    let is_integer = Expr::BinaryOp {
+        left: Box::new(json_each_value()),
+        op: BinaryOperator::PGRegexMatch,
+        right: Box::new(make_string(r"^\s*[-+]?[0-9]{1,18}\s*$")),
+    };
+    select.selection = Some(match select.selection.take() {
+        Some(existing) => Expr::BinaryOp {
+            left: Box::new(existing),
+            op: BinaryOperator::And,
+            right: Box::new(is_integer),
+        },
+        None => is_integer,
+    });
+}
+
+fn json_each_value() -> Expr {
+    Expr::Identifier(Ident::new("value"))
+}
+
+/// The table functions json_each becomes, whose `value` is the element's text.
+fn is_json_elements_text_table(relation: &TableFactor) -> bool {
+    let TableFactor::Table {
+        name,
+        args: Some(_),
+        ..
+    } = relation
+    else {
+        return false;
+    };
+    matches!(
+        name.0.last(),
+        Some(ObjectNamePart::Identifier(i))
+            if i.value.eq_ignore_ascii_case("json_array_elements_text")
+                || i.value.eq_ignore_ascii_case("jsonb_array_elements_text")
+    )
+}
+
+/// `value`, or `value::TEXT` as the json_each rewrite leaves it.
+fn is_json_each_value(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(i) => i.value.eq_ignore_ascii_case("value"),
+        Expr::Cast {
+            expr,
+            data_type: DataType::Text,
+            ..
+        } => is_json_each_value(expr),
+        _ => false,
+    }
 }
 
 // ─── Fix 14: GLOB → regular expression ────────────────────────────────────────

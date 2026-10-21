@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.38 (unreleased)
+
+- An integer column compared with a json_each list (`st.media_item_id IN (SELECT value FROM json_each(:C2))`) takes the list's integer elements, as bigints, and drops the rest (`integer_json_each_elements`), as SQLite's integer affinity does and as a literal list already did. json_each is json_array_elements_text, whose `value` is text, and PostgreSQL compared it with the integer only through the plex schema's `=`, which a Live TV guide's connection, on the guide's schema and public, cannot see: "operator does not exist: integer = text" (talos, 2026-10-21). The list still plans as an index lookup per element.
+
 ### v1.3.17-clusterplex.37 (2026-10-21)
 
 - A join whose ON clause names a later inner join's alias gets that join moved ahead of it, its own definers first (`hoist_forward_referenced_joins`). SQLite resolves an ON clause against the whole FROM clause; PostgreSQL against the joins before it. PMS builds the Live TV "What's On" hub (`/tv.plex.providers.epg.xmltv:N/hubs/discover`) by joining the hub's items on `grandchildren.id` four joins before it joins `metadata_items AS children` and `AS grandchildren`, so once the guide was served from PostgreSQL every "What's On" answered 500 with `missing FROM-clause entry for table "grandchildren"` (450 in twelve hours on talos, 2026-10-21). A LEFT JOIN is never moved, and a statement that would need one moved is left as it came.
