@@ -171,7 +171,11 @@ fn a_registered_library_handle_is_pg_backed() {
 fn a_redirected_handle_without_a_peekable_connection_reports_no_error() {
     let handle = fake_conn("/x/com.plexapp.plugins.library.db");
     unsafe { (*handle).is_pg_active = 0 };
-    let db = 0x7a3e_0003usize as *const sqlite3;
+    // A handle no other test registers: the registry is the process's, and
+    // a_registered_library_handle_is_pg_backed, running beside this test,
+    // unregistered 0x7a3e_0003 under it, so errcode reached libsqlite3 with
+    // the fake handle and the test binary died of SIGSEGV.
+    let db = 0x7a3e_0005usize as *const sqlite3;
     unsafe { (*handle).shadow_db = db as *mut sqlite3 };
     crate::pg_client::rust_pg_register_connection(handle);
     assert!(
