@@ -1060,9 +1060,14 @@ enum TimeSource {
     Now,
     /// A date or time written out, `'2024-01-01 10:00:00'`.
     Text(String),
-    /// Seconds since the epoch: Plex's columns, a number, a bound value,
-    /// anything the `'unixepoch'` modifier names.
+    /// Seconds since the epoch: Plex's columns, a number, anything the
+    /// `'unixepoch'` modifier names.
     Epoch(Expr),
+    /// A bound value, which may be either: PMS binds the day of a Live TV
+    /// guide's grid as text (`strftime('%s', ?, '+1 days')` with
+    /// `'2026-10-21'`), which SQLite reads as a date, and other values as
+    /// numbers, read as seconds as before.
+    Bound(Expr),
 }
 
 /// A timestamp built from SQLite's time value and modifiers.
@@ -1107,6 +1112,8 @@ fn time_value(args: &[Expr]) -> Option<TimeValue> {
         TimeSource::Epoch(source)
     } else if let Some(text) = get_literal_single_quoted_string(&source) {
         TimeSource::Text(text)
+    } else if is_placeholder(&source) {
+        TimeSource::Bound(source)
     } else {
         TimeSource::Epoch(source)
     };
@@ -1120,6 +1127,7 @@ fn time_value(args: &[Expr]) -> Option<TimeValue> {
             false,
         ),
         TimeSource::Epoch(e) => (make_to_timestamp(e), true),
+        TimeSource::Bound(e) => (make_bound_timestamp(e), true),
     };
     let mut subsec = false;
     for modifier in &modifiers {
@@ -1244,6 +1252,34 @@ fn is_now_literal(expr: &Expr) -> bool {
 
 fn make_now_call() -> Expr {
     make_function_call("NOW", vec![])
+}
+
+/// A bound time value as a timestamp, decided on its text when the
+/// statement runs: a number is seconds since the epoch, TO_TIMESTAMP's
+/// reading; anything else is a date or time, which SQLite reads as UTC:
+/// CASE WHEN $n::TEXT ~ '<number>' THEN TO_TIMESTAMP($n::TEXT::DOUBLE
+/// PRECISION) ELSE $n::TEXT::TIMESTAMP AT TIME ZONE 'UTC' END. Both are
+/// zoned. The casts to TEXT also fix the parameter's type, which TO_TIMESTAMP
+/// alone made double precision.
+fn make_bound_timestamp(param: Expr) -> Expr {
+    let text = wrap_double_colon_cast(param, DataType::Text);
+    let is_number = make_binary(
+        text.clone(),
+        BinaryOperator::PGRegexMatch,
+        make_string_literal(r"^\s*[-+]?[0-9]+(\.[0-9]*)?\s*$"),
+    );
+    let seconds = make_to_timestamp(wrap_double_colon_cast(
+        text.clone(),
+        DataType::DoublePrecision,
+    ));
+    let date = Expr::AtTimeZone {
+        timestamp: Box::new(wrap_double_colon_cast(
+            text,
+            DataType::Timestamp(None, TimezoneInfo::None),
+        )),
+        time_zone: Box::new(make_string_literal("UTC")),
+    };
+    make_case_when(is_number, seconds, date)
 }
 
 /// Build a TO_TIMESTAMP(expr) function call.
