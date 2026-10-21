@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.36 (2026-10-21)
+
+- A bound time value in strftime, datetime, date, time or unixepoch without `'unixepoch'` is read as a date when its text is one, and as seconds since the epoch when it is a number. A number keeps the shim's existing reading. PMS asks a Live TV guide for a day's airings with the day bound as text (`strftime('%s', ?, '+1 days')` with `'2026-10-21'`), and `TO_TIMESTAMP($n)` refused it: once the guide was served from PostgreSQL (clusterplex.35), every such query failed with "invalid input syntax for type double precision", 4,341 in ten minutes on talos.
+
 ### v1.3.17-clusterplex.35 (2026-10-21)
 
 - A Live TV guide database, `tv.plex.providers.epg.<provider>-<DVR uuid>.db`, is served from PostgreSQL, from the schema `epg_<uuid without dashes>` in the library's database. Each guide handle gets a connection of its own, as the blobs do, and that connection and every reconnect run with the guide's schema as `search_path`. A guide whose schema does not exist stays SQLite. cluster-plex makes the schemas before PMS starts. PMS's load file, `<guide>-loading.db`, is never redirected: PMS fills it in SQLite and renames it onto the guide (talos, 2026-10-21), and cluster-plex copies each load into the schema.
