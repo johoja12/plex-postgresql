@@ -114,3 +114,41 @@ pub(crate) fn handle_exception_with_tls(
     });
     (handled, should_call_original)
 }
+
+/// The program's own name from `/proc/self/cmdline`: argv[0]'s base name.
+///
+/// Not the text after the last `/` of the whole command line, which is what
+/// the shim read until 2026-10-20: an argument holding a slash named the
+/// process after itself. Plex Transcoder logged as
+/// `manifest?X-Plex-Http-Pipeline=infinite`, its manifest URL's tail, and a
+/// Plex Media Scanner given a directory would have lost the shim and read
+/// the empty SQLite shadow.
+pub(crate) fn process_base_name(cmdline: &[u8]) -> &[u8] {
+    let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or(&[]);
+    match argv0.iter().rposition(|&b| b == b'/') {
+        Some(pos) => &argv0[pos + 1..],
+        None => argv0,
+    }
+}
+
+#[cfg(test)]
+mod process_name_tests {
+    use super::process_base_name;
+
+    #[test]
+    fn a_process_is_named_by_its_own_program_not_an_argument() {
+        let transcoder = b"/usr/lib/plexmediaserver/Plex Transcoder\0-codec:0\0h264\0http://127.0.0.1:32400/video/:/transcode/session/x/progress\0/transcode/Transcode/Sessions/plex-transcode-x/manifest?X-Plex-Http-Pipeline=infinite\0";
+        assert_eq!(process_base_name(transcoder), b"Plex Transcoder");
+        let scanner = b"/usr/lib/plexmediaserver/Plex Media Scanner\0--directory\0/media/movies/Heat (1995)\0";
+        assert_eq!(process_base_name(scanner), b"Plex Media Scanner");
+        assert_eq!(
+            process_base_name(b"/usr/lib/plexmediaserver/Plex Media Server\0"),
+            b"Plex Media Server"
+        );
+        assert_eq!(
+            process_base_name(b"Plex Media Server\0"),
+            b"Plex Media Server"
+        );
+        assert_eq!(process_base_name(b""), b"");
+    }
+}

@@ -20,11 +20,27 @@ pub extern "C" fn pg_query_cache_key(stmt: *mut PgStmt) -> u64 {
         return 0;
     }
     let s = unsafe { &*stmt };
-    crate::pg_query_cache::rust_query_cache_key(
+    let key = crate::pg_query_cache::rust_query_cache_key(
         s.pg_sql,
         s.param_values.as_ptr() as *const *const c_char,
         s.param_count,
-    )
+    );
+    if key == 0 {
+        return 0;
+    }
+    // The cache is the thread's, shared by every database on it: the same
+    // statement against a Live TV guide and against the library has two
+    // answers.
+    let conn = s.conn();
+    if conn.is_null() {
+        return key;
+    }
+    let path =
+        unsafe { crate::db_interpose_helpers::cstr_to_str_or_empty((*conn).db_path.as_ptr()) };
+    match crate::db_interpose_helpers::epg_schema_for_path(path) {
+        Some(schema) => crate::pg_query_cache::rust_query_cache_key_in_schema(key, &schema),
+        None => key,
+    }
 }
 
 #[no_mangle]

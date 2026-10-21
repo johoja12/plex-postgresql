@@ -413,13 +413,7 @@ unsafe extern "C" fn shim_init() {
         || {
             // Process name filtering: skip non-server/scanner processes.
             if let Ok(cmdline) = std::fs::read("/proc/self/cmdline") {
-                let mut base = cmdline.as_slice();
-                if let Some(pos) = cmdline.iter().rposition(|&b| b == b'/') {
-                    base = &cmdline[pos + 1..];
-                }
-                if let Some(pos) = base.iter().position(|&b| b == 0) {
-                    base = &base[..pos];
-                }
+                let base = crate::runtime_common::process_base_name(&cmdline);
                 let base_str = std::str::from_utf8(base).unwrap_or_default();
                 if !base_str.contains("Plex Media Server")
                     && !base_str.contains("Plex Media Scanner")

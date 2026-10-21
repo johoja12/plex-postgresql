@@ -181,7 +181,7 @@ pub(super) unsafe fn ensure_connection_ready(
 
     let cfg = pg_config_get();
     if !cfg.is_null() {
-        apply_pg_session_settings(ec.conn, &*cfg);
+        apply_pg_session_settings(ec.conn, &*cfg, ec.db_path.as_ptr());
     }
     Ok(())
 }

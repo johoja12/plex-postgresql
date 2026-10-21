@@ -48,6 +48,10 @@ pub(crate) fn should_redirect_str(filename: &str, passthrough: bool) -> bool {
     }
     filename.contains("com.plexapp.plugins.library.db")
         || filename.contains("com.plexapp.plugins.library.blobs.db")
+        // A Live TV guide, served from a schema of its own (owner,
+        // 2026-10-20). rust_pg_connect leaves it SQLite while that schema
+        // does not exist.
+        || crate::db_interpose_helpers::epg_schema_for_path(filename).is_some()
 }
 
 /// Returns true if the SQL is a SQLite engine configuration call that must
@@ -519,6 +523,22 @@ mod tests {
     fn redirect_blobs_db() {
         assert!(should_redirect_str(
             "/data/com.plexapp.plugins.library.blobs.db",
+            false
+        ));
+    }
+
+    #[test]
+    fn redirect_a_live_tv_guide() {
+        assert!(should_redirect_str(
+            "/data/tv.plex.providers.epg.xmltv-adfe4a6f-79d0-4135-93d5-edf0235ec02b.db",
+            false
+        ));
+        assert!(!should_redirect_str(
+            "/data/tv.plex.providers.epg.xmltv-adfe4a6f-79d0-4135-93d5-edf0235ec02b.db",
+            true
+        ));
+        assert!(!should_redirect_str(
+            "/data/tv.plex.providers.epg.xmltv-x.db",
             false
         ));
     }

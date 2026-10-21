@@ -144,6 +144,8 @@ pub(super) fn normalize_sql_literals_impl(sql: &str) -> Option<(String, Vec<Stri
     Some((out, params))
 }
 
+/// Whether the shim serves this database from PostgreSQL: the library, its
+/// blobs, or a Live TV guide (`epg_schema_for_path_impl`).
 pub(super) fn is_library_db_path_impl(path: &str) -> bool {
     let mut bytes = path.as_bytes();
     if bytes.len() > 4 && (bytes.ends_with(b"-wal") || bytes.ends_with(b"-shm")) {
@@ -151,11 +153,63 @@ pub(super) fn is_library_db_path_impl(path: &str) -> bool {
     }
     contains_ascii_icase(bytes, b"com.plexapp.plugins.library.db")
         || contains_ascii_icase(bytes, b"com.plexapp.plugins.library.blobs.db")
+        || epg_schema_for_path_impl(path).is_some()
 }
 
+/// The same set as `is_library_db_path_impl`, for the step paths that read it
+/// under this name.
 pub(super) fn is_library_or_blobs_db_path_impl(path: &str) -> bool {
     contains_ascii_icase(path.as_bytes(), b"com.plexapp.plugins.library.db")
         || contains_ascii_icase(path.as_bytes(), b"com.plexapp.plugins.library.blobs.db")
+        || epg_schema_for_path_impl(path).is_some()
+}
+
+/// The PostgreSQL schema a Live TV guide is served from, owner 2026-10-20.
+///
+/// Plex keeps each XMLTV DVR's guide in a database of its own,
+/// `tv.plex.providers.epg.<provider>-<dvr uuid>.db`, with the library's
+/// schema (the same tables, the same migrations), so each guide is a schema
+/// of its own: `epg_` and the uuid without its dashes. The library's tables
+/// could not hold it: the guide numbers its rows from 1 and its statements
+/// assume every row is a guide row. None for any other file, or one whose
+/// uuid is not a uuid.
+pub(super) fn epg_schema_for_path_impl(path: &str) -> Option<String> {
+    let mut p = path;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        if let Some(stripped) = p.strip_suffix(suffix) {
+            p = stripped;
+            break;
+        }
+    }
+    let name = p.rsplit('/').next()?;
+    let stem = name
+        .strip_prefix("tv.plex.providers.epg.")?
+        .strip_suffix(".db")?;
+    if stem.len() < 38 || !stem.is_char_boundary(stem.len() - 36) {
+        return None;
+    }
+    let (provider, uuid) = stem.split_at(stem.len() - 36);
+    let provider = provider.strip_suffix('-')?;
+    if provider.is_empty()
+        || !provider
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return None;
+    }
+    let groups: Vec<&str> = uuid.split('-').collect();
+    let lengths: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+    if lengths != [8, 4, 4, 4, 12]
+        || !groups
+            .iter()
+            .all(|g| g.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    Some(format!(
+        "epg_{}",
+        uuid.replace('-', "").to_ascii_lowercase()
+    ))
 }
 
 pub(super) fn is_blobs_db_path_impl(path: &str) -> bool {
