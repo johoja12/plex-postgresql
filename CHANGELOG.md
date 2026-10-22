@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.40 (unreleased)
+
+- `sqlite3_last_insert_rowid`, `sqlite3_changes`, `sqlite3_errcode` and `sqlite3_errmsg` answer from the connection the handle's last write ran on (`connection_state::write_conn`): inside a transaction that is the connection the BEGIN pinned, where every statement of the handle runs since the transaction work, not the handle's own connection. PMS 1.43.5.11029 registers a metadata agent provider at start as BEGIN, INSERT, last_insert_rowid; the handle's connection had inserted nothing and answered 0, Plex threw `DB::Exception`, rolled back and every start ended "Unable to set up server" (talos, 2026-10-22, after clusterplex.39 had passed the rig and a canary pod, where Plex found every provider and inserted none). Outside a transaction the answer is the handle's connection's, as before.
+
 ### v1.3.17-clusterplex.39 (2026-10-22)
 
 - A write whose own SQL names RETURNING steps as SQLite steps it: SQLITE_ROW with the row PostgreSQL answered, then SQLITE_DONE (`write_exec::plex_reads_returning_rows`). The `RETURNING id` the shim appends to an INSERT for `last_insert_rowid` still steps straight to DONE. PMS 1.43.5.11029's one new migration, 202609141200, upserts a preference with `INSERT INTO preferences ... ON CONFLICT(name) DO UPDATE SET value = excluded.value RETURNING id` and reads the id from the row; given DONE and no row it threw, rolled the migration back and every start ended "Unable to set up server" (standalone rig, 2026-10-22). Since 0.8.9.5 a write's RETURNING result was dropped on purpose, when SOCI read nothing but `lastval()`.

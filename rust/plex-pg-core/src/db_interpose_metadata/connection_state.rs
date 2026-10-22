@@ -2,6 +2,27 @@ use super::*;
 use crate::log_debug_lazy;
 use std::sync::atomic::Ordering;
 
+/// The connection a handle's last write ran on, whose `last_changes`,
+/// `last_insert_rowid`, `last_insert_failed` and last error answer
+/// `sqlite3_changes`, `sqlite3_last_insert_rowid`, `sqlite3_errcode` and
+/// `sqlite3_errmsg`. Inside a transaction every statement of the handle runs
+/// on the connection its BEGIN pinned (db_interpose_step), so that is where
+/// the write left them, not on the handle's own connection: PMS 1.43.5's
+/// start registers a metadata agent provider as BEGIN, INSERT,
+/// last_insert_rowid, and the handle's connection, which had inserted
+/// nothing, answered 0 -- Plex threw, rolled back and the server never set
+/// up (talos, 2026-10-22; the same shim passed on the rig, where Plex found
+/// every provider and inserted none). Outside a transaction it is the
+/// handle's connection, as before. Read, never acquired, for the reason
+/// given in `changes_impl`.
+fn write_conn(db: *mut sqlite3) -> *mut crate::ffi_types::PgConnection {
+    let pinned = crate::pg_client::txn::pinned_conn(db);
+    if !pinned.is_null() {
+        return pinned;
+    }
+    crate::pg_client::peek_connection(db)
+}
+
 pub(super) fn changes_impl(db: *mut sqlite3) -> c_int {
     let _guard = match InterposeGuard::try_enter() {
         Some(g) => g,
@@ -11,7 +32,7 @@ pub(super) fn changes_impl(db: *mut sqlite3) -> c_int {
     // Read, never acquired: these accessors run after the statement, on the
     // connection it used, and acquiring here blocked for the retry ladder
     // on a full pool and re-assigned the handle's slot on every call.
-    let pg_conn = crate::pg_client::peek_connection(db);
+    let pg_conn = write_conn(db);
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         if conn.is_pg_active != 0 {
@@ -34,7 +55,7 @@ pub(super) fn changes64_impl(db: *mut sqlite3) -> i64 {
         None => return 0,
     };
 
-    let pg_conn = crate::pg_client::peek_connection(db);
+    let pg_conn = write_conn(db);
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         if conn.is_pg_active != 0 {
@@ -57,7 +78,7 @@ pub(super) fn last_insert_rowid_impl(db: *mut sqlite3) -> i64 {
         None => return 0,
     };
 
-    let pg_conn = crate::pg_client::peek_connection(db);
+    let pg_conn = write_conn(db);
     if pg_conn.is_null() {
         // No PostgreSQL connection for this handle means the shim never took
         // it over. Plex opens its in-memory statistics database through the
@@ -126,7 +147,7 @@ pub(super) fn errmsg_impl(db: *mut sqlite3) -> *const c_char {
         }
     }
 
-    let pg_conn = crate::pg_client::peek_connection(db);
+    let pg_conn = write_conn(db);
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         if conn.last_error_code != SQLITE_OK && conn.last_error[0] != 0 {
@@ -168,7 +189,7 @@ pub(super) fn errcode_impl(db: *mut sqlite3) -> c_int {
         }
     }
 
-    let pg_conn = crate::pg_client::peek_connection(db);
+    let pg_conn = write_conn(db);
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         log_debug_lazy!(
@@ -197,7 +218,7 @@ pub(super) fn errcode_impl(db: *mut sqlite3) -> c_int {
 }
 
 pub(super) fn extended_errcode_impl(db: *mut sqlite3) -> c_int {
-    let pg_conn = crate::pg_client::peek_connection(db);
+    let pg_conn = write_conn(db);
     if !pg_conn.is_null() {
         let conn = unsafe { &*pg_conn };
         return conn.last_error_code;
