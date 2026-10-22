@@ -44,7 +44,14 @@ fn idempotence_known_corpus() {
 }
 
 fn ident() -> impl Strategy<Value = String> {
-    "[A-Za-z_][A-Za-z0-9_]{0,10}".prop_map(|s| s.to_string())
+    "[A-Za-z_][A-Za-z0-9_]{0,10}"
+        .prop_map(|s| s.to_string())
+        // These identifiers are emitted without quotes (including table
+        // qualifiers). A keyword such as IS makes the generated SQL invalid,
+        // so it cannot exercise translation idempotence.
+        .prop_filter("identifier is not an SQL keyword", |s| {
+            !sqlparser::keywords::ALL_KEYWORDS.contains(&s.to_ascii_uppercase().as_str())
+        })
 }
 
 fn col_expr() -> impl Strategy<Value = String> {
