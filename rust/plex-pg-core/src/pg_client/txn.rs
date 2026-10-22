@@ -399,6 +399,7 @@ pub(crate) fn run(conn: *mut PgConnection, db: *const sqlite3, cmd: &TxnCmd) -> 
         return Err("no PostgreSQL connection for transaction control".to_string());
     }
     // SAFETY: the caller holds a live pool connection.
+    let _metadata = super::registry_api::MetadataGuard::new(db, conn);
     let c = unsafe { &mut *conn };
     if c.conn.is_null() {
         return Err("PostgreSQL connection is closed".to_string());
@@ -465,6 +466,7 @@ pub(crate) fn run(conn: *mut PgConnection, db: *const sqlite3, cmd: &TxnCmd) -> 
         reg.by_conn.remove(&(conn as usize));
         reg.pins.retain(|_, pc| *pc != conn as usize);
     }
+    c.clear_last_error();
     if !statements.is_empty() {
         log_info(&format!(
             "TXN: {:?} on conn {:p} -> {}",
@@ -677,6 +679,129 @@ mod tests {
         assert!(pinned_conn(db).is_null());
         assert!(!in_transaction(conn));
         unsafe { libc::free(conn as *mut libc::c_void) };
+    }
+
+    // Real production failure: prepare cached a different slot, while step
+    // executed the INSERT on the handle's transaction pin. Every metadata
+    // accessor must follow the pin, and keep following that handle after the
+    // terminator removes it, even when this thread has used another handle.
+    #[test]
+    fn metadata_follows_the_handle_transaction_not_the_threads_cached_slot() {
+        use crate::db_interpose_metadata::*;
+        use crate::ffi_types::{conn_ref, conn_unref};
+        use crate::pg_client::threading::current_thread_id;
+        use crate::pg_client::tls_cache::{tls_pool_cache_clear, tls_pool_cache_set};
+        use crate::pg_client::{peek_connection, pool, SLOT_FREE, SLOT_READY};
+        let storage = Box::new(0_u8);
+        let db = (&*storage as *const u8).cast::<sqlite3>() as *mut sqlite3;
+        let other_storage = Box::new(0_u8);
+        let other_db = (&*other_storage as *const u8).cast::<sqlite3>();
+        let alloc = || {
+            let c = unsafe {
+                libc::calloc(1, std::mem::size_of::<PgConnection>()) as *mut PgConnection
+            };
+            assert!(!c.is_null());
+            conn_ref(c);
+            unsafe {
+                (*c).is_pg_active = 1;
+            }
+            c
+        };
+        let handle = alloc();
+        let tx = alloc();
+        let cached = alloc();
+        unsafe {
+            (*handle).shadow_db = db;
+            for (dst, src) in (*handle)
+                .db_path
+                .iter_mut()
+                .zip(b"/x/com.plexapp.plugins.library.db")
+            {
+                *dst = *src as _;
+            }
+            (*tx).last_insert_rowid = 4242;
+            (*tx).last_changes = 2;
+            (*tx).set_last_error(19, "transaction error");
+            (*cached).last_insert_rowid = 9001;
+            (*cached).last_changes = 99;
+        }
+        super::super::rust_pg_register_connection(handle);
+        let pm = pool();
+        let indices: Vec<_> = (0..pm.pool_size())
+            .filter(|&i| pm.slots[i].try_claim_free())
+            .take(2)
+            .collect();
+        assert_eq!(indices.len(), 2);
+        for (&i, conn) in indices.iter().zip([tx, cached]) {
+            pm.slots[i].conn.store(conn.cast(), Ordering::Release);
+            pm.slots[i]
+                .owner_thread
+                .store(current_thread_id(), Ordering::Release);
+            pm.slots[i].state.store(SLOT_READY, Ordering::Release);
+        }
+        let generation = pm.slots[indices[1]].generation.load(Ordering::Acquire);
+        tls_pool_cache_set(0, indices[1] as u32, generation);
+        // Preparation has associated this handle with the cached slot too.
+        pm.db_to_pool.assign(db as usize, indices[1]);
+        {
+            let mut reg = mutex_lock(&TXN);
+            reg.pins.insert(db as usize, tx as usize);
+            reg.by_conn.insert(
+                tx as usize,
+                TxnState {
+                    frames: vec![Frame::Outer { explicit: true }],
+                    db: db as usize,
+                },
+            );
+        }
+        let check = || {
+            assert_eq!(rust_my_sqlite3_last_insert_rowid(db), 4242);
+            assert_eq!(rust_my_sqlite3_changes(db), 2);
+            assert_eq!(rust_my_sqlite3_changes64(db), 2);
+            assert_eq!(rust_my_sqlite3_errcode(db), 19);
+            assert_eq!(rust_my_sqlite3_extended_errcode(db), 19);
+            let msg = unsafe { std::ffi::CStr::from_ptr(rust_my_sqlite3_errmsg(db)) };
+            assert_eq!(msg.to_str().unwrap(), "transaction error");
+        };
+        check();
+        // The same publication the execution guard performs on return.
+        unsafe { super::super::registry_api::save_metadata(db, tx) };
+        forget_connection(tx);
+        assert!(pinned_conn(db).is_null());
+        tls_pool_cache_set(other_db as usize, indices[1] as u32, generation);
+        unsafe {
+            (*tx).last_insert_rowid = 7777;
+            (*tx).last_changes = 77;
+            (*tx).clear_last_error();
+        }
+        assert_eq!(peek_connection(db), handle, "metadata survives pool reuse");
+        check();
+        assert_eq!(pm.db_to_pool.find(db as usize), Some(indices[1]));
+        {
+            let _read = super::super::registry_api::MetadataGuard::new(db, tx);
+            assert_eq!(
+                unsafe { (*tx).last_insert_rowid },
+                4242,
+                "a SELECT/terminator on a reused session preserves this handle's rowid"
+            );
+            assert_eq!(unsafe { (*tx).last_changes }, 2);
+        }
+        assert_eq!(rust_my_sqlite3_last_insert_rowid(db), 4242);
+        assert_eq!(rust_my_sqlite3_changes(db), 2);
+
+        tls_pool_cache_clear();
+        pm.db_to_pool.release(db as usize);
+        super::super::rust_pg_unregister_connection(handle);
+        for i in indices {
+            pm.slots[i]
+                .conn
+                .store(std::ptr::null_mut(), Ordering::Release);
+            pm.slots[i].owner_thread.store(0, Ordering::Release);
+            pm.slots[i].state.store(SLOT_FREE, Ordering::Release);
+        }
+        assert!(conn_unref(handle));
+        assert!(conn_unref(tx));
+        assert!(conn_unref(cached));
     }
 
     #[test]

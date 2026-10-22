@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -44,30 +44,47 @@ fn pool_exhaustion_times_out_under_pressure() {
     let pool = Arc::new(Pool::new(2));
     let timeouts = Arc::new(AtomicUsize::new(0));
 
-    let mut handles = Vec::new();
-    for tid in 0..4 {
+    // Keep both slots occupied until the contenders have finished. The old
+    // sleep-only test could schedule the short-lived contenders first and
+    // observe no exhaustion at all on a busy build host.
+    let ready = Arc::new(Barrier::new(3));
+    let release = Arc::new(Barrier::new(3));
+    let mut holders = Vec::new();
+    for _ in 0..2 {
+        let pool = pool.clone();
+        let ready = ready.clone();
+        let release = release.clone();
+        holders.push(thread::spawn(move || {
+            let idx = pool.acquire(Duration::from_millis(30)).unwrap();
+            ready.wait();
+            release.wait();
+            pool.release(idx);
+        }));
+    }
+    ready.wait();
+    let mut contenders = Vec::new();
+    for _ in 0..2 {
         let pool = pool.clone();
         let timeouts = timeouts.clone();
-        handles.push(thread::spawn(move || {
+        contenders.push(thread::spawn(move || {
             if let Some(idx) = pool.acquire(Duration::from_millis(30)) {
-                // Hold the slot longer for the first two threads.
-                if tid < 2 {
-                    thread::sleep(Duration::from_millis(80));
-                }
                 pool.release(idx);
             } else {
                 timeouts.fetch_add(1, Ordering::Relaxed);
             }
         }));
     }
-
-    for h in handles {
-        let _ = h.join();
+    for h in contenders {
+        h.join().unwrap();
+    }
+    release.wait();
+    for h in holders {
+        h.join().unwrap();
     }
 
     let total_timeouts = timeouts.load(Ordering::Relaxed);
     assert!(
-        total_timeouts >= 1,
+        total_timeouts == 2,
         "expected at least one timeout under exhaustion"
     );
 }
