@@ -82,6 +82,7 @@ pub(crate) fn exec_via_postgres(
     arg: *mut c_void,
     errmsg: *mut *mut c_char,
 ) -> c_int {
+    let _metadata = crate::pg_client::registry_api::MetadataGuard::new(db, pg_conn);
     let pg = unsafe { &mut *pg_conn };
     unsafe {
         if pg.conn.is_null() || crate::libpq_helpers::rust_pq_status(pg.conn) != CONNECTION_OK {

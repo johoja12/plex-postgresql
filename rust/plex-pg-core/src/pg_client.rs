@@ -23,7 +23,7 @@ mod pool_runtime;
 mod pool_state;
 #[path = "pg_client_registry.rs"]
 mod registry;
-mod registry_api;
+pub(crate) mod registry_api;
 mod session;
 mod support;
 mod threading;
