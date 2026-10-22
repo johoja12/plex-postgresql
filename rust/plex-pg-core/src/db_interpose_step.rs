@@ -511,6 +511,12 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
                     }
                     return SQLITE_ERROR;
                 }
+                // A RETURNING write of Plex's own answers its row first
+                // (write_exec::plex_reads_returning_rows); the next step is
+                // DONE through write_executed.
+                if write_rc == STEP_RESULT_ROW {
+                    return SQLITE_ROW;
+                }
             }
         }
     }

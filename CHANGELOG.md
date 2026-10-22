@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.39 (unreleased)
+
+- A write whose own SQL names RETURNING steps as SQLite steps it: SQLITE_ROW with the row PostgreSQL answered, then SQLITE_DONE (`write_exec::plex_reads_returning_rows`). The `RETURNING id` the shim appends to an INSERT for `last_insert_rowid` still steps straight to DONE. PMS 1.43.5.11029's one new migration, 202609141200, upserts a preference with `INSERT INTO preferences ... ON CONFLICT(name) DO UPDATE SET value = excluded.value RETURNING id` and reads the id from the row; given DONE and no row it threw, rolled the migration back and every start ended "Unable to set up server" (standalone rig, 2026-10-22). Since 0.8.9.5 a write's RETURNING result was dropped on purpose, when SOCI read nothing but `lastval()`.
+- A write's column metadata, asked for before its first step, comes from PQdescribePrepared, never from running the statement (`metadata_support::metadata_source`): the metadata path executed that upsert on a second connection, outside Plex's transaction, before the step ran it again. A write without a prepared name answers no metadata until the step. A read is described while its parameters are unbound and executed once they are, as before.
+
 ### v1.3.17-clusterplex.38 (2026-10-21)
 
 - An integer column compared with a json_each list (`st.media_item_id IN (SELECT value FROM json_each(:C2))`) takes the list's integer elements, as bigints, and drops the rest (`integer_json_each_elements`), as SQLite's integer affinity does and as a literal list already did. json_each is json_array_elements_text, whose `value` is text, and PostgreSQL compared it with the integer only through the plex schema's `=`, which a Live TV guide's connection, on the guide's schema and public, cannot see: "operator does not exist: integer = text" (talos, 2026-10-21). The list still plans as an index lookup per element.

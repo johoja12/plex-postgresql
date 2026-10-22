@@ -129,8 +129,22 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         }
     }
 
+    let source = metadata_source(
+        pg_stmt_ref.is_pg == 1,
+        has_unbound_params,
+        pg_stmt_ref.stmt_name[0] != 0,
+    );
+    if source == MetadataSource::None {
+        drop(_conn_guard);
+        log_info_lazy!(
+            "METADATA: no column metadata before the step of a write without a prepared name: {}",
+            cstr_prefix(pg_stmt_ref.pg_sql, 100, "?")
+        );
+        return false;
+    }
+
     unsafe {
-        if has_unbound_params && pg_stmt_ref.stmt_name[0] != 0 {
+        if source == MetadataSource::Describe {
             log_info_lazy!(
                 "METADATA_DESCRIBE: Using prepared-statement describe for: {}",
                 cstr_prefix(pg_stmt_ref.pg_sql, 100, "?")
@@ -276,5 +290,61 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         drop(_conn_guard);
         log_error(&format!("METADATA_EXEC: Query failed: {}", err));
         false
+    }
+}
+
+/// Where a statement's column metadata comes from when Plex asks for it
+/// before the first step.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MetadataSource {
+    /// PQdescribePrepared on the statement's prepared name: runs nothing.
+    Describe,
+    /// The statement itself, run with its bound parameters.
+    Execute,
+    /// Nothing: the step answers.
+    None,
+}
+
+/// A write is described, never executed, whatever is bound: executing it
+/// for its column names ran PMS 1.43.5's preference upsert (migration
+/// 202609141200, `INSERT ... ON CONFLICT ... RETURNING id`) on a second
+/// connection outside Plex's transaction before the step ran it again
+/// (2026-10-22). A read is described while its parameters are unbound, and
+/// executed once they are, as before.
+pub(crate) fn metadata_source(
+    is_write: bool,
+    has_unbound_params: bool,
+    has_stmt_name: bool,
+) -> MetadataSource {
+    if is_write {
+        return if has_stmt_name {
+            MetadataSource::Describe
+        } else {
+            MetadataSource::None
+        };
+    }
+    if has_unbound_params && has_stmt_name {
+        MetadataSource::Describe
+    } else {
+        MetadataSource::Execute
+    }
+}
+
+#[cfg(test)]
+mod metadata_source_tests {
+    use super::{metadata_source, MetadataSource};
+
+    #[test]
+    fn a_write_is_described_never_executed() {
+        assert_eq!(metadata_source(true, false, true), MetadataSource::Describe);
+        assert_eq!(metadata_source(true, true, true), MetadataSource::Describe);
+        assert_eq!(metadata_source(true, false, false), MetadataSource::None);
+    }
+
+    #[test]
+    fn a_read_is_described_unbound_and_executed_bound() {
+        assert_eq!(metadata_source(false, true, true), MetadataSource::Describe);
+        assert_eq!(metadata_source(false, false, true), MetadataSource::Execute);
+        assert_eq!(metadata_source(false, true, false), MetadataSource::Execute);
     }
 }

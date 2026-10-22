@@ -208,10 +208,80 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
         }
 
         stmt.write_executed = 1;
+        if plex_reads_returning_rows(
+            cstr_bytes(stmt.sql),
+            status,
+            crate::libpq_helpers::rust_pq_ntuples(res),
+        ) {
+            // Plex steps a RETURNING write as SQLite does: SQLITE_ROW with
+            // the row, then SQLITE_DONE (write_executed, above). The result
+            // replaces the metadata-only one a column call may have made.
+            let _stmt_guard = PgStmt::lock_mutex(pg_stmt);
+            if !stmt.result.is_null() {
+                crate::libpq_helpers::rust_pq_clear(stmt.result);
+            }
+            stmt.result = res;
+            stmt.metadata_only_result = 0;
+            stmt.num_rows = crate::libpq_helpers::rust_pq_ntuples(res);
+            stmt.num_cols = crate::libpq_helpers::rust_pq_nfields(res);
+            stmt.ensure_column_capacity(stmt.num_cols.max(0) as usize);
+            stmt.current_row = 0;
+            stmt.set_result_conn(exec_conn);
+            return STEP_RESULT_ROW;
+        }
         if !res.is_null() {
             crate::libpq_helpers::rust_pq_clear(res);
         }
         STEP_RESULT_DONE
+    }
+}
+
+/// Whether the rows a write came back with are Plex's to read: its own SQL
+/// named RETURNING, and PostgreSQL answered rows. The `RETURNING id` the
+/// shim appends to an INSERT of its own accord feeds `last_insert_rowid`
+/// alone, and such a step stays SQLITE_DONE, as it was. PMS 1.43.5's
+/// migration 202609141200 upserts a preference with `... ON CONFLICT(name)
+/// DO UPDATE SET value = excluded.value RETURNING id` and reads the id from
+/// the row: given SQLITE_DONE and no row it threw, rolled the migration
+/// back and the server never set up (2026-10-22).
+pub(crate) fn plex_reads_returning_rows(orig_sql: &[u8], status: c_int, ntuples: c_int) -> bool {
+    status == PGRES_TUPLES_OK && ntuples > 0 && contains_icase_bytes(orig_sql, b"RETURNING")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UPSERT: &[u8] = b"INSERT INTO preferences (`name`,`value`) VALUES (:U1,:U2) ON CONFLICT(`name`) DO UPDATE SET `value`=excluded.`value` RETURNING `id`";
+
+    #[test]
+    fn a_returning_write_of_plexs_own_is_a_row() {
+        assert!(plex_reads_returning_rows(UPSERT, PGRES_TUPLES_OK, 1));
+        assert!(plex_reads_returning_rows(
+            b"UPDATE metadata_items SET title = ? WHERE id = ? returning id, title",
+            PGRES_TUPLES_OK,
+            3
+        ));
+    }
+
+    #[test]
+    fn the_shims_own_returning_id_stays_done() {
+        // Plex's SQL named no RETURNING; the shim appended one for last_insert_rowid.
+        assert!(!plex_reads_returning_rows(
+            b"INSERT INTO media_parts (directory, file) VALUES (?, ?)",
+            PGRES_TUPLES_OK,
+            1
+        ));
+    }
+
+    #[test]
+    fn a_returning_write_that_touched_no_row_is_done() {
+        assert!(!plex_reads_returning_rows(
+            b"INSERT INTO schema_migrations (version) VALUES (?) ON CONFLICT DO NOTHING RETURNING version",
+            PGRES_TUPLES_OK,
+            0
+        ));
+        assert!(!plex_reads_returning_rows(UPSERT, PGRES_COMMAND_OK, 0));
     }
 }
 
