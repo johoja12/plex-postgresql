@@ -48,6 +48,8 @@ pub(super) fn first_execute_impl(
                 Err(rc) => return rc,
             };
 
+        let _metadata =
+            crate::pg_client::registry_api::MetadataGuard::for_statement(pg_stmt, exec_conn);
         (&mut *pg_stmt).set_conn(exec_conn);
         if let Err(rc) = ensure_connection_ready(
             pg_stmt,

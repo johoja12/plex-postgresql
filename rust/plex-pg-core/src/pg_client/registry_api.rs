@@ -7,11 +7,7 @@ use crate::ffi_types::{sqlite3, PgConnection};
 use super::config::env_nonzero;
 use super::connection_helpers::{conn_db_path, conn_is_pg_active, conn_is_pg_active_ptr};
 use super::pool_lookup::{is_library_db, pool_find_connection_for_db};
-use super::threading::{current_thread_id, threads_equal};
-use super::tls_cache::tls_pool_cache_get;
-use super::{
-    log_debug, pool, rust_find_any_library_connection, rust_find_registered_connection, SLOT_READY,
-};
+use super::{log_debug, pool, rust_find_any_library_connection, rust_find_registered_connection};
 
 /// Register a non-pooled connection using its shadow DB handle.
 #[no_mangle]
@@ -129,85 +125,98 @@ pub(crate) fn handle_is_pg_library(db_handle: *const sqlite3) -> bool {
         && !env_nonzero("PLEX_PG_FORCE_SQLITE_LIBRARY")
 }
 
-/// The connection a handle's last statement ran on, without acquiring one.
-///
-/// `sqlite3_changes`, `sqlite3_errmsg`, `sqlite3_errcode` and
-/// `sqlite3_last_insert_rowid` read state a step or exec left on the
-/// connection it used. They went through `rust_pg_find_connection`, which
-/// acquires: on a full pool that blocks through the retry ladder (about ten
-/// seconds, for `errmsg()`), and every call re-assigned `db_to_pool`, so a
-/// handle looked held by whichever thread last asked what the error was.
-///
-/// This reads what is already there: the thread's own READY slot first --
-/// that is the connection its step just used -- then the slot the handle is
-/// recorded on, then the handle's own non-pooled connection. Null means no
-/// statement has run on this handle on a connection we still have, and the
-/// caller answers as for an idle handle.
-pub(crate) fn peek_connection(db_handle: *const sqlite3) -> *mut PgConnection {
-    if db_handle.is_null() {
-        return std::ptr::null_mut();
+// Metadata belongs to sqlite3*, not to a pooled libpq session. Store a
+// snapshot on the registered handle so another handle reusing that session
+// cannot change last_insert_rowid()/changes()/errmsg() after a transaction.
+pub(crate) unsafe fn save_metadata(db: *const sqlite3, conn: *const PgConnection) {
+    if db.is_null() || conn.is_null() {
+        return;
     }
-    let handle_conn =
-        rust_find_registered_connection(db_handle as *const c_void) as *mut PgConnection;
-    if handle_conn.is_null() {
-        return std::ptr::null_mut();
+    let handle = rust_pg_find_handle_connection(db);
+    if handle.is_null() || handle == conn.cast_mut() {
+        return;
     }
-    let handle_ref = unsafe { &*handle_conn };
-    if !is_library_db(&conn_db_path(handle_ref)) || env_nonzero("PLEX_PG_DISABLE_POOL") {
-        return if conn_is_pg_active(handle_ref) {
-            handle_conn
-        } else {
-            std::ptr::null_mut()
-        };
-    }
-    if env_nonzero("PLEX_PG_FORCE_SQLITE_LIBRARY") {
-        return std::ptr::null_mut();
-    }
+    let src = &*conn;
+    let dst = &mut *handle;
+    dst.last_changes = src.last_changes;
+    dst.last_insert_rowid = src.last_insert_rowid;
+    dst.last_insert_failed.store(
+        src.last_insert_failed.load(Ordering::Acquire),
+        Ordering::Release,
+    );
+    dst.last_error = src.last_error;
+    dst.last_error_code = src.last_error_code;
+}
 
-    let pm = pool();
-    let pool_size = pm.pool_size();
-    let ready_conn = |idx: usize| -> *mut PgConnection {
-        if idx >= pool_size {
-            return std::ptr::null_mut();
-        }
-        let slot = &pm.slots[idx];
-        if slot.state.load(Ordering::Acquire) != SLOT_READY {
-            return std::ptr::null_mut();
-        }
-        let conn = slot.conn.load(Ordering::Acquire) as *mut PgConnection;
-        if conn_is_pg_active_ptr(conn) {
-            conn
-        } else {
-            std::ptr::null_mut()
-        }
-    };
-
-    if let Some((idx, generation)) = tls_pool_cache_get(0) {
-        let idx = idx as usize;
-        if idx < pool_size
-            && pm.slots[idx].generation.load(Ordering::Acquire) == generation
-            && threads_equal(
-                pm.slots[idx].owner_thread.load(Ordering::Acquire),
-                current_thread_id(),
-            )
-        {
-            let conn = ready_conn(idx);
-            if !conn.is_null() {
-                return conn;
+/// Publish on every return, including failed writes and transaction endings.
+/// The caller keeps `conn` and `db` alive until the guard is dropped.
+pub(crate) struct MetadataGuard {
+    db: *const sqlite3,
+    conn: *const PgConnection,
+}
+impl MetadataGuard {
+    pub(crate) fn new(db: *const sqlite3, conn: *const PgConnection) -> Self {
+        // SELECT and transaction control preserve changes()/rowid. Seed a
+        // reused session with this handle's values rather than another
+        // handle's most recent INSERT. Execution updates them on writes.
+        unsafe {
+            let handle = rust_pg_find_handle_connection(db);
+            if !conn.is_null() && !handle.is_null() && handle != conn.cast_mut() {
+                let dst = &mut *conn.cast_mut();
+                let src = &*handle;
+                dst.last_changes = src.last_changes;
+                dst.last_insert_rowid = src.last_insert_rowid;
+                dst.last_error = src.last_error;
+                dst.last_error_code = src.last_error_code;
+                dst.last_insert_failed.store(
+                    src.last_insert_failed.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
             }
         }
+        Self { db, conn }
     }
-    if let Some(idx) = pm.db_to_pool.find(db_handle as usize) {
-        let conn = ready_conn(idx);
-        if !conn.is_null() {
-            return conn;
+    pub(crate) unsafe fn for_statement(
+        stmt: *const crate::ffi_types::PgStmt,
+        conn: *const PgConnection,
+    ) -> Self {
+        let db = if stmt.is_null() || (*stmt).shadow_stmt.is_null() {
+            std::ptr::null_mut()
+        } else {
+            match crate::db_interpose_common::get_orig_sqlite3_db_handle() {
+                Some(f) => f((*stmt).shadow_stmt),
+                None => std::ptr::null_mut(),
+            }
+        };
+        Self::new(db, conn)
+    }
+}
+impl Drop for MetadataGuard {
+    fn drop(&mut self) {
+        unsafe { save_metadata(self.db, self.conn) };
+    }
+}
+
+/// The metadata state for a logical SQLite handle, without acquiring a slot.
+/// Active transactions must read the connection executing their statements,
+/// even when prepare has cached another slot on this thread. After execution
+/// MetadataGuard publishes a snapshot on the registered handle, so COMMIT,
+/// ROLLBACK and pool reuse cannot redirect accessors to another handle's state.
+pub(crate) fn peek_connection(db_handle: *const sqlite3) -> *mut PgConnection {
+    let handle = rust_pg_find_handle_connection(db_handle);
+    if !conn_is_pg_active_ptr(handle) {
+        return std::ptr::null_mut();
+    }
+    if is_library_db(&conn_db_path(unsafe { &*handle })) {
+        if env_nonzero("PLEX_PG_FORCE_SQLITE_LIBRARY") {
+            return std::ptr::null_mut();
+        }
+        let pinned = super::txn::pinned_conn(db_handle);
+        if !pinned.is_null() {
+            return pinned;
         }
     }
-    if conn_is_pg_active(handle_ref) {
-        handle_conn
-    } else {
-        std::ptr::null_mut()
-    }
+    handle
 }
 
 /// `peek_connection` for C callers.

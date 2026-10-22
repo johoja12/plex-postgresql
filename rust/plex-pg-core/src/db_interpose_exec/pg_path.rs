@@ -82,6 +82,7 @@ pub(crate) fn exec_via_postgres(
     arg: *mut c_void,
     errmsg: *mut *mut c_char,
 ) -> c_int {
+    let _metadata = crate::pg_client::registry_api::MetadataGuard::new(db, pg_conn);
     let pg = unsafe { &mut *pg_conn };
     unsafe {
         if pg.conn.is_null() || crate::libpq_helpers::rust_pq_status(pg.conn) != CONNECTION_OK {
@@ -324,7 +325,17 @@ pub(crate) fn exec_via_postgres(
                     } else {
                         cmd_tuples
                     };
-                    pg.last_changes = crate::db_interpose_helpers::rust_pg_text_to_int(tuples_ptr);
+                    pg.clear_last_error();
+                    // SQLite changes() is the last DML count, not the number
+                    // of rows returned by a SELECT on this pooled session.
+                    if starts_with_icase_bytes(sql_bytes, b"INSERT")
+                        || starts_with_icase_bytes(sql_bytes, b"UPDATE")
+                        || starts_with_icase_bytes(sql_bytes, b"DELETE")
+                        || starts_with_icase_bytes(sql_bytes, b"REPLACE")
+                    {
+                        pg.last_changes =
+                            crate::db_interpose_helpers::rust_pg_text_to_int(tuples_ptr);
+                    }
 
                     if status == PGRES_TUPLES_OK
                         && callback.is_some()

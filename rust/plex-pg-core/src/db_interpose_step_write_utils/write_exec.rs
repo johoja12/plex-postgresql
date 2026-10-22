@@ -22,6 +22,8 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
             }
             return STEP_RESULT_ERROR;
         }
+        let _metadata =
+            crate::pg_client::registry_api::MetadataGuard::for_statement(pg_stmt, exec_conn);
         let stmt = &mut *pg_stmt;
         let ec = &mut *exec_conn;
         let mut conn_guard = PthreadMutexGuard::lock(&mut ec.mutex as *mut _);
