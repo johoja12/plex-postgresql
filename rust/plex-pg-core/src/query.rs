@@ -274,11 +274,87 @@ fn expand_projection_aliases(sel: &mut Select) {
 // ─── Fix 1: Subquery alias, and JOIN … ON ────────────────────────────────────
 
 fn fix_table_with_joins(twj: &mut TableWithJoins) {
+    order_plex_descendant_media_joins(twj);
     fix_table_factor(&mut twj.relation);
     for join in &mut twj.joins {
         fix_table_factor(&mut join.relation);
         if let Some(on) = join_on_expr_mut(&mut join.join_operator) {
             transform_bool_expr(on);
+        }
+    }
+}
+
+// SQLite accepts Plex's INNER media join before the children/grandchildren
+// alias its ON clause references. PostgreSQL requires that alias to be in
+// scope already. Move only the exact INNER metadata hierarchy joins; never
+// reorder an outer join or an unknown ON expression.
+fn order_plex_descendant_media_joins(twj: &mut TableWithJoins) {
+    fn table(tf: &TableFactor, name: &str, alias: Option<&str>) -> bool {
+        matches!(tf, TableFactor::Table { name: n, alias: a, .. }
+            if n.to_string() == name && a.as_ref().map(|v| v.name.value.as_str()) == alias)
+    }
+    fn column(e: &Expr, alias: &str, name: &str) -> bool {
+        matches!(e, Expr::CompoundIdentifier(v) if v.len() == 2 && v[0].value == alias && v[1].value == name)
+    }
+    fn inner_eq(j: &Join, lhs: (&str, &str), rhs: (&str, &str)) -> bool {
+        let on = match &j.join_operator {
+            JoinOperator::Inner(JoinConstraint::On(e))
+            | JoinOperator::Join(JoinConstraint::On(e)) => e,
+            _ => return false,
+        };
+        matches!(on, Expr::BinaryOp { left, op: BinaryOperator::Eq, right }
+            if column(left, lhs.0, lhs.1) && column(right, rhs.0, rhs.1))
+    }
+    if !table(&twj.relation, "metadata_items", None) {
+        return;
+    }
+    if twj.joins.iter().any(|j| match &j.join_operator {
+        JoinOperator::Inner(_) | JoinOperator::Join(_) => false,
+        JoinOperator::LeftOuter(JoinConstraint::On(e)) | JoinOperator::Left(JoinConstraint::On(e)) => {
+            !table(&j.relation, "metadata_item_settings", None)
+                || e.to_string().replace(['`', '"'], "")
+                    != "metadata_item_settings.guid = metadata_items.guid AND metadata_item_settings.account_id = 1"
+        }
+        _ => true,
+    }) {
+        return;
+    }
+    for descendant in ["children", "grandchildren"] {
+        let Some(media) = twj.joins.iter().position(|j| {
+            table(&j.relation, "media_items", None)
+                && inner_eq(j, ("media_items", "metadata_item_id"), (descendant, "id"))
+        }) else {
+            continue;
+        };
+        let hierarchy = if descendant == "children" {
+            vec![("children", "metadata_items")]
+        } else {
+            vec![
+                ("children", "metadata_items"),
+                ("grandchildren", "children"),
+            ]
+        };
+        let mut indices = Vec::new();
+        for (child, parent) in hierarchy {
+            let Some(i) = twj.joins.iter().position(|j| {
+                table(&j.relation, "metadata_items", Some(child))
+                    && inner_eq(j, (child, "parent_id"), (parent, "id"))
+            }) else {
+                return;
+            };
+            indices.push(i);
+        }
+        // Already valid, or an unusual partially ordered chain: leave it alone.
+        if indices.iter().any(|&i| i <= media) {
+            continue;
+        }
+        let joins: Vec<_> = indices.iter().map(|&i| twj.joins[i].clone()).collect();
+        indices.sort_unstable();
+        for i in indices.into_iter().rev() {
+            twj.joins.remove(i);
+        }
+        for (offset, join) in joins.into_iter().enumerate() {
+            twj.joins.insert(media + offset, join);
         }
     }
 }
@@ -2825,5 +2901,31 @@ mod smart_tv_page_tests {
             let result = crate::translate(&sql).unwrap().sql;
             assert!(!result.contains("GROUP BY metadata_items.id"), "{result}");
         }
+    }
+    #[test]
+    fn plex_descendant_media_joins_are_in_postgres_scope() {
+        for (descendant, hierarchy) in [
+            ("children", "JOIN metadata_items AS children ON children.parent_id = metadata_items.id"),
+            ("grandchildren", "JOIN metadata_items AS children ON children.parent_id = metadata_items.id JOIN metadata_items AS grandchildren ON grandchildren.parent_id = children.id"),
+        ] {
+            let sql = format!("SELECT DISTINCT metadata_items.id FROM metadata_items JOIN media_items ON media_items.metadata_item_id = {descendant}.id JOIN media_parts ON media_parts.media_item_id = media_items.id LEFT JOIN metadata_item_settings ON metadata_item_settings.guid = metadata_items.guid AND metadata_item_settings.account_id = 1 {hierarchy} WHERE metadata_items.id IN (1, 2)");
+            let result = crate::translate(&sql).unwrap().sql;
+            assert!(result.find(&format!("JOIN metadata_items AS {descendant}")).unwrap() < result.find("JOIN media_items").unwrap(), "{result}");
+            assert!(result.contains("LEFT JOIN metadata_item_settings"), "{result}");
+            if descendant == "grandchildren" {
+                assert!(result.find("JOIN metadata_items AS children").unwrap() < result.find("JOIN metadata_items AS grandchildren").unwrap(), "{result}");
+            }
+        }
+    }
+
+    #[test]
+    fn plex_descendant_media_join_outer_hierarchy_is_unchanged() {
+        let sql = "SELECT metadata_items.id FROM metadata_items JOIN media_items ON media_items.metadata_item_id = children.id LEFT JOIN metadata_items AS children ON children.parent_id = metadata_items.id";
+        let result = crate::translate(sql).unwrap().sql;
+        assert!(
+            result.find("JOIN media_items").unwrap()
+                < result.find("LEFT JOIN metadata_items AS children").unwrap(),
+            "{result}"
+        );
     }
 }
