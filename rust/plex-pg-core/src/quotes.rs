@@ -394,6 +394,7 @@ fn fix_expr(expr: &mut Expr) {
         }
         Expr::UnaryOp { expr: inner, .. } => fix_expr(inner),
         Expr::Nested(inner) => fix_expr(inner),
+        Expr::Collate { expr: inner, .. } => fix_expr(inner),
         Expr::Cast { expr: inner, .. } => fix_expr(inner),
         Expr::InList { expr, list, .. } => {
             fix_expr(expr);
@@ -606,5 +607,12 @@ mod tests {
             "backticks in FULL OUTER JOIN ON should be double-quoted, got: {}",
             r.sql
         );
+    }
+    #[test]
+    fn compat_backticks__collated_parent_ordering() {
+        let sql = "SELECT parents.id FROM metadata_items AS parents ORDER BY (parents.`title_sort`) COLLATE NOCASE";
+        let result = translate(sql).unwrap().sql;
+        assert!(!result.contains('`'), "{result}");
+        assert!(result.replace('"', "").contains("parents.title_sort"), "{result}");
     }
 }
