@@ -19,7 +19,9 @@ int main(int argc, char **argv){
  CHECK(sqlite3_bind_text(s,1,"codex_private_returning_probe",-1,SQLITE_STATIC)==SQLITE_OK,5);
  CHECK(sqlite3_bind_text(s,2,"1",-1,SQLITE_STATIC)==SQLITE_OK,6);
  int rc=sqlite3_step(s);printf("checkpoint_upsert_first_step=%d expected_ROW=%d\n",rc,SQLITE_ROW);CHECK(rc==SQLITE_ROW,7);
- CHECK(sqlite3_column_int64(s,0)>0,8);CHECK(sqlite3_step(s)==SQLITE_DONE,9);
+ CHECK(sqlite3_column_int64(s,0)>0,8);sqlite3_int64 first_id=sqlite3_column_int64(s,0);CHECK(sqlite3_step(s)==SQLITE_DONE,9);
+ CHECK(sqlite3_reset(s)==SQLITE_OK,24);CHECK(sqlite3_bind_text(s,2,"2",-1,SQLITE_STATIC)==SQLITE_OK,25);
+ CHECK(sqlite3_step(s)==SQLITE_ROW && sqlite3_column_int64(s,0)==first_id,26);CHECK(sqlite3_step(s)==SQLITE_DONE,27);
  sqlite3_finalize(s);exec("ROLLBACK");exec("BEGIN");
  s=prep("INSERT INTO preferences(name,value) VALUES('codex_private_returning_a','a'),('codex_private_returning_b','b') RETURNING name,id");
  CHECK(sqlite3_column_count(s)==2,10);
