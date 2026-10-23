@@ -193,7 +193,7 @@ fn rewrite_server_uri_encoded_params() {
 
 #[test]
 fn rewrite_server_uri_small_buffer() {
-    let (ok, out) = rewrite_with_buf(
+    let (ok, _out) = rewrite_with_buf(
         "server://abc/com.plexapp.plugins.library/library/sections/2/all?type=2&sort=date",
         32,
     );
