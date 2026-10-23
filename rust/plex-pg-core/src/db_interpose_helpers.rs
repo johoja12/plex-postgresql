@@ -20,6 +20,7 @@ mod badcast_trace;
 mod decltype;
 mod ffi_strings;
 mod pg_result;
+pub(crate) use pg_result::column_text_transform_owned;
 mod pure_helpers;
 mod string_utils;
 mod type_cache;

@@ -66,10 +66,24 @@ unsafe fn load_cached_text_state(pg_stmt: &mut PgStmt, idx: c_int) -> Option<Cac
 /// to avoid deadlock with the LOGGER mutex.
 unsafe fn write_cached_text_output(
     pg_stmt: &mut PgStmt,
-    _idx: c_int,
+    idx: c_int,
     state: &CachedTextState,
 ) -> (*const c_uchar, bool) {
+    if let Some(Some(owned)) = pg_stmt.owned_column_text.get(idx as usize) {
+        return (owned.as_ptr(), false);
+    }
     let str_len = libc::strlen(state.source_value) as usize;
+    // Cached transformed values need the same unbounded statement ownership
+    // as live values; a fixed ring would truncate a long rewritten URI.
+    let bytes = std::slice::from_raw_parts(state.source_value as *const u8, str_len);
+    if let Some(owned) = crate::db_interpose_helpers::column_text_transform_owned(
+        state.col_name, state.oid, pg_stmt.pg_sql, state.source_value, bytes,
+    ) {
+        pg_stmt.owned_column_text.resize_with(
+            pg_stmt.owned_column_text.len().max(idx as usize + 1), || None);
+        pg_stmt.owned_column_text[idx as usize] = Some(owned);
+        return (pg_stmt.owned_column_text[idx as usize].as_ref().unwrap().as_ptr(), false);
+    }
     let buf_idx = next_text_buffer_index();
     let mut out_ptr: *const c_uchar = ptr::null();
     let mut from_ring = true;
@@ -155,6 +169,27 @@ unsafe fn write_live_text_output(
     idx: c_int,
     state: &LiveTextState,
 ) -> (*const c_uchar, bool) {
+    if let Some(Some(owned)) = pg_stmt.owned_column_text.get(idx as usize) {
+        return (owned.as_ptr(), false);
+    }
+    let mut source = ptr::null();
+    let mut len = 0;
+    let mut is_null = 0;
+    let ok = crate::db_interpose_helpers::rust_pg_result_value_ptr_len(
+        helpers_result_ptr(pg_stmt.result), state.row, idx,
+        &mut source, &mut len, &mut is_null,
+    );
+    if ok == 0 || is_null != 0 || source.is_null() || len < 0 {
+        return (b"\0".as_ptr(), false);
+    }
+    let bytes = std::slice::from_raw_parts(source as *const u8, len as usize);
+    if let Some(owned) = crate::db_interpose_helpers::column_text_transform_owned(
+        state.col_name, state.oid_u, pg_stmt.pg_sql, source, bytes,
+    ) {
+        pg_stmt.owned_column_text.resize_with(pg_stmt.num_cols as usize, || None);
+        pg_stmt.owned_column_text[idx as usize] = Some(owned);
+        return (pg_stmt.owned_column_text[idx as usize].as_ref().unwrap().as_ptr(), false);
+    }
     let buf_idx = next_text_buffer_index();
     let mut out_ptr: *const c_uchar = ptr::null();
     let mut preview = [0u8; 128];

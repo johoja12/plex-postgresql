@@ -338,6 +338,7 @@ pub fn rust_stmt_clear_result(stmt_ptr: *mut PgStmt) {
         }
         stmt.set_result_conn(std::ptr::null_mut());
         stmt.metadata_only_result = 0;
+        stmt.owned_column_text.clear();
         stmt.current_row = -1;
         stmt.num_rows = 0;
         stmt.num_cols = 0;
