@@ -457,6 +457,18 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
                 return first_rc;
             } else if stmt_is_pg == 1 {
                 if write_executed {
+                    // An explicit RETURNING may contain more than one row.
+                    // Stepping advances its retained result without rerunning DML.
+                    let _stmt_guard = PgStmt::lock_mutex(pg_stmt);
+                    let s = &mut *pg_stmt;
+                    if !s.result.is_null() && s.metadata_only_result == 0
+                        && s.current_row < s.num_rows
+                    {
+                        s.current_row += 1;
+                        if s.current_row < s.num_rows {
+                            return SQLITE_ROW;
+                        }
+                    }
                     return SQLITE_DONE;
                 }
 
@@ -523,6 +535,12 @@ unsafe fn my_sqlite3_step_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
                         note_pg_conn_error();
                     }
                     return SQLITE_ERROR;
+                }
+                // A RETURNING write of Plex's own answers its row first
+                // (write_exec::plex_reads_returning_rows); the next step is
+                // DONE through write_executed.
+                if write_rc == STEP_RESULT_ROW {
+                    return SQLITE_ROW;
                 }
             }
         }
