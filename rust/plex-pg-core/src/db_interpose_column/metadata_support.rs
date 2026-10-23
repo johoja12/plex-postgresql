@@ -72,6 +72,12 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         return false;
     }
 
+    // Backport upstream 4eddbba without reverting our describe-only read path.
+    // Asking a write for column names must never execute it outside its step.
+    if pg_stmt_ref.is_pg == 1 && pg_stmt_ref.stmt_name[0] == 0 {
+        return false;
+    }
+
     let mut exec_conn = conn;
     let thread_conn = unsafe {
         if conn_ref.streaming_active.load(Ordering::SeqCst) != 0 {

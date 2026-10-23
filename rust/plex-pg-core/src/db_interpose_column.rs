@@ -43,6 +43,7 @@ use crate::ffi_types::{sqlite3, sqlite3_stmt, sqlite3_value, PgConnection, PgStm
 use crate::libpq_helpers::PGresult as PgResultLibpq;
 use badcast::{trace_badcast_log_ctx, trace_badcast_should_log, trace_badcast_should_log_col};
 use binary_accessors::{column_blob_impl, column_bytes_impl};
+pub(crate) use binary_accessors::transformed_text_blob;
 use blob_cache::pg_decode_bytea_cached_impl;
 pub use blob_cache::rust_pg_decode_bytea_cached;
 use decltype_accessor::column_decltype_impl;
@@ -583,4 +584,64 @@ mod tests {
         }
         rust_stmt_free(stmt);
     }
+    #[test]
+    fn uri_text_has_consistent_blob_text_and_bytes_in_both_result_paths() {
+        use super::rust_my_sqlite3_column_blob;
+        let original = "server://m/com.plexapp.plugins.library/library/sections/2/all?type=2";
+        let rewritten = "library:///directory/%2Flibrary%2Fsections%2F2%2Fall%3Ftype%3D2";
+        for cached_path in [false, true] {
+            for bytes_first in [false, true] {
+                for oid in [25_u32, 17_u32] {
+                    let stmt = make_stmt();
+                    let mut key = Box::new(0u8);
+                    let shadow = (&mut *key as *mut u8).cast::<sqlite3_stmt>();
+                    let value = CString::new(original).unwrap();
+                    let name = CString::new("extra_data").unwrap();
+                    let mut values = [value.as_ptr() as *mut c_char];
+                    let mut lengths = [original.len() as c_int];
+                    let mut nulls = [0];
+                    let mut row = CachedRow { values: values.as_mut_ptr(), lengths: lengths.as_mut_ptr(), is_null: nulls.as_mut_ptr() };
+                    let mut types = [oid]; let mut names = [name.as_ptr() as *mut c_char];
+                    let mut cached = CachedResult { cache_key: 1, created_ms: 0, ref_count: AtomicI32::new(1), num_rows: 1, num_cols: 1, col_types: types.as_mut_ptr(), col_names: names.as_mut_ptr(), rows: &mut row, hit_count: 0 };
+                    let mut res = std::ptr::null_mut();
+                    unsafe {
+                        let s = &mut *stmt; s.is_pg = 2; s.num_cols = 1; s.num_rows = 1; s.current_row = 0; s.ensure_column_capacity(1);
+                        if cached_path { s.cached_result = &mut cached; }
+                        else {
+                            res = PQmakeEmptyPGresult(std::ptr::null_mut(), 2);
+                            let mut desc = PgResAttDesc { name: name.as_ptr(), tableid: 0, columnid: 0, format: 0, typid: oid, typlen: -1, atttypmod: -1 };
+                            assert_eq!(PQsetResultAttrs(res, 1, &mut desc), 1);
+                            assert_eq!(PQsetvalue(res, 0, 0, value.as_ptr(), original.len() as c_int), 1);
+                            s.result = res;
+                        }
+                    }
+                    rust_stmt_register(shadow as usize, stmt as usize);
+                    let expected = if oid == 17 { original } else { rewritten };
+                    if bytes_first { assert_eq!(rust_my_sqlite3_column_bytes(shadow, 0) as usize, expected.len()); }
+                    let blob = rust_my_sqlite3_column_blob(shadow, 0);
+                    assert!(!blob.is_null());
+                    let len = rust_my_sqlite3_column_bytes(shadow, 0);
+                    assert_eq!(len as usize, expected.len());
+                    assert_eq!(unsafe { std::slice::from_raw_parts(blob.cast::<u8>(), len as usize) }, expected.as_bytes());
+                    if oid != 17 {
+                        let text = rust_my_sqlite3_column_text(shadow, 0);
+                        assert_eq!(unsafe { CStr::from_ptr(text.cast()) }.to_str().unwrap(), expected);
+                    } else { assert!(unsafe { &*stmt }.owned_column_text.is_empty()); }
+                    if oid != 17 && !cached_path {
+                        let fake = super::rust_my_sqlite3_column_value(shadow, 0);
+                        assert!(!fake.is_null());
+                        assert_eq!(crate::db_interpose_value::rust_my_sqlite3_value_bytes(fake) as usize, expected.len());
+                        let text = crate::db_interpose_value::rust_my_sqlite3_value_text(fake);
+                        assert_eq!(unsafe { CStr::from_ptr(text.cast()) }.to_str().unwrap(), expected);
+                        let blob = crate::db_interpose_value::rust_my_sqlite3_value_blob(fake);
+                        assert_eq!(unsafe { std::slice::from_raw_parts(blob.cast::<u8>(), expected.len()) }, expected.as_bytes());
+                    }
+                    rust_stmt_unregister(shadow as usize);
+                    unsafe { (&mut *stmt).cached_result = std::ptr::null_mut(); (&mut *stmt).result = std::ptr::null_mut(); if !res.is_null() { PQclear(res); } }
+                    rust_stmt_free(stmt);
+                }
+            }
+        }
+    }
+
 }

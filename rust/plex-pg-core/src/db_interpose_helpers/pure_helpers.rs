@@ -1,61 +1,129 @@
 use super::*;
 use crate::byte_utils::push_utf8_byte;
 
-pub(super) fn rewrite_server_library_uri_bytes(
+/// Replace migrated server identities without moving filter parameters out of
+/// Plex's encoded directory path. A bare `library://sections/...?...` is not a
+/// canonical collection URI and makes Plex's library path parser fall back.
+pub(super) fn rewrite_server_library_uri_bytes(input: &[u8], out_cap: usize) -> Option<Vec<u8>> {
+    // Imported extra_data can contain both a literal pv:uri and a form-encoded
+    // url copy. Plex may read either; keep them consistent without rewriting
+    // other keys or values in that form string.
+    let mut encoded = Vec::new();
+    let mut pos = 0;
+    let mut changed = false;
+    while let Some(rel) = find_ascii_icase(&input[pos..], b"server%3a%2f%2f") {
+        let begin = pos + rel;
+        let end = input[begin..].iter().position(|b|
+            b.is_ascii_whitespace() || matches!(b, b'&' | b'"' | b'\\' | b'\'' | b';')
+        ).map_or(input.len(), |n| begin + n);
+        encoded.extend_from_slice(&input[pos..begin]);
+        if let Some(decoded) = decode_uri_component(&input[begin..end]) {
+            if let Some(uri) = rewrite_server_library_uri_raw(&decoded, usize::MAX) {
+                encode_uri_component(&mut encoded, &uri);
+                changed = true;
+            } else { encoded.extend_from_slice(&input[begin..end]); }
+        } else { encoded.extend_from_slice(&input[begin..end]); }
+        pos = end;
+        if encoded.len() > out_cap { return None; }
+    }
+    if changed {
+        encoded.extend_from_slice(&input[pos..]);
+        if encoded.len() > out_cap { return None; }
+        // Raw and encoded copies can occur together in the same JSON value.
+        let value = rewrite_server_library_uri_raw(&encoded, usize::MAX).unwrap_or(encoded);
+        if value.len() <= out_cap { Some(value) } else { None }
+    } else { rewrite_server_library_uri_raw(input, out_cap) }
+}
+
+fn decode_uri_component(input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'%' {
+            let high = (*input.get(i + 1)? as char).to_digit(16)?;
+            let low = (*input.get(i + 2)? as char).to_digit(16)?;
+            out.push(((high << 4) | low) as u8); i += 3;
+        } else {
+            out.push(if input[i] == b'+' { b' ' } else { input[i] }); i += 1;
+        }
+    }
+    Some(out)
+}
+
+fn encode_uri_component(out: &mut Vec<u8>, input: &[u8]) {
+    const HEX: &[u8] = b"0123456789ABCDEF";
+    for b in input {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(*b);
+        } else { out.extend_from_slice(&[b'%', HEX[(b >> 4) as usize], HEX[(b & 15) as usize]]); }
+    }
+}
+
+fn rewrite_server_library_uri_raw(
     input_bytes: &[u8],
     out_cap: usize,
 ) -> Option<Vec<u8>> {
     const SERVER_PREFIX: &[u8] = b"server://";
     const NEEDLE: &[u8] = b"/com.plexapp.plugins.library/library/";
-    const REPLACEMENT: &[u8] = b"library://";
-
+    const HEX: &[u8] = b"0123456789ABCDEF";
     if find_subslice(input_bytes, SERVER_PREFIX).is_none()
         || find_subslice(input_bytes, NEEDLE).is_none()
     {
         return None;
     }
-
-    let mut out_buf = Vec::with_capacity(input_bytes.len().min(out_cap));
-    let mut in_pos = 0usize;
+    let mut out = Vec::with_capacity(input_bytes.len().min(out_cap));
+    let mut pos = 0;
     let mut rewrites = 0;
-
-    while in_pos < input_bytes.len() {
-        if out_buf.len() >= out_cap {
-            break;
+    while let Some(rel) = find_subslice(&input_bytes[pos..], SERVER_PREFIX) {
+        let begin = pos + rel;
+        out.extend_from_slice(&input_bytes[pos..begin]);
+        let authority = begin + SERVER_PREFIX.len();
+        // Never consume a prefix or plugin path from a different JSON field.
+        let end = input_bytes[authority..]
+            .iter()
+            .position(|b| b.is_ascii_whitespace() || matches!(b, b'"' | b'\\' | b'\'' | b';'))
+            .map_or(input_bytes.len(), |n| authority + n);
+        let slash = input_bytes[authority..end]
+            .iter()
+            .position(|b| *b == b'/')
+            .map(|n| authority + n);
+        if let Some(slash) = slash.filter(|&n| input_bytes[n..end].starts_with(NEEDLE)) {
+            let path = slash + NEEDLE.len();
+            if input_bytes[path..end].starts_with(b"sections/") {
+                out.extend_from_slice(b"library:///directory/");
+                // Encode the complete /library/... path, including the query.
+                // Existing % escapes get one extra layer and decode unchanged.
+                for b in b"/library/".iter().chain(input_bytes[path..end].iter()) {
+                    if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                        out.push(*b);
+                    } else {
+                        out.extend_from_slice(&[
+                            b'%',
+                            HEX[(b >> 4) as usize],
+                            HEX[(b & 15) as usize],
+                        ]);
+                    }
+                }
+                pos = end;
+            } else {
+                // Retain existing behavior for non-collection server paths.
+                out.extend_from_slice(b"library://");
+                pos = path;
+            }
+            rewrites += 1;
+        } else {
+            out.extend_from_slice(SERVER_PREFIX);
+            pos = authority;
         }
-        let slice = &input_bytes[in_pos..];
-        let Some(rel_match) = find_subslice(slice, SERVER_PREFIX) else {
-            push_capped(&mut out_buf, out_cap, slice);
-            break;
-        };
-        let abs_match = in_pos + rel_match;
-        push_capped(&mut out_buf, out_cap, &input_bytes[in_pos..abs_match]);
-        in_pos = abs_match;
-
-        let search_start = in_pos + SERVER_PREFIX.len();
-        if search_start >= input_bytes.len() {
-            push_capped(&mut out_buf, out_cap, &input_bytes[in_pos..]);
-            break;
+        if out.len() > out_cap {
+            return None;
         }
-
-        let tail = &input_bytes[search_start..];
-        let Some(rel_lib) = find_subslice(tail, NEEDLE) else {
-            push_capped(&mut out_buf, out_cap, &input_bytes[in_pos..search_start]);
-            in_pos = search_start;
-            continue;
-        };
-        let abs_lib = search_start + rel_lib;
-        let lib_end = abs_lib + NEEDLE.len();
-
-        push_capped(&mut out_buf, out_cap, REPLACEMENT);
-        in_pos = lib_end;
-        rewrites += 1;
     }
-
-    if rewrites == 0 {
+    out.extend_from_slice(&input_bytes[pos..]);
+    if rewrites == 0 || out.len() > out_cap {
         None
     } else {
-        Some(out_buf)
+        Some(out)
     }
 }
 

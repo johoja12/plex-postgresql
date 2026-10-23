@@ -254,9 +254,8 @@ pub(crate) fn plex_reads_returning_rows(orig_sql: &[u8], status: c_int, ntuples:
     let Ok(tokens) = sqlparser::tokenizer::Tokenizer::new(
         &sqlparser::dialect::SQLiteDialect {}, sql,
     ).tokenize() else { return false; };
-    tokens.iter().any(|token| matches!(token,
-        sqlparser::tokenizer::Token::Word(word)
-            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("returning")))
+    tokens.iter().any(|t| matches!(t, sqlparser::tokenizer::Token::Word(w)
+        if w.quote_style.is_none() && w.keyword == sqlparser::keywords::Keyword::RETURNING))
 }
 
 #[cfg(test)]
@@ -286,11 +285,12 @@ mod tests {
     }
 
     #[test]
-    fn returning_in_a_literal_identifier_or_comment_is_not_a_clause() {
+    fn returning_in_values_identifiers_or_comments_is_not_a_clause() {
         for sql in [
-            &b"INSERT INTO preferences(name,value) VALUES ('returning', 'x')"[..],
-            &b"INSERT INTO preferences(name,value) VALUES (?, ?) /* RETURNING */"[..],
-            &b"INSERT INTO preferences (`returning`) VALUES (?)"[..],
+            b"INSERT INTO preferences(name,value) VALUES ('returning', 'x')".as_slice(),
+            b"INSERT INTO preferences(name,value) VALUES ('x','y') /* RETURNING */",
+            b"INSERT INTO preferences(name,value) VALUES('x','y') -- RETURNING id",
+            b"UPDATE metadata_items SET `RETURNING` = 1",
         ] {
             assert!(!plex_reads_returning_rows(sql, PGRES_TUPLES_OK, 1));
         }

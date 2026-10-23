@@ -135,6 +135,9 @@ pub(super) fn value_text_impl(p_val: *mut sqlite3_value) -> *const c_uchar {
         return ptr::null();
     }
 
+    if let Some((value, _)) = unsafe { super::support::transformed_fake_text(&ctx) } {
+        return value;
+    }
     let result_ptr = pg_stmt_ref.result;
     let mut value: *const c_char = ptr::null();
     let mut len: c_int = 0;
