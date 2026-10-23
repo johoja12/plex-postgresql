@@ -38,18 +38,6 @@ pub(super) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-pub(super) fn push_capped(buf: &mut Vec<u8>, out_cap: usize, bytes: &[u8]) {
-    if out_cap == 0 || bytes.is_empty() {
-        return;
-    }
-    let remaining = out_cap.saturating_sub(buf.len());
-    if remaining == 0 {
-        return;
-    }
-    let take = remaining.min(bytes.len());
-    buf.extend_from_slice(&bytes[..take]);
-}
-
 pub(super) fn starts_with_ascii_icase_at(haystack: &[u8], at: usize, pat: &[u8]) -> bool {
     if haystack.len() < at + pat.len() {
         return false;

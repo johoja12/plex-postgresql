@@ -64,6 +64,40 @@ pub fn rust_column_text_reformat_aggregate(
     c_int::from(write_i32_to_buf(out, out_len, val))
 }
 
+/// None means libpq's NUL-terminated storage can be borrowed unchanged.
+/// Owned output has a trailing NUL and is kept until the next step/reset.
+pub(crate) fn column_text_transform_owned(
+    col_name: *const c_char, oid: c_uint, pg_sql: *const c_char,
+    source: *const c_char, bytes: &[u8],
+) -> Option<Vec<u8>> {
+    if std::str::from_utf8(bytes).is_err() { return Some(vec![0]); }
+    // Keep upstream boolean conversion in the owned/borrowed fast path too.
+    // Plex reads EXISTS predicates as SQLite integer text, not libpq's t/f.
+    if oid == 16 {
+        match bytes {
+            b"t" => return Some(b"1\0".to_vec()),
+            b"f" => return Some(b"0\0".to_vec()),
+            _ => {}
+        }
+    }
+    if matches!(oid, 20 | 21 | 23) {
+        let mut aggregate = [0 as c_char; 32];
+        if rust_column_text_reformat_aggregate(col_name, oid, pg_sql, source,
+            aggregate.as_mut_ptr(), aggregate.len()) != 0
+        {
+            return Some(unsafe { CStr::from_ptr(aggregate.as_ptr()) }.to_bytes_with_nul().to_vec());
+        }
+    }
+    // Most ordinary fields cannot contain a server URI. Avoid the multi-byte
+    // substring matcher for values with no colon.
+    if !bytes.contains(&b':') { return None; }
+    rewrite_server_library_uri_bytes(bytes, bytes.len().saturating_mul(3).saturating_add(64))
+        .map(|mut value| {
+            value.push(0);
+            value
+        })
+}
+
 pub fn rust_column_text_transform(
     col_name: *const c_char,
     oid: c_uint,

@@ -103,7 +103,7 @@ fn rewrite_server_uri_standalone() {
         512,
     );
     assert_eq!(ok, 1);
-    assert_eq!(out, "library://sections/2/all?type=2");
+    assert_eq!(out, "library:///directory/%2Flibrary%2Fsections%2F2%2Fall%3Ftype%3D2");
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn rewrite_server_uri_json_embedded() {
     assert_eq!(ok, 1);
     assert_eq!(
         out,
-        "{\"at:childCount\":\"1\",\"at:smart\":\"1\",\"pv:uri\":\"library://sections/2/all?type=2&sort=date\"}"
+        "{\"at:childCount\":\"1\",\"at:smart\":\"1\",\"pv:uri\":\"library:///directory/%2Flibrary%2Fsections%2F2%2Fall%3Ftype%3D2%26sort%3Ddate\"}"
     );
 }
 
@@ -166,7 +166,7 @@ fn rewrite_server_uri_multiple_in_json() {
     assert_eq!(ok, 1);
     assert_eq!(
         out,
-        "{\"uri1\":\"library://sections/1/all\",\"uri2\":\"library://sections/2/all\"}"
+        "{\"uri1\":\"library:///directory/%2Flibrary%2Fsections%2F1%2Fall\",\"uri2\":\"library:///directory/%2Flibrary%2Fsections%2F2%2Fall\"}"
     );
 }
 
@@ -187,7 +187,7 @@ fn rewrite_server_uri_encoded_params() {
     assert_eq!(ok, 1);
     assert_eq!(
         out,
-        "library://sections/2/all?type=2&sort=originallyAvailableAt%3Adesc&push=1&show.network=248684&pop=1"
+        "library:///directory/%2Flibrary%2Fsections%2F2%2Fall%3Ftype%3D2%26sort%3DoriginallyAvailableAt%253Adesc%26push%3D1%26show.network%3D248684%26pop%3D1"
     );
 }
 
@@ -197,7 +197,7 @@ fn rewrite_server_uri_small_buffer() {
         "server://abc/com.plexapp.plugins.library/library/sections/2/all?type=2&sort=date",
         32,
     );
-    assert!(ok == 0 || out.len() < 32);
+    assert_eq!(ok, 0, "never return a truncated encoded URI");
 }
 
 #[test]
@@ -213,7 +213,7 @@ fn rewrite_server_uri_real_plex_blob() {
         2048,
     );
     assert_eq!(ok, 1);
-    assert!(out.contains("library://sections/2/all"));
+    assert!(out.contains("library:///directory/%2Flibrary%2Fsections%2F2%2Fall"));
     assert!(!out.contains("server://"));
 }
 
@@ -903,4 +903,60 @@ fn column_text_transform_leaves_a_text_t_alone() {
         out.len(),
     );
     assert_eq!(rc, 0, "text is passed through untouched");
+}
+
+#[test]
+fn owned_boolean_transform_matches_upstream_and_borrows_ordinary_text() {
+    let name = c("exists");
+    for (source, expected) in [("t", b"1\0"), ("f", b"0\0")] {
+        let value = c(source);
+        let owned = column_text_transform_owned(name.as_ptr(), 16, std::ptr::null(),
+            value.as_ptr(), value.as_bytes()).unwrap();
+        assert_eq!(owned, expected);
+        let mut legacy = [0 as c_char; 8];
+        assert_eq!(rust_column_text_transform(name.as_ptr(), 16, std::ptr::null(),
+            value.as_ptr(), value.as_bytes().len(), legacy.as_mut_ptr(), legacy.len()), 1);
+        assert_eq!(owned, unsafe { CStr::from_ptr(legacy.as_ptr()) }.to_bytes_with_nul());
+        assert!(column_text_transform_owned(name.as_ptr(), 25, std::ptr::null(),
+            value.as_ptr(), value.as_bytes()).is_none());
+    }
+}
+
+#[test]
+fn rewrite_server_uri_preserves_nested_escapes_unicode_and_json_fields() {
+    let input = r#"{"pv:uri":"server://m/com.plexapp.plugins.library/library/sections/2/all?title=Pokémon%20A%26B&sort=titleSort%3Adesc","label":"unchanged"}"#;
+    let (ok, out) = rewrite_with_buf(input, 2048);
+    assert_eq!(ok, 1);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["pv:uri"], "library:///directory/%2Flibrary%2Fsections%2F2%2Fall%3Ftitle%3DPok%C3%A9mon%2520A%2526B%26sort%3DtitleSort%253Adesc");
+    assert_eq!(v["label"], "unchanged");
+    let (again, _) = rewrite_with_buf(&out, 2048);
+    assert_eq!(again, 0, "canonical URIs are already normalized");
+}
+
+#[test]
+fn rewrite_server_uri_does_not_join_separate_fields_or_other_plugins() {
+    for input in [
+        r#"{"a":"server://m","b":"/com.plexapp.plugins.library/library/sections/2/all"}"#,
+        "server://m/other/com.plexapp.plugins.library/library/sections/2/all",
+    ] {
+        let (ok, _) = rewrite_with_buf(input, 2048);
+        assert_eq!(ok, 0);
+    }
+}
+
+#[test]
+fn owned_collection_uri_can_expand_past_input_and_fixed_buffers_fail_closed() {
+    use crate::db_interpose_helpers::column_text_transform_owned;
+    let uri = format!("server://m/com.plexapp.plugins.library/library/sections/2/all?{}", "x=%26&".repeat(200));
+    let src = CString::new(uri.clone()).unwrap();
+    let name = CString::new("extra_data").unwrap();
+    let out = column_text_transform_owned(name.as_ptr(), 25, std::ptr::null(), src.as_ptr(), uri.as_bytes()).unwrap();
+    assert_eq!(out.last(), Some(&0));
+    let decoded = CStr::from_bytes_with_nul(&out).unwrap().to_str().unwrap();
+    assert!(decoded.starts_with("library:///directory/%2Flibrary%2Fsections%2F2%2Fall%3F"));
+    assert_eq!(decoded.matches("x%3D%2526%26").count(), 200);
+    assert!(decoded.len() > uri.len());
+    let (ok, _) = rewrite_with_buf(&uri, uri.len());
+    assert_eq!(ok, 0, "a fixed buffer must not report a partial URI as success");
 }
