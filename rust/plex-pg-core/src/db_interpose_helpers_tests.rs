@@ -193,7 +193,7 @@ fn rewrite_server_uri_encoded_params() {
 
 #[test]
 fn rewrite_server_uri_small_buffer() {
-    let (ok, out) = rewrite_with_buf(
+    let (ok, _out) = rewrite_with_buf(
         "server://abc/com.plexapp.plugins.library/library/sections/2/all?type=2&sort=date",
         32,
     );
@@ -1033,4 +1033,25 @@ fn owned_collection_uri_can_expand_past_input_and_fixed_buffers_fail_closed() {
     assert!(decoded.len() > uri.len());
     let (ok, _) = rewrite_with_buf(&uri, uri.len());
     assert_eq!(ok, 0, "a fixed buffer must not report a partial URI as success");
+}
+
+
+#[test]
+fn rewrite_server_uri_updates_both_imported_extra_data_representations() {
+    let input = r#"{"pv:uri":"server://m/com.plexapp.plugins.library/library/sections/2/all?type=2&sort=titleSort%3Adesc","url":"keep=unchanged%2Fvalue&pv%3Auri=server%3A%2F%2Fm%2Fcom%2Eplexapp%2Eplugins%2Elibrary%2Flibrary%2Fsections%2F2%2Fall%3Ftype%3D2%26sort%3DtitleSort%253Adesc&after=still%2Bsame"}"#;
+    let (ok, out) = rewrite_with_buf(input, 4096);
+    assert_eq!(ok, 1);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["pv:uri"], "library:///directory/%2Flibrary%2Fsections%2F2%2Fall%3Ftype%3D2%26sort%3DtitleSort%253Adesc");
+    assert_eq!(v["url"], "keep=unchanged%2Fvalue&pv%3Auri=library%3A%2F%2F%2Fdirectory%2F%252Flibrary%252Fsections%252F2%252Fall%253Ftype%253D2%2526sort%253DtitleSort%25253Adesc&after=still%2Bsame");
+    let (ok, _) = rewrite_with_buf(&out, 4096);
+    assert_eq!(ok, 0);
+}
+
+#[test]
+fn rewrite_server_uri_handles_encoded_only_and_invalid_percent_escapes() {
+    let (ok, out) = rewrite_with_buf("pv%3Auri=server%3a%2f%2fm%2fcom.plexapp.plugins.library%2flibrary%2fsections%2f2%2fall", 4096);
+    assert_eq!(ok, 1);
+    assert_eq!(out, "pv%3Auri=library%3A%2F%2F%2Fdirectory%2F%252Flibrary%252Fsections%252F2%252Fall");
+    assert_eq!(rewrite_with_buf("pv%3Auri=server%3A%2F%2Fm%zz", 4096).0, 0);
 }
