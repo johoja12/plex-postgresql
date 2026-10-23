@@ -21,6 +21,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration; fresh schemas include the same indexes. Trigram operator classes
   are resolved from the installed extension's schema.
 
+### v1.3.17-clusterplex.40 (2026-10-22)
+
+- `sqlite3_last_insert_rowid`, `sqlite3_changes`, `sqlite3_errcode` and `sqlite3_errmsg` answer from the connection the handle's last write ran on (`connection_state::write_conn`): inside a transaction that is the connection the BEGIN pinned, where every statement of the handle runs since the transaction work, not the handle's own connection. PMS 1.43.5.11029 registers a metadata agent provider at start as BEGIN, INSERT, last_insert_rowid; the handle's connection had inserted nothing and answered 0, Plex threw `DB::Exception`, rolled back and every start ended "Unable to set up server" (talos, 2026-10-22, after clusterplex.39 had passed the rig and a canary pod, where Plex found every provider and inserted none). Outside a transaction the answer is the handle's connection's, as before.
+
+### v1.3.17-clusterplex.39 (2026-10-22)
+
+- A write whose own SQL names RETURNING steps as SQLite steps it: SQLITE_ROW with the row PostgreSQL answered, then SQLITE_DONE (`write_exec::plex_reads_returning_rows`). The `RETURNING id` the shim appends to an INSERT for `last_insert_rowid` still steps straight to DONE. PMS 1.43.5.11029's one new migration, 202609141200, upserts a preference with `INSERT INTO preferences ... ON CONFLICT(name) DO UPDATE SET value = excluded.value RETURNING id` and reads the id from the row; given DONE and no row it threw, rolled the migration back and every start ended "Unable to set up server" (standalone rig, 2026-10-22). Since 0.8.9.5 a write's RETURNING result was dropped on purpose, when SOCI read nothing but `lastval()`.
+- A write's column metadata, asked for before its first step, comes from PQdescribePrepared, never from running the statement (`metadata_support::metadata_source`): the metadata path executed that upsert on a second connection, outside Plex's transaction, before the step ran it again. A write without a prepared name answers no metadata until the step. A read is described while its parameters are unbound and executed once they are, as before.
+
+### v1.3.17-clusterplex.38 (2026-10-21)
+
+- An integer column compared with a json_each list (`st.media_item_id IN (SELECT value FROM json_each(:C2))`) takes the list's integer elements, as bigints, and drops the rest (`integer_json_each_elements`), as SQLite's integer affinity does and as a literal list already did. json_each is json_array_elements_text, whose `value` is text, and PostgreSQL compared it with the integer only through the plex schema's `=`, which a Live TV guide's connection, on the guide's schema and public, cannot see: "operator does not exist: integer = text" (talos, 2026-10-21). The list still plans as an index lookup per element.
+- `pg_compat_functions.sql` defines the integer/text `=` (`integer_equals_text`, `text_equals_integer`) in public as well as in plex, so a Live TV guide's connection can compare an integer with text as the library's can. The library's search path finds plex's first, the same function. The file runs at every start, so an existing database takes it at the next one.
+- A bound time value that is neither a number nor one of SQLite's date and time forms (YYYY-MM-DD, then optionally T or a space with HH:MM, :SS, .SSS and Z or ±HH:MM; or `now`) is NULL, as SQLite reads a time value it cannot parse, instead of an error. A Plex client asked a Live TV guide for the day "Invalid Date" (talos, 2026-10-21): SQLite answers no airings, while clusterplex.36's cast refused it. A time of day alone, which SQLite puts on 2000-01-01, is NULL too.
+
+### v1.3.17-clusterplex.37 (2026-10-21)
+
+- A join whose ON clause names a later inner join's alias gets that join moved ahead of it, its own definers first (`hoist_forward_referenced_joins`). SQLite resolves an ON clause against the whole FROM clause; PostgreSQL against the joins before it. PMS builds the Live TV "What's On" hub (`/tv.plex.providers.epg.xmltv:N/hubs/discover`) by joining the hub's items on `grandchildren.id` four joins before it joins `metadata_items AS children` and `AS grandchildren`, so once the guide was served from PostgreSQL every "What's On" answered 500 with `missing FROM-clause entry for table "grandchildren"` (450 in twelve hours on talos, 2026-10-21). A LEFT JOIN is never moved, and a statement that would need one moved is left as it came.
+
+### v1.3.17-clusterplex.36 (2026-10-21)
+
+- A bound time value in strftime, datetime, date, time or unixepoch without `'unixepoch'` is read as a date when its text is one, and as seconds since the epoch when it is a number. A number keeps the shim's existing reading. PMS asks a Live TV guide for a day's airings with the day bound as text (`strftime('%s', ?, '+1 days')` with `'2026-10-21'`), and `TO_TIMESTAMP($n)` refused it: once the guide was served from PostgreSQL (clusterplex.35), every such query failed with "invalid input syntax for type double precision", 4,341 in ten minutes on talos.
+
 ### v1.3.17-clusterplex.35 (2026-10-21)
 
 - A Live TV guide database, `tv.plex.providers.epg.<provider>-<DVR uuid>.db`, is served from PostgreSQL, from the schema `epg_<uuid without dashes>` in the library's database. Each guide handle gets a connection of its own, as the blobs do, and that connection and every reconnect run with the guide's schema as `search_path`. A guide whose schema does not exist stays SQLite. cluster-plex makes the schemas before PMS starts. PMS's load file, `<guide>-loading.db`, is never redirected: PMS fills it in SQLite and renames it onto the guide (talos, 2026-10-21), and cluster-plex copies each load into the schema.

@@ -19,7 +19,8 @@ pub(super) fn preprocess_sql(sql: &str) -> String {
     let sql = rewrite_index_ddl_identifier_quotes(&sql);
     let sql = rewrite_sqlite_collations(&sql);
     let sql = rewrite_distinct_orderby_projection(&sql);
-    rewrite_metadata_items_self_join(&sql)
+    let sql = rewrite_metadata_items_self_join(&sql);
+    hoist_forward_referenced_joins(&sql)
 }
 
 fn rewrite_or_conflict_prefix_statements(sql: &str) -> String {
@@ -2041,6 +2042,250 @@ fn reorder_and_alias_self_join(sql: &str) -> String {
 /// The next join keyword sequence at or after `from`, outside quotes and
 /// parentheses: the byte range of `[NATURAL] [LEFT|RIGHT|FULL|INNER|CROSS]
 /// [OUTER] JOIN`.
+/// Moves an inner join ahead of the first join whose ON clause names its
+/// alias.
+///
+/// SQLite resolves the names in an ON clause against the whole FROM clause,
+/// so Plex joins a hub's items on `grandchildren.id` and only then joins
+/// `metadata_items AS children` and `AS grandchildren` (the Live TV "What's
+/// On" hub, `/hubs/discover`; talos, 2026-10-21). PostgreSQL resolves an ON
+/// clause against the joins before it, and answers `missing FROM-clause
+/// entry for table "grandchildren"`. For inner joins the order does not
+/// change the result, so the join that defines the alias is moved up to
+/// where it is first needed, its own definers ahead of it. A LEFT JOIN is
+/// never moved, and a join that needs one left where it is: the statement is
+/// returned as it came.
+fn hoist_forward_referenced_joins(sql: &str) -> String {
+    let unchanged = || sql.to_string();
+    let Some(first) = find_join_keyword(sql, 0) else {
+        return unchanged();
+    };
+    let prefix = &sql[..first.0];
+    let Some(base) = from_item_alias(prefix) else {
+        return unchanged();
+    };
+    let rest = &sql[first.0..];
+    let suffix_start = find_top_level_clause(&rest.to_ascii_lowercase());
+    let joins_str = &rest[..suffix_start];
+    let suffix = &rest[suffix_start..];
+
+    struct Frag {
+        keyword: String,
+        body: String,
+        alias: String,
+        inner: bool,
+        refs: Vec<String>,
+    }
+    let mut frags: Vec<Frag> = Vec::new();
+    let mut pos = 0usize;
+    while let Some((kw_start, kw_end)) = find_join_keyword(joins_str, pos) {
+        let body_end = find_join_keyword(joins_str, kw_end)
+            .map(|(s, _)| s)
+            .unwrap_or(joins_str.len());
+        let keyword = joins_str[kw_start..kw_end].to_string();
+        let body = joins_str[kw_end..body_end].trim().to_string();
+        let Some((alias, on_start)) = join_item_alias(&body) else {
+            return unchanged();
+        };
+        let refs = qualifiers_in(&body[on_start..]);
+        let inner = matches!(
+            keyword
+                .split_whitespace()
+                .map(|w| w.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .as_str(),
+            "join" | "inner join"
+        );
+        frags.push(Frag {
+            keyword,
+            body,
+            alias,
+            inner,
+            refs,
+        });
+        pos = body_end;
+    }
+
+    let mut changed = false;
+    let mut i = 0usize;
+    let mut steps = 0usize;
+    while i < frags.len() {
+        steps += 1;
+        if steps > frags.len() * frags.len() + 1 {
+            return unchanged();
+        }
+        let defined_later = |name: &str| {
+            frags[i + 1..]
+                .iter()
+                .position(|f| f.alias == name)
+                .map(|p| p + i + 1)
+        };
+        let known = |name: &str| name == base || frags[..i].iter().any(|f| f.alias == name);
+        let needed = frags[i]
+            .refs
+            .iter()
+            .find_map(|r| if known(r) { None } else { defined_later(r) });
+        match needed {
+            Some(j) => {
+                if !frags[j].inner {
+                    return unchanged();
+                }
+                let f = frags.remove(j);
+                frags.insert(i, f);
+                changed = true;
+            }
+            None => i += 1,
+        }
+    }
+    if !changed {
+        return unchanged();
+    }
+    let mut out = String::with_capacity(sql.len());
+    out.push_str(prefix.trim_end());
+    for f in &frags {
+        out.push(' ');
+        out.push_str(&f.keyword);
+        out.push(' ');
+        out.push_str(&f.body);
+    }
+    if !suffix.is_empty() {
+        out.push(' ');
+        out.push_str(suffix.trim_start());
+    }
+    out
+}
+
+/// The alias the FROM item in `prefix` (everything before the first JOIN)
+/// is known by: the table's name, or its AS alias. None for a FROM list
+/// (a comma join), a subquery, or no FROM at all.
+fn from_item_alias(prefix: &str) -> Option<String> {
+    let lower = prefix.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut depth = 0usize;
+    let mut from_at: Option<usize> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ if depth == 0
+                && !(i > 0 && is_ident_char(bytes[i - 1]))
+                && bytes[i..].starts_with(b"from")
+                && i + 4 < bytes.len()
+                && bytes[i + 4].is_ascii_whitespace() =>
+            {
+                from_at = Some(i + 4);
+                i += 4;
+            }
+            _ => i += 1,
+        }
+    }
+    let item = prefix[from_at?..].trim();
+    if item.contains(',') {
+        return None;
+    }
+    let (alias, _) = join_item_alias_impl(item, false)?;
+    Some(alias)
+}
+
+/// The alias a join item is known by, and where its ON clause starts in
+/// `body` ("table [AS alias] ON ..."). None for a subquery, a USING join or
+/// a join with no ON.
+fn join_item_alias(body: &str) -> Option<(String, usize)> {
+    join_item_alias_impl(body, true)
+}
+
+fn join_item_alias_impl(body: &str, need_on: bool) -> Option<(String, usize)> {
+    let bytes = body.as_bytes();
+    if bytes.first().is_none_or(|b| !is_ident_char(*b)) {
+        return None;
+    }
+    let word = |from: usize| -> (usize, usize) {
+        let mut s = from;
+        while s < bytes.len() && bytes[s].is_ascii_whitespace() {
+            s += 1;
+        }
+        let mut e = s;
+        while e < bytes.len() && is_ident_char(bytes[e]) {
+            e += 1;
+        }
+        (s, e)
+    };
+    let (ts, te) = word(0);
+    let table = body[ts..te].to_ascii_lowercase();
+    let (ns, ne) = word(te);
+    let next = body[ns..ne].to_ascii_lowercase();
+    let (alias, after) = if next == "as" {
+        let (as_, ae) = word(ne);
+        if as_ == ae {
+            return None;
+        }
+        (body[as_..ae].to_ascii_lowercase(), ae)
+    } else if !next.is_empty() && next != "on" && next != "using" {
+        (next, ne)
+    } else {
+        (table, te)
+    };
+    let (os, oe) = word(after);
+    if !need_on {
+        return Some((alias, after));
+    }
+    if body[os..oe].eq_ignore_ascii_case("on") {
+        Some((alias, oe))
+    } else {
+        None
+    }
+}
+
+/// The qualifiers named in `expr`: every identifier a "." follows, in
+/// lowercase, quoted text left out.
+fn qualifiers_in(expr: &str) -> Vec<String> {
+    let bytes = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b if is_ident_char(b) => {
+                let s = i;
+                while i < bytes.len() && is_ident_char(bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'.' && !bytes[s].is_ascii_digit() {
+                    let q = expr[s..i].to_ascii_lowercase();
+                    if !out.contains(&q) {
+                        out.push(q);
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
 fn find_join_keyword(sql: &str, from: usize) -> Option<(usize, usize)> {
     let bytes = sql.as_bytes();
     let mut i = from;

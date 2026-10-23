@@ -559,3 +559,171 @@ fn a_distinct_over_a_group_by_with_an_aggregate_keeps_the_group_by() {
     let t = translate("select distinct tags.id from tags group by tags.id").unwrap();
     assert_eq!(t.sql, "SELECT DISTINCT tags.id FROM tags");
 }
+
+// ─── a join that names a later join's alias ──────────────────────────────────
+//
+// SQLite resolves an ON clause against the whole FROM clause; PostgreSQL
+// against the joins before it. Plex's Live TV "What's On" hub joined a hub's
+// items on grandchildren.id four joins before it joined grandchildren
+// (talos, 2026-10-21: every /hubs/discover answered 500, "missing
+// FROM-clause entry for table "grandchildren"").
+
+const WHATS_ON: &str = "select distinct metadata_items.id as \"metadata_items_id\" from metadata_items \
+ join media_items on media_items.metadata_item_id=grandchildren.id \
+ join media_parts on media_parts.media_item_id=media_items.id \
+ join play_queue_generators on play_queue_generators.metadata_item_id=grandchildren.id and play_queue_generators.playlist_id=1667 \
+ left join metadata_item_settings on metadata_item_settings.guid=metadata_items.guid and metadata_item_settings.account_id=1 \
+ join metadata_items as children on children.parent_id=metadata_items.id \
+ join metadata_items as grandchildren on grandchildren.parent_id=children.id \
+ where metadata_items.id in (1, 2) order by metadata_items.title_sort";
+
+#[test]
+fn a_join_that_names_a_later_alias_gets_that_join_moved_ahead_of_it() {
+    let out = sql(WHATS_ON);
+    assert_eq!(
+        out,
+        "SELECT DISTINCT metadata_items.id AS \"metadata_items_id\", metadata_items.title_sort FROM metadata_items \
+         JOIN metadata_items AS children ON children.parent_id = metadata_items.id \
+         JOIN metadata_items AS grandchildren ON grandchildren.parent_id = children.id \
+         JOIN media_items ON media_items.metadata_item_id = grandchildren.id \
+         JOIN media_parts ON media_parts.media_item_id = media_items.id \
+         JOIN play_queue_generators ON play_queue_generators.metadata_item_id = grandchildren.id AND play_queue_generators.playlist_id = 1667 \
+         LEFT JOIN metadata_item_settings ON metadata_item_settings.guid = metadata_items.guid AND metadata_item_settings.account_id = 1 \
+         WHERE metadata_items.id IN (1, 2) ORDER BY metadata_items.title_sort"
+    );
+}
+
+#[test]
+fn joins_in_scope_order_are_left_in_their_order() {
+    let out = sql(
+        "select media_items.id from metadata_items \
+         left join metadata_item_settings on metadata_item_settings.guid=metadata_items.guid \
+         join media_items on media_items.metadata_item_id=metadata_items.id \
+         join media_parts on media_parts.media_item_id=media_items.id where media_parts.id=?",
+    );
+    assert_eq!(
+        out,
+        "SELECT media_items.id FROM metadata_items \
+         LEFT JOIN metadata_item_settings ON metadata_item_settings.guid = metadata_items.guid \
+         JOIN media_items ON media_items.metadata_item_id = metadata_items.id \
+         JOIN media_parts ON media_parts.media_item_id = media_items.id WHERE media_parts.id = $1"
+    );
+}
+
+#[test]
+fn a_join_that_needs_a_later_left_join_is_left_as_it_came() {
+    // Moving a LEFT JOIN changes which rows survive; PostgreSQL's error is
+    // better than a quietly different answer.
+    let input = "select 1 from metadata_items \
+                 join media_items on media_items.metadata_item_id=s.metadata_item_id \
+                 left join metadata_item_settings as s on s.guid=metadata_items.guid";
+    assert_eq!(
+        sql(input),
+        "SELECT 1 FROM metadata_items \
+         JOIN media_items ON media_items.metadata_item_id = s.metadata_item_id \
+         LEFT JOIN metadata_item_settings AS s ON s.guid = metadata_items.guid"
+    );
+}
+
+#[test]
+fn a_qualifier_no_join_defines_moves_nothing() {
+    // An outer query's alias, or a typo: not this rule's to fix.
+    let input = "select 1 from metadata_items \
+                 join media_items on media_items.metadata_item_id=outer_q.id \
+                 join media_parts on media_parts.media_item_id=media_items.id";
+    assert_eq!(
+        sql(input),
+        "SELECT 1 FROM metadata_items \
+         JOIN media_items ON media_items.metadata_item_id = outer_q.id \
+         JOIN media_parts ON media_parts.media_item_id = media_items.id"
+    );
+}
+
+#[test]
+fn a_hoisted_join_takes_its_own_definers_with_it() {
+    // grandchildren needs children, which is defined after it too.
+    let out = sql(
+        "select 1 from metadata_items \
+         join media_items on media_items.metadata_item_id=grandchildren.id \
+         join metadata_items as grandchildren on grandchildren.parent_id=children.id \
+         join metadata_items as children on children.parent_id=metadata_items.id",
+    );
+    assert_eq!(
+        out,
+        "SELECT 1 FROM metadata_items \
+         JOIN metadata_items AS children ON children.parent_id = metadata_items.id \
+         JOIN metadata_items AS grandchildren ON grandchildren.parent_id = children.id \
+         JOIN media_items ON media_items.metadata_item_id = grandchildren.id"
+    );
+}
+
+// ─── json_each against an integer column ─────────────────────────────────────
+//
+// PMS asks for an item's streams with `st.media_item_id IN (SELECT value FROM
+// json_each(:C2))`. json_each is json_array_elements_text, whose value is
+// text, and PostgreSQL compares an integer with text only through the plex
+// schema's own operator, which a Live TV guide's connection, on the guide's
+// schema and public, cannot see (talos, 2026-10-21: "operator does not
+// exist: integer = text"). SQLite gives the elements the column's integer
+// affinity, so one that is no integer never matches: the list keeps its
+// integers, as bigints.
+
+/// The json_each list an integer column is compared with.
+const INTEGER_ELEMENTS: &str =
+    "SELECT value::BIGINT FROM json_array_elements_text($2::JSON) AS json_each (value) \
+     WHERE (value IS NULL OR value ~ '^\\s*[-+]?[0-9]{1,18}\\s*$')";
+
+#[test]
+fn an_integer_column_in_a_json_each_list_takes_its_integer_elements() {
+    let out = sql(
+        "SELECT st.`id`,st.`url` FROM media_streams st WHERE (st.`url` LIKE :C1 AND st.`media_item_id` IN (SELECT value FROM json_each(:C2)))",
+    );
+    assert_eq!(
+        out,
+        format!(
+            "SELECT st.\"id\", st.\"url\" FROM media_streams st \
+             WHERE (st.\"url\" ILIKE $1 AND st.\"media_item_id\" IN ({INTEGER_ELEMENTS}))"
+        )
+    );
+}
+
+#[test]
+fn an_integer_column_not_in_a_json_each_list_drops_the_other_elements_too() {
+    // NOT IN: an element that is no integer matches nothing, so it excludes
+    // nothing either.
+    let out = sql(
+        "SELECT st.`id` FROM media_streams st WHERE st.`url` LIKE :C1 AND st.`media_item_id` NOT IN (SELECT value FROM json_each(:C2))",
+    );
+    assert_eq!(
+        out,
+        format!(
+            "SELECT st.\"id\" FROM media_streams st \
+             WHERE st.\"url\" ILIKE $1 AND st.\"media_item_id\" NOT IN ({INTEGER_ELEMENTS})"
+        )
+    );
+}
+
+#[test]
+fn a_text_column_in_a_json_each_list_keeps_the_elements_text() {
+    // Plex's collection delete compares both kinds in one statement.
+    let out = sql(
+        "DELETE FROM taggings WHERE (`tag_id` IN (SELECT tg.`id` FROM tags tg WHERE (tg.`tag` IN (SELECT value FROM json_each(:C1)) AND tg.`tag_type`=:C2)) AND `metadata_item_id` IN (SELECT value FROM json_each(:C3)))",
+    );
+    assert_eq!(
+        out,
+        "DELETE FROM taggings WHERE (\"tag_id\" IN (SELECT tg.\"id\" FROM tags tg \
+         WHERE (tg.\"tag\" IN (SELECT value::TEXT FROM json_array_elements_text($1::JSON) AS json_each (value)) \
+         AND tg.\"tag_type\" = $2)) \
+         AND \"metadata_item_id\" IN (SELECT value::BIGINT FROM json_array_elements_text($3::JSON) AS json_each (value) \
+         WHERE (value IS NULL OR value ~ '^\\s*[-+]?[0-9]{1,18}\\s*$')))"
+    );
+}
+
+#[test]
+fn forward_join_scan_preserves_unquoted_unicode_and_unicode_case_offsets() {
+    for title in ["café", "İstanbul"] {
+        let input = format!("SELECT {title} FROM metadata_items JOIN media_items ON media_items.metadata_item_id = grandchildren.id JOIN metadata_items AS grandchildren ON grandchildren.parent_id = metadata_items.id");
+        let out = sql(&input);
+        assert!(out.starts_with(&format!("SELECT {title} FROM metadata_items JOIN metadata_items AS grandchildren")), "{out}");
+    }
+}

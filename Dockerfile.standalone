@@ -63,7 +63,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ============================================================================
 # Stage 2: Runtime with plexinc/pms-docker
 # ============================================================================
-FROM plexinc/pms-docker
+# Pinned to the Plex release the shim is verified against (cluster-plex's
+# Dockerfile VERSION): an unpinned tag let the rig test a different server
+# than the one deployed. 1.43.5.11029 runs one migration past 1.43.4.10903,
+# 202609141200, which changes no schema.
+FROM plexinc/pms-docker:1.43.5.11029-6bf8af3f0
 
 # Install minimal runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -847,21 +847,18 @@ mod tests {
         // Verify peak never decreases: record the current peak, do a large
         // allocation, then confirm peak is at least as large as before.
         // We do NOT call reset() here to avoid disrupting parallel tests.
-        let before = G_PEAK_LIVE.load(Ordering::Relaxed);
+        let before_peak = G_PEAK_LIVE.load(Ordering::Relaxed);
+        let before_live = G_BYTES_LIVE.load(Ordering::Relaxed);
+        let expected_peak = before_live.saturating_add(999_001).max(0) as u64;
         // Allocate a distinctively large amount so peak is forced up.
         rust_shim_alloc_record_alloc(999_001);
         let after = G_PEAK_LIVE.load(Ordering::Relaxed);
         rust_shim_alloc_record_free(999_001); // clean up live bytes
 
         assert!(
-            after >= before,
-            "peak decreased: before={before} after={after}"
-        );
-        // The peak must have been updated by at least our allocation size minus
-        // whatever the live bytes were before (could be > 999001 already).
-        assert!(
-            after >= 999_001,
-            "peak should reflect the large allocation, got {after}"
+            after >= before_peak.max(expected_peak),
+            "peak should retain its previous value and reflect the allocation baseline: \
+             before_peak={before_peak} before_live={before_live} after={after}"
         );
     }
 

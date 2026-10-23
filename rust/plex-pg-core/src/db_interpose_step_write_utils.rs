@@ -35,8 +35,10 @@ pub(crate) use write_exec::note_failed_write;
 pub use write_exec::rust_step_write_execute_and_finalize;
 
 const SQLITE_DONE: c_int = 101;
+const SQLITE_ROW: c_int = 100;
 const SQLITE_ERROR: c_int = 1;
 const STEP_RESULT_DONE: c_int = SQLITE_DONE;
+const STEP_RESULT_ROW: c_int = SQLITE_ROW;
 const STEP_RESULT_ERROR: c_int = SQLITE_ERROR;
 
 const PGRES_COMMAND_OK: c_int = 1;

@@ -214,7 +214,8 @@ pub(crate) unsafe fn try_advance_materialized(stmt: *mut PgStmt) -> Option<c_int
     if stmt.is_null() { return None; }
     let _guard = PgStmt::lock_mutex(stmt);
     let s = &mut *stmt;
-    if s.is_pg != 2 || s.streaming_mode != 0 || s.metadata_only_result != 0 {
+    if (s.is_pg != 2 && !(s.is_pg == 1 && s.write_executed != 0))
+        || s.streaming_mode != 0 || s.metadata_only_result != 0 {
         return None;
     }
     if s.read_done != 0 { return Some(STEP_RESULT_DONE); }
@@ -251,6 +252,24 @@ mod fast_advance_tests {
         assert_eq!(s.current_row, 1);
         assert_eq!(unsafe { try_advance_materialized(&mut s) }, Some(STEP_RESULT_DONE));
         assert!(s.result.is_null());
+        assert_eq!(unsafe { try_advance_materialized(&mut s) }, Some(STEP_RESULT_DONE));
+    }
+    #[test]
+    fn returning_write_advances_all_rows_once_without_reexecuting() {
+        let mut s = PgStmt::new();
+        s.is_pg = 1;
+        s.write_executed = 1;
+        s.current_row = 0;
+        s.num_rows = 3;
+        s.result = unsafe { PQmakeEmptyPGresult(std::ptr::null_mut(), PGRES_TUPLES_OK) };
+        assert!(!s.result.is_null());
+        for row in [1, 2] {
+            assert_eq!(unsafe { try_advance_materialized(&mut s) }, Some(STEP_RESULT_ROW));
+            assert_eq!(s.current_row, row);
+        }
+        assert_eq!(unsafe { try_advance_materialized(&mut s) }, Some(STEP_RESULT_DONE));
+        assert!(s.result.is_null());
+        assert_eq!(s.write_executed, 1);
         assert_eq!(unsafe { try_advance_materialized(&mut s) }, Some(STEP_RESULT_DONE));
     }
     #[test]

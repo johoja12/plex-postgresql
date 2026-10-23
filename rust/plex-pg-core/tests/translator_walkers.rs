@@ -317,6 +317,55 @@ fn time_modifier_unixepoch_is_to_timestamp() {
     assert_eq!(n, 1);
 }
 
+// PMS asks a Live TV guide for a day's airings with the day bound as text:
+// begins_at < strftime('%s', ?, '+1 days') with '2026-10-21', which SQLite
+// reads as that date. TO_TIMESTAMP($1) takes only a number, so PostgreSQL
+// refused every such query once the guide moved there (talos, 2026-10-21:
+// 4,341 in ten minutes, "invalid input syntax for type double precision").
+// A bound value reads as a date when its text is one, and as seconds since
+// the epoch when it is a number, as before.
+#[test]
+fn a_bound_time_value_is_read_as_a_date_or_as_seconds() {
+    let (sql, n) = t(
+        "SELECT id FROM media_items WHERE begins_at < strftime('%s', ?, '+1 days') AND ends_at > strftime('%s', ?)",
+    );
+    assert_eq!(
+        sql,
+        format!(
+            "SELECT id FROM media_items WHERE begins_at < EXTRACT(EPOCH FROM {} + INTERVAL '1 days')::BIGINT AND ends_at > EXTRACT(EPOCH FROM {})::BIGINT",
+            bound_time("$1"),
+            bound_time("$2")
+        )
+    );
+    assert_eq!(n, 2);
+}
+
+// A Plex client asked a guide for the day "Invalid Date" (talos,
+// 2026-10-21). SQLite reads a time value it cannot parse as NULL, so the
+// guide has no airings for it; PostgreSQL refused the cast and the request
+// failed. Only SQLite's own forms are cast -- a date, a date and time with T
+// or a space, seconds, fractions and a zone optional, or "now" -- and
+// anything else is NULL.
+#[test]
+fn a_bound_time_value_that_is_no_time_is_null() {
+    let (sql, n) = t("SELECT strftime('%s', ?)");
+    assert_eq!(
+        sql,
+        format!("SELECT EXTRACT(EPOCH FROM {})::BIGINT", bound_time("$1"))
+    );
+    assert_eq!(n, 1);
+}
+
+/// What a bound time value `p` translates to.
+fn bound_time(p: &str) -> String {
+    let number = r"^\s*[-+]?[0-9]+(\.[0-9]*)?\s*$";
+    let time = r"^\s*(now|[0-9]{4}-[0-9]{2}-[0-9]{2}([ T][0-9]{2}:[0-9]{2}(:[0-9]{2}(\.[0-9]+)?)?)?\s*(z|[-+][0-9]{2}:[0-9]{2})?)\s*$";
+    format!(
+        "CASE WHEN {p}::TEXT ~ '{number}' THEN TO_TIMESTAMP({p}::TEXT::DOUBLE PRECISION) \
+         WHEN {p}::TEXT ~* '{time}' THEN {p}::TEXT::TIMESTAMP AT TIME ZONE 'UTC' END"
+    )
+}
+
 #[test]
 fn time_modifier_interval_and_weekday() {
     let (sql, n) = t("SELECT datetime('now', '-7 days'), datetime('now', 'weekday 1')");

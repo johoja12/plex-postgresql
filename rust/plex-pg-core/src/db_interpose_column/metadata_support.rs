@@ -118,11 +118,13 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         crate::libpq_helpers::rust_pq_clear(pending);
     }
 
+    let source = metadata_source(pg_stmt_ref.is_pg == 1, pg_stmt_ref.stmt_name[0] != 0);
+    if source == MetadataSource::None {
+        return false;
+    }
+
     unsafe {
-        // Column metadata must not execute a full library SELECT merely to
-        // discard its rows at the first sqlite3_step. Describe works for bound
-        // and parameter-free statements too, and preserves original column OIDs.
-        if pg_stmt_ref.stmt_name[0] != 0 {
+        if source == MetadataSource::Describe {
             log_info_lazy!(
                 "METADATA_DESCRIBE: Using prepared-statement describe for: {}",
                 cstr_prefix(pg_stmt_ref.pg_sql, 100, "?")
@@ -275,5 +277,48 @@ pub(crate) fn ensure_pg_result_for_metadata(pg_stmt: *mut PgStmt) -> bool {
         drop(_conn_guard);
         log_error(&format!("METADATA_EXEC: Query failed: {}", err));
         false
+    }
+}
+
+/// Where a statement's column metadata comes from when Plex asks for it
+/// before the first step.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MetadataSource {
+    /// PQdescribePrepared on the statement's prepared name: runs nothing.
+    Describe,
+    /// The statement itself, run with its bound parameters.
+    Execute,
+    /// Nothing: the step answers.
+    None,
+}
+
+/// Prepared reads and writes are described without executing them. This
+/// preserves the fork's avoidance of duplicate SELECT execution and upstream's
+/// guarantee that metadata access cannot perform writes outside a transaction.
+/// An unnamed read can execute for metadata; an unnamed write must wait for step.
+pub(crate) fn metadata_source(is_write: bool, has_stmt_name: bool) -> MetadataSource {
+    if has_stmt_name {
+        MetadataSource::Describe
+    } else if is_write {
+        MetadataSource::None
+    } else {
+        MetadataSource::Execute
+    }
+}
+
+#[cfg(test)]
+mod metadata_source_tests {
+    use super::{metadata_source, MetadataSource};
+
+    #[test]
+    fn writes_never_execute_for_metadata() {
+        assert_eq!(metadata_source(true, true), MetadataSource::Describe);
+        assert_eq!(metadata_source(true, false), MetadataSource::None);
+    }
+
+    #[test]
+    fn prepared_reads_are_described_even_when_bound_or_parameter_free() {
+        assert_eq!(metadata_source(false, true), MetadataSource::Describe);
+        assert_eq!(metadata_source(false, false), MetadataSource::Execute);
     }
 }
