@@ -43,6 +43,7 @@ use crate::ffi_types::{sqlite3, sqlite3_stmt, sqlite3_value, PgConnection, PgStm
 use crate::libpq_helpers::PGresult as PgResultLibpq;
 use badcast::{trace_badcast_log_ctx, trace_badcast_should_log, trace_badcast_should_log_col};
 use binary_accessors::{column_blob_impl, column_bytes_impl};
+pub(crate) use binary_accessors::transformed_text_blob;
 use blob_cache::pg_decode_bytea_cached_impl;
 pub use blob_cache::rust_pg_decode_bytea_cached;
 use decltype_accessor::column_decltype_impl;
@@ -626,6 +627,15 @@ mod tests {
                         let text = rust_my_sqlite3_column_text(shadow, 0);
                         assert_eq!(unsafe { CStr::from_ptr(text.cast()) }.to_str().unwrap(), expected);
                     } else { assert!(unsafe { &*stmt }.owned_column_text.is_empty()); }
+                    if oid != 17 && !cached_path {
+                        let fake = super::rust_my_sqlite3_column_value(shadow, 0);
+                        assert!(!fake.is_null());
+                        assert_eq!(crate::db_interpose_value::rust_my_sqlite3_value_bytes(fake) as usize, expected.len());
+                        let text = crate::db_interpose_value::rust_my_sqlite3_value_text(fake);
+                        assert_eq!(unsafe { CStr::from_ptr(text.cast()) }.to_str().unwrap(), expected);
+                        let blob = crate::db_interpose_value::rust_my_sqlite3_value_blob(fake);
+                        assert_eq!(unsafe { std::slice::from_raw_parts(blob.cast::<u8>(), expected.len()) }, expected.as_bytes());
+                    }
                     rust_stmt_unregister(shadow as usize);
                     unsafe { (&mut *stmt).cached_result = std::ptr::null_mut(); (&mut *stmt).result = std::ptr::null_mut(); if !res.is_null() { PQclear(res); } }
                     rust_stmt_free(stmt);

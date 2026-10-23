@@ -9,7 +9,7 @@ struct LiveBinaryState {
 
 // SQLite exposes a TEXT value consistently through text/blob/bytes accessors.
 // Plex reads imported collection extra_data through its blob holder too.
-unsafe fn transformed_text_blob(
+pub(crate) unsafe fn transformed_text_blob(
     stmt: &mut PgStmt, idx: c_int, oid: c_uint, name: *const c_char,
     source: *const c_char, len: usize,
 ) -> Option<*const c_void> {
