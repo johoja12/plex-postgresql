@@ -7,6 +7,27 @@ struct LiveBinaryState {
     col_name: *const c_char,
 }
 
+// SQLite exposes a TEXT value consistently through text/blob/bytes accessors.
+// Plex reads imported collection extra_data through its blob holder too.
+pub(crate) unsafe fn transformed_text_blob(
+    stmt: &mut PgStmt, idx: c_int, oid: c_uint, name: *const c_char,
+    source: *const c_char, len: usize,
+) -> Option<*const c_void> {
+    if !matches!(oid, 25 | 1042 | 1043 | 114 | 3802) || source.is_null() {
+        return None;
+    }
+    let idx = idx as usize;
+    if let Some(Some(value)) = stmt.owned_column_text.get(idx) {
+        return Some(value.as_ptr().cast());
+    }
+    let value = crate::db_interpose_helpers::column_text_transform_owned(
+        name, oid, stmt.pg_sql, source, std::slice::from_raw_parts(source.cast(), len),
+    )?;
+    stmt.owned_column_text.resize_with(stmt.owned_column_text.len().max(idx + 1), || None);
+    stmt.owned_column_text[idx] = Some(value);
+    Some(stmt.owned_column_text[idx].as_ref().unwrap().as_ptr().cast())
+}
+
 unsafe fn load_cached_blob_ptr(pg_stmt: &mut PgStmt, idx: c_int) -> *const c_void {
     let cached = &*pg_stmt.cached_result;
     let row = pg_stmt.current_row;
@@ -16,6 +37,12 @@ unsafe fn load_cached_blob_ptr(pg_stmt: &mut PgStmt, idx: c_int) -> *const c_voi
         if !is_null {
             let val_ptr = *crow.values.add(idx as usize);
             if !val_ptr.is_null() {
+                let oid = if cached.col_types.is_null() { 0 } else { *cached.col_types.add(idx as usize) };
+                let name = if cached.col_names.is_null() { ptr::null() } else { *cached.col_names.add(idx as usize) };
+                let len = if crow.lengths.is_null() { libc::strlen(val_ptr) } else { (*crow.lengths.add(idx as usize)).max(0) as usize };
+                if let Some(value) = transformed_text_blob(pg_stmt, idx, oid, name, val_ptr, len) {
+                    return value;
+                }
                 return val_ptr as *const c_void;
             }
         }
@@ -170,6 +197,17 @@ pub(super) fn column_blob_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> *const 
             return ptr::null();
         };
 
+        if state.oid_u != 17 {
+            let mut value = ptr::null(); let mut len = 0; let mut is_null = 0;
+            crate::db_interpose_helpers::rust_pg_result_value_ptr_len(
+                helpers_result_ptr(pg_stmt.result), state.row, idx, &mut value, &mut len, &mut is_null,
+            );
+            if is_null == 0 {
+                if let Some(value) = unsafe { transformed_text_blob(pg_stmt, idx, state.oid_u, state.col_name, value, len.max(0) as usize) } {
+                    return value;
+                }
+            }
+        }
         let blob_result = if state.oid_u == 17 {
             let mut blob_len = 0;
             pg_decode_bytea_cached_impl(raw_pg_stmt, state.row, idx, &mut blob_len as *mut c_int)
@@ -207,6 +245,12 @@ pub(super) fn column_bytes_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int 
     let _guard = unsafe { PgStmt::lock_mutex(raw_pg_stmt) };
 
     if !pg_stmt.cached_result.is_null() {
+        // bytes() may be asked before blob()/text(); materialize the same
+        // transformed TEXT value before choosing its length.
+        unsafe { load_cached_blob_ptr(pg_stmt, idx); }
+        if let Some(Some(value)) = pg_stmt.owned_column_text.get(idx as usize) {
+            return value.len().saturating_sub(1) as c_int;
+        }
         return unsafe { load_cached_bytes_len(pg_stmt, idx) };
     }
 
@@ -214,6 +258,15 @@ pub(super) fn column_bytes_impl(p_stmt: *mut sqlite3_stmt, idx: c_int) -> c_int 
         return 0;
     };
 
+    if state.oid_u != 17 {
+        let mut value = ptr::null(); let mut len = 0; let mut is_null = 0;
+        crate::db_interpose_helpers::rust_pg_result_value_ptr_len(
+            helpers_result_ptr(pg_stmt.result), state.row, idx, &mut value, &mut len, &mut is_null,
+        );
+        if is_null == 0 {
+            unsafe { transformed_text_blob(pg_stmt, idx, state.oid_u, state.col_name, value, len.max(0) as usize); }
+        }
+    }
     if let Some(Some(owned)) = pg_stmt.owned_column_text.get(idx as usize) {
         return owned.len().saturating_sub(1) as c_int;
     }

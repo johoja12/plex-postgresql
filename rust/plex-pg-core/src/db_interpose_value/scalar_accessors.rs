@@ -146,6 +146,9 @@ pub(super) fn value_bytes_impl(p_val: *mut sqlite3_value) -> c_int {
         return 0;
     }
 
+    if let Some((_, len)) = unsafe { super::support::transformed_fake_text(&ctx) } {
+        return len as c_int;
+    }
     let len = crate::db_interpose_helpers::rust_pg_result_length(
         helpers_result_ptr(pg_stmt_ref.result),
         ctx.row,
@@ -183,6 +186,9 @@ pub(super) fn value_blob_impl(p_val: *mut sqlite3_value) -> *const c_void {
         return ptr::null();
     }
 
+    if let Some((value, _)) = unsafe { super::support::transformed_fake_text(&ctx) } {
+        return value.cast();
+    }
     let result_ptr = pg_stmt_ref.result;
     // The decoded blob is never longer than libpq's text for it (bytea hex
     // is twice the bytes), so a slot of that size takes it whole; the slot
