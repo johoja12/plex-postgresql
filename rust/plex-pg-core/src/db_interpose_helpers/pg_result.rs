@@ -91,7 +91,7 @@ pub(crate) fn column_text_transform_owned(
     // Most ordinary fields cannot contain a server URI. Avoid the multi-byte
     // substring matcher for values with no colon.
     if !bytes.contains(&b':') { return None; }
-    rewrite_server_library_uri_bytes(bytes, bytes.len().saturating_mul(3).saturating_add(64))
+    rewrite_server_library_uri_bytes(bytes, usize::MAX)
         .map(|mut value| {
             value.push(0);
             value
