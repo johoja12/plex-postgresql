@@ -23,8 +23,8 @@ unsafe fn clear_dynamic_param_values(stmt: &mut PgStmt) {
 }
 
 /// `sqlite3_clear_bindings`: every parameter becomes NULL, an int or a double
-/// in the preallocated buffer as much as a heap value. Reset keeps those
-/// (`clear_dynamic_param_values`); a clear that kept them sent the previous
+/// in the preallocated buffer as much as a heap value. Reset keeps every
+/// binding; a clear that kept them sent the previous
 /// row's integers to a statement whose caller cleared and bound only some.
 unsafe fn clear_all_param_values(stmt: &mut PgStmt) {
     clear_dynamic_param_values(stmt);
@@ -40,7 +40,8 @@ unsafe fn reset_pg_stmt_locked(p_stmt: *mut sqlite3_stmt, stmt: *mut PgStmt) -> 
     let _guard = PgStmt::lock_mutex(stmt);
     stmt_ref.in_step.store(0, Ordering::Relaxed);
 
-    clear_dynamic_param_values(stmt_ref);
+    // sqlite3_reset retains every binding, including heap-backed text/blob
+    // values. Only clear_bindings, rebind or finalize may release them.
     pg_stmt_clear_result(stmt);
 
     // PG-routed non-cached stmts: skip orig_sqlite3_reset entirely.
