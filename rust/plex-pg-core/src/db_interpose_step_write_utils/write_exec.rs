@@ -245,7 +245,15 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
 /// the row: given SQLITE_DONE and no row it threw, rolled the migration
 /// back and the server never set up (2026-10-22).
 pub(crate) fn plex_reads_returning_rows(orig_sql: &[u8], status: c_int, ntuples: c_int) -> bool {
-    status == PGRES_TUPLES_OK && ntuples > 0 && contains_icase_bytes(orig_sql, b"RETURNING")
+    if status != PGRES_TUPLES_OK || ntuples <= 0 {
+        return false;
+    }
+    let Ok(sql) = std::str::from_utf8(orig_sql) else { return false; };
+    let Ok(tokens) = sqlparser::tokenizer::Tokenizer::new(
+        &sqlparser::dialect::SQLiteDialect {}, sql,
+    ).tokenize() else { return false; };
+    tokens.iter().any(|t| matches!(t, sqlparser::tokenizer::Token::Word(w)
+        if w.quote_style.is_none() && w.keyword == sqlparser::keywords::Keyword::RETURNING))
 }
 
 #[cfg(test)]
@@ -272,6 +280,18 @@ mod tests {
             PGRES_TUPLES_OK,
             1
         ));
+    }
+
+    #[test]
+    fn returning_in_values_identifiers_or_comments_is_not_a_clause() {
+        for sql in [
+            b"INSERT INTO preferences(name,value) VALUES('RETURNING','x')".as_slice(),
+            b"INSERT INTO preferences(name,value) VALUES('x','y') /* RETURNING */",
+            b"INSERT INTO preferences(name,value) VALUES('x','y') -- RETURNING id",
+            b"UPDATE metadata_items SET `RETURNING` = 1",
+        ] {
+            assert!(!plex_reads_returning_rows(sql, PGRES_TUPLES_OK, 1));
+        }
     }
 
     #[test]
