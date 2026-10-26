@@ -386,6 +386,60 @@ mod tests {
         }
     }
 
+    /// A read the shim answers from PostgreSQL (`is_pg == 2`) still hands
+    /// Plex a statement SQLite prepared -- its own SQL, or a dummy
+    /// `SELECT 1 WHERE 0` -- and that statement has to be finalized like any
+    /// other. `is_pg == 2` once meant a handle that was no SQLite statement at
+    /// all, and its finalize skipped SQLite's: the statement lived on, and the
+    /// connection it was prepared on could never close. Every Live TV guide
+    /// swap left the old guide's connections open on the replaced file, and
+    /// their shared -wal was replayed into each new guide, corrupting it
+    /// (talos, 2026-10-23 to 10-26: 43 generations, 902 descriptors).
+    #[test]
+    fn a_read_answered_from_postgresql_is_finalized_in_sqlite_too() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            let fakes = FakeSqlite::install();
+            let stmt = 0x2468usize as *mut sqlite3_stmt;
+            let pg = crate::pg_statement::rust_stmt_create(
+                ptr::null_mut(),
+                c"SELECT id FROM metadata_items".as_ptr(),
+                stmt,
+            );
+            (*pg).is_pg = 2;
+            crate::pg_statement::pg_register_stmt(stmt, pg);
+            assert_eq!(rust_my_sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(fakes.finalize_calls(), 1);
+        }
+    }
+
+    /// The cached read steps the statement in SQLite before PostgreSQL
+    /// answers it, so what it wraps is a real, stepped statement.
+    #[test]
+    fn a_cached_read_is_finalized_in_sqlite_too() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            let fakes = FakeSqlite::install();
+            let conn = libc::calloc(1, std::mem::size_of::<crate::ffi_types::PgConnection>())
+                as *mut crate::ffi_types::PgConnection;
+            assert!(!conn.is_null());
+            crate::ffi_types::conn_ref(conn);
+            let stmt = 0x2470usize as *mut sqlite3_stmt;
+            let sql = c"SELECT id FROM metadata_items";
+            let wrapped =
+                crate::db_interpose_step_cached_read_utils::rust_step_cached_read_prepare_stmt(
+                    ptr::null_mut(),
+                    conn,
+                    sql.as_ptr(),
+                    stmt,
+                    sql.as_ptr(),
+                );
+            assert!(!wrapped.is_null());
+            assert_eq!(rust_my_sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(fakes.finalize_calls(), 1);
+        }
+    }
+
     /// An address finalized several times holds several records. A prepare
     /// the shim sees at that address must clear every one: with one left, the
     /// new statement's own finalize was skipped and the statement leaked, so

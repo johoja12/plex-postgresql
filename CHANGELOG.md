@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.41 (unreleased)
+
+- A read answered from PostgreSQL (`is_pg == 2`) is finalized in SQLite as well (`finalize_impl`). That covers both a read routed at prepare and a cached read, which steps the statement in SQLite before PostgreSQL answers.
+  - **The bug:** every such statement is one SQLite prepared, its own SQL or a dummy `SELECT 1 WHERE 0`. Its finalize skipped SQLite's, a rule from when `is_pg == 2` meant a handle that was no SQLite statement at all. The statement lived on, and its connection could never close.
+  - **On talos (2026-10-23 to 10-26):** every Live TV guide swap left the old guide's connections open on the replaced file, 43 generations and 902 descriptors in PMS. Their one shared `-wal` was replayed into each new guide ("recovered 32 frames from WAL", then "database corruption"). cluster-plex could not copy the guide, its schema drained to no airings, and every tune failed with "Unable to find title for item of type 5".
+  - **Since when:** guides have taken these paths since clusterplex.35. The library's connections, which never close, leaked the statements too.
+
 ### v1.3.17-clusterplex.40 (2026-10-22)
 
 - `sqlite3_last_insert_rowid`, `sqlite3_changes`, `sqlite3_errcode` and `sqlite3_errmsg` answer from the connection the handle's last write ran on (`connection_state::write_conn`): inside a transaction that is the connection the BEGIN pinned, where every statement of the handle runs since the transaction work, not the handle's own connection. PMS 1.43.5.11029 registers a metadata agent provider at start as BEGIN, INSERT, last_insert_rowid; the handle's connection had inserted nothing and answered 0, Plex threw `DB::Exception`, rolled back and every start ended "Unable to set up server" (talos, 2026-10-22, after clusterplex.39 had passed the rig and a canary pod, where Plex found every provider and inserted none). Outside a transaction the answer is the handle's connection's, as before.
