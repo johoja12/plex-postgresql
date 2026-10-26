@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### v1.3.17-clusterplex.41 (unreleased)
+### v1.3.17-clusterplex.41 (2026-10-26)
 
 - A read answered from PostgreSQL (`is_pg == 2`) is finalized in SQLite as well (`finalize_impl`). That covers both a read routed at prepare and a cached read, which steps the statement in SQLite before PostgreSQL answers.
   - **The bug:** every such statement is one SQLite prepared, its own SQL or a dummy `SELECT 1 WHERE 0`. Its finalize skipped SQLite's, a rule from when `is_pg == 2` meant a handle that was no SQLite statement at all. The statement lived on, and its connection could never close.
