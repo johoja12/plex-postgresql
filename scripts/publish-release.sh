@@ -1,10 +1,11 @@
 #!/bin/sh
 # Publishes a tag's Linux release assets from this fork.
 #
-# A tag push does not start a workflow on mediactl/plex-postgresql (no push
-# event has ever started one there, 2026-10-27), so the release workflow is
-# dispatched by hand for the tag, which builds both architectures natively
-# and creates the GitHub release with its bundles. Idempotent: a second run
+# A tag push runs the release workflow itself (since the fork's first manual
+# dispatch on 2026-10-27; before it no push had ever started a workflow
+# there). This dispatches the same workflow by hand for a tag whose push ran
+# nothing, or to rebuild a release's assets: both architectures build
+# natively and the GitHub release gets its bundles. Idempotent: a second run
 # replaces the assets.
 #
 #   scripts/publish-release.sh v1.3.17-clusterplex.42
