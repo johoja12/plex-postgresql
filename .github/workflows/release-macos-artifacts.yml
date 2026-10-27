@@ -1,9 +1,8 @@
+# Dispatch only on this fork: nothing of ours runs the shim on macOS, and a
+# tag push publishes the Linux bundle alone (release-linux-artifacts.yml).
 name: Release macOS Artifacts
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:

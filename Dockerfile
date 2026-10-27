@@ -39,13 +39,15 @@ COPY Makefile Makefile
 COPY VERSION VERSION
 COPY scripts/docker-build-shim.sh scripts/docker-build-shim.sh
 
-# Build PostgreSQL/libpq, Rust core, shim, and collect runtime libs in /libs
+# Build PostgreSQL/libpq, Rust core, shim, and collect runtime libs in /libs.
+# --with-noop adds the static no-op binary the release bundle ships for
+# CrashUploader replacement (Dockerfile.standalone and cluster-plex use it).
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     --mount=type=cache,target=/build/.cache,sharing=locked \
     rm -rf /usr/local/cargo/registry/src/index.crates.io-* && \
-    sh scripts/docker-build-shim.sh
+    sh scripts/docker-build-shim.sh --with-noop
 
 # Runtime stage, pinned to the Plex release the shim is verified against
 # (Dockerfile.standalone carries the same version).
