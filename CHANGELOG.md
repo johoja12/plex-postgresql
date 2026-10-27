@@ -8,9 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### v1.3.17-clusterplex.42 (2026-10-27)
+### v1.3.17-clusterplex.43 (2026-10-27)
 
-- A tag now publishes Linux release assets from GitHub Actions (`release-linux-artifacts.yml`): `plex-postgresql-<tag>-linux-x86_64.tar.gz` and `-aarch64.tar.gz`, each everything the Docker builder stage leaves in `/libs` (`db_interpose_pg.so`, `libpq.so.5`, `libgcc_s.so.1`, `subreaper`, `noop`), beside upstream's combined zip and `SHA256SUMS`. The builder stage always builds `noop`. The fork had never run a workflow or published a release, so every consumer built the shim from source; mediactl/clusterplex downloads the bundle instead. The Docker image, wiki and macOS workflows run by dispatch only on this fork.
+- A tag now publishes Linux release assets from GitHub Actions (`release-linux-artifacts.yml`): `plex-postgresql-<tag>-linux-x86_64.tar.gz` and `-aarch64.tar.gz`, each everything the Docker builder stage leaves in `/libs` (`db_interpose_pg.so`, `libpq.so.5`, `libgcc_s.so.1`, `subreaper`, `noop`), beside upstream's combined zip and `SHA256SUMS`. The builder stage always builds `noop`. The fork had never run a workflow or published a release, so every consumer built the shim from source; mediactl/clusterplex downloads the bundle instead. The Docker image, wiki and macOS workflows run by dispatch only on this fork. A `libs` stage (`FROM scratch`, the builder's `/libs`) is what the workflows export: exporting the builder stage streamed its whole root filesystem through the buildx session, and when the session's health check had failed during the five-minute build ("session healthcheck failed fatally: only one connection allowed") the export hung at "copying files" for good -- the first run's aarch64 job sat there for 30 minutes, and a workstation reproduced it. `scripts/publish-release.sh` dispatches the workflow for a pushed tag, since no push has ever started a workflow on this fork.
 
 ### v1.3.17-clusterplex.41 (2026-10-26)
 

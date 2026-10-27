@@ -67,14 +67,16 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build builder rootfs for ${{ matrix.platform }}
+      # --target libs is the builder's /libs alone (a scratch stage): the
+      # export streams ten megabytes, not the builder's whole root filesystem.
+      - name: Build the shim for ${{ matrix.platform }}
         run: |
           set -eux
-          mkdir -p out dist
+          mkdir -p out/libs dist
           docker buildx build \
             --platform "${{ matrix.platform }}" \
-            --target builder \
-            --output "type=local,dest=out" \
+            --target libs \
+            --output "type=local,dest=out/libs" \
             .
           ls -la out/libs
 
