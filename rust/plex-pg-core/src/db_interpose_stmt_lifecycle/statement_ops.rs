@@ -134,7 +134,6 @@ pub(super) fn finalize_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
             log_clear_bindings_anomaly("finalize on unknown stmt", p_stmt);
         }
 
-        let mut is_pg_only = 0;
         let mut is_pg_value = 0;
         let mut final_sql: *const c_char = ptr::null();
 
@@ -142,7 +141,6 @@ pub(super) fn finalize_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
         if !pg_stmt.is_null() {
             let pg_stmt_ref = &*pg_stmt;
             is_pg_value = pg_stmt_ref.is_pg;
-            is_pg_only = if pg_stmt_ref.is_pg == 2 { 1 } else { 0 };
             final_sql = if !pg_stmt_ref.pg_sql.is_null() {
                 pg_stmt_ref.pg_sql
             } else {
@@ -167,7 +165,6 @@ pub(super) fn finalize_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
             if !cached.is_null() {
                 let cached_ref = &*cached;
                 is_pg_value = cached_ref.is_pg;
-                is_pg_only = if cached_ref.is_pg == 2 { 1 } else { 0 };
                 if final_sql.is_null() {
                     final_sql = if !cached_ref.pg_sql.is_null() {
                         cached_ref.pg_sql
@@ -194,12 +191,15 @@ pub(super) fn finalize_impl(p_stmt: *mut sqlite3_stmt) -> c_int {
             }
         }
 
-        let mut rc = SQLITE_OK;
-        if is_pg_only == 0 {
-            rc = orig_sqlite3_finalize
-                .map(|f| f(p_stmt))
-                .unwrap_or(SQLITE_ERROR);
-        }
+        // Every statement the shim registers is one SQLite prepared, a read
+        // answered from PostgreSQL (`is_pg == 2`) included: its own SQL, or a
+        // dummy `SELECT 1 WHERE 0`. Left unfinalized, it kept its connection
+        // from ever closing, and each Live TV guide swap left the old guide's
+        // connections open on the replaced file with their -wal, which the
+        // next guide then replayed as its own (2026-10-26).
+        let rc = orig_sqlite3_finalize
+            .map(|f| f(p_stmt))
+            .unwrap_or(SQLITE_ERROR);
         clear_prepared_stmt(p_stmt);
         rc
     }
