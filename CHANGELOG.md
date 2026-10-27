@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.42 (2026-10-27)
+
+- A tag now publishes Linux release assets from GitHub Actions (`release-linux-artifacts.yml`): `plex-postgresql-<tag>-linux-x86_64.tar.gz` and `-aarch64.tar.gz`, each everything the Docker builder stage leaves in `/libs` (`db_interpose_pg.so`, `libpq.so.5`, `libgcc_s.so.1`, `subreaper`, `noop`), beside upstream's combined zip and `SHA256SUMS`. The builder stage always builds `noop`. The fork had never run a workflow or published a release, so every consumer built the shim from source; mediactl/clusterplex downloads the bundle instead. The Docker image, wiki and macOS workflows run by dispatch only on this fork.
+
 ### v1.3.17-clusterplex.41 (2026-10-26)
 
 - A read answered from PostgreSQL (`is_pg == 2`) is finalized in SQLite as well (`finalize_impl`). That covers both a read routed at prepare and a cached read, which steps the statement in SQLite before PostgreSQL answers.
