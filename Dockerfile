@@ -39,13 +39,26 @@ COPY Makefile Makefile
 COPY VERSION VERSION
 COPY scripts/docker-build-shim.sh scripts/docker-build-shim.sh
 
-# Build PostgreSQL/libpq, Rust core, shim, and collect runtime libs in /libs
+# Build PostgreSQL/libpq, Rust core, shim, and collect runtime libs in /libs.
+# --with-noop adds the static no-op binary the release bundle ships for
+# CrashUploader replacement (Dockerfile.standalone and cluster-plex use it).
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     --mount=type=cache,target=/build/.cache,sharing=locked \
     rm -rf /usr/local/cargo/registry/src/index.crates.io-* && \
-    sh scripts/docker-build-shim.sh
+    sh scripts/docker-build-shim.sh --with-noop
+
+# The builder's payload alone, for `--target libs --output type=local`: what
+# the release workflow attaches to a tag. Exporting the builder stage itself
+# streamed its whole root filesystem (the toolchains and the PostgreSQL
+# source tree, about a gigabyte) through the buildx session for ten
+# megabytes of output, and a session whose health check had failed during
+# the long build hung at "copying files" for good (2026-10-27, on the arm64
+# runner and on a workstation: "session healthcheck failed fatally: only
+# one connection allowed").
+FROM scratch AS libs
+COPY --from=builder /libs/ /
 
 # Runtime stage, pinned to the Plex release the shim is verified against
 # (Dockerfile.standalone carries the same version).

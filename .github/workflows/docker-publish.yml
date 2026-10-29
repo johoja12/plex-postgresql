@@ -1,9 +1,10 @@
+# On this fork the images are built by hand (workflow_dispatch) only: the
+# consumer of the shim is mediactl/clusterplex, which downloads the Linux
+# release bundle instead of a plex-postgresql image. A tag push publishes
+# the release assets (release-linux-artifacts.yml) and nothing else.
 name: Publish Docker Images
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       version:

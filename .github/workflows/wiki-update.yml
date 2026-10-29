@@ -1,9 +1,9 @@
+# Dispatch only on this fork: its wiki is not maintained, and a tag push
+# must not fail on it.
 name: Update Versions on Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write

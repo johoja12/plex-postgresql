@@ -1,3 +1,22 @@
+# Builds the Linux shim for x86_64 and aarch64, each natively on its own
+# runner (never under QEMU: the Rust build takes 25 minutes emulated and 3
+# native), and attaches the results to the GitHub release of the tag.
+#
+# Two kinds of asset:
+#
+#   plex-postgresql-<tag>-linux-<arch>.tar.gz
+#       Everything the Docker builder stage leaves in /libs, per
+#       architecture: db_interpose_pg.so, libpq.so.5 (and its real file),
+#       libgcc_s.so.1, the static subreaper and noop binaries. This is what
+#       an image that does not build the shim itself downloads
+#       (mediactl/clusterplex's Dockerfile).
+#
+#   plex-postgresql-<tag>-linux.zip
+#       Upstream's bundle: both shims, the aarch64 libpq, docs and scripts.
+#
+# plus SHA256SUMS over all of them. A tag push creates the release when
+# none exists; a dispatch re-attaches assets to an existing tag's release,
+# building from that tag's tree.
 name: Release Linux Artifacts
 
 on:
@@ -7,65 +26,81 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag (for example: v0.9.14)"
+        description: "Existing release tag (for example: v1.3.17-clusterplex.42)"
         required: true
         type: string
   workflow_call:
     inputs:
       tag:
-        description: "Existing release tag (for example: v0.9.14)"
+        description: "Existing release tag (for example: v1.3.17-clusterplex.42)"
         required: true
         type: string
 
 permissions:
   contents: write
 
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
 jobs:
   build:
     name: Build ${{ matrix.arch }} artifact
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
             platform: linux/amd64
-            runner: ubuntu-latest
-            out_name: db_interpose_pg-linux-x86_64.so
+            runner: ubuntu-24.04
           - arch: aarch64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
-            out_name: db_interpose_pg-linux-aarch64.so
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ env.TAG }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build builder rootfs for ${{ matrix.platform }}
+      # --target libs is the builder's /libs alone (a scratch stage): the
+      # export streams ten megabytes, not the builder's whole root filesystem.
+      - name: Build the shim for ${{ matrix.platform }}
         run: |
           set -eux
-          mkdir -p out/${{ matrix.arch }} dist
+          mkdir -p out/libs dist
           docker buildx build \
             --platform "${{ matrix.platform }}" \
-            --target builder \
-            --output "type=local,dest=out/${{ matrix.arch }}" \
+            --target libs \
+            --output "type=local,dest=out/libs" \
             .
+          ls -la out/libs
 
-      - name: Collect shim artifact
+      - name: Bundle the ${{ matrix.arch }} payload
         run: |
           set -eux
-          cp "out/${{ matrix.arch }}/libs/db_interpose_pg.so" "dist/${{ matrix.out_name }}"
-
-      - name: Collect libpq (arm64 only)
-        if: matrix.arch == 'aarch64'
-        run: |
-          set -eux
-          cp "out/${{ matrix.arch }}/libs/libpq.so.5" "dist/libpq.so.5"
+          ARCH="${{ matrix.arch }}"
+          STAGE="plex-postgresql-${TAG}-linux-${ARCH}"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          # Every file the builder stage produces for the runtime image.
+          for f in db_interpose_pg.so libpq.so.5 libgcc_s.so.1 subreaper noop; do
+            test -f "out/libs/$f" || { echo "builder produced no $f" >&2; exit 1; }
+          done
+          cp out/libs/db_interpose_pg.so out/libs/libpq.so.5* out/libs/libgcc_s.so.1 \
+             out/libs/subreaper out/libs/noop "$STAGE/"
+          cp LICENSE THIRD_PARTY_LICENSES "$STAGE/"
+          printf '%s\n' "$TAG" > "$STAGE/VERSION"
+          tar -czf "dist/${STAGE}.tar.gz" "$STAGE"
+          # The bare files the combined zip is assembled from.
+          mkdir -p "dist/raw"
+          cp out/libs/db_interpose_pg.so "dist/raw/db_interpose_pg-linux-${ARCH}.so"
+          cp out/libs/libpq.so.5 "dist/raw/libpq.so.5"
+          ls -la dist dist/raw
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -73,24 +108,18 @@ jobs:
           name: linux-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
+          retention-days: 7
 
-  package-linux-zip:
-    name: Package Linux zip bundle
-    runs-on: ubuntu-latest
+  package:
+    name: Package and upload to the release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     needs: build
-    outputs:
-      tag: ${{ steps.tag.outputs.value }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Determine tag
-        id: tag
-        run: |
-          set -eu
-          echo "value=${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+          ref: ${{ env.TAG }}
 
       - name: Download Linux build artifacts
         uses: actions/download-artifact@v4
@@ -100,43 +129,45 @@ jobs:
       - name: Build Linux zip
         run: |
           set -eux
-          TAG="${{ steps.tag.outputs.value }}"
           STAGE="linux-zip"
           OUT="plex-postgresql-${TAG}-linux.zip"
-
           rm -rf "$STAGE"
           mkdir -p "$STAGE/scripts"
-
-          cp release-assets/linux-x86_64/db_interpose_pg-linux-x86_64.so "$STAGE/"
-          cp release-assets/linux-aarch64/db_interpose_pg-linux-aarch64.so "$STAGE/"
-          cp release-assets/linux-aarch64/libpq.so.5 "$STAGE/"
-
+          cp release-assets/linux-x86_64/raw/db_interpose_pg-linux-x86_64.so "$STAGE/"
+          cp release-assets/linux-aarch64/raw/db_interpose_pg-linux-aarch64.so "$STAGE/"
+          cp release-assets/linux-aarch64/raw/libpq.so.5 "$STAGE/"
           cp README.md CHANGELOG.md INSTALL.md LICENSE THIRD_PARTY_LICENSES "$STAGE/"
           cp -R scripts/* "$STAGE/scripts/"
+          rm -rf "$STAGE/scripts/__pycache__"
+          (cd "$STAGE" && zip -qr "../$OUT" .)
 
-          (cd "$STAGE" && zip -r "../$OUT" .)
+      - name: Collect the assets
+        run: |
+          set -eux
+          mkdir -p upload
+          cp release-assets/linux-*/plex-postgresql-*-linux-*.tar.gz upload/
+          cp plex-postgresql-*-linux.zip upload/
+          (cd upload && sha256sum * > SHA256SUMS && cat SHA256SUMS)
 
-      - name: Upload packaged zip artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-release-zip
-          path: plex-postgresql-*-linux.zip
-          if-no-files-found: error
-
-  upload-release:
-    name: Upload artifacts to GitHub Release
-    runs-on: ubuntu-latest
-    needs: package-linux-zip
-    steps:
-      - name: Download zip artifact
-        uses: actions/download-artifact@v4
-        with:
-          path: release-assets
+      - name: Release notes from the changelog
+        id: notes
+        run: |
+          set -eu
+          # The tag's own section of CHANGELOG.md ("### <tag> (date)" up to
+          # the next heading); the release body is empty when there is none.
+          awk -v tag="$TAG" '
+            /^### / { on = index($0, "### " tag " (") == 1; next }
+            /^## /  { on = 0 }
+            on      { print }
+          ' CHANGELOG.md > notes.md
+          echo "lines=$(wc -l < notes.md)" >> "$GITHUB_OUTPUT"
 
       - name: Upload assets to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ needs.package-linux-zip.outputs.tag }}
-          files: |
-            release-assets/linux-release-zip/plex-postgresql-*-linux.zip
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          body_path: notes.md
+          files: upload/*
           overwrite_files: true
+          fail_on_unmatched_files: true
