@@ -28,6 +28,7 @@ pub(super) fn pool_get_connection_inner_excluding(
     db_path: *const c_char,
     exclude_conn: *const c_void,
 ) -> *mut c_void {
+    super::thread_exit::register_owner_exit();
     acquire_on(pool(), db_path, exclude_conn)
 }
 

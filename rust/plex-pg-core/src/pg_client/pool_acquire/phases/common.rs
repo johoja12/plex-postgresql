@@ -6,6 +6,7 @@ use super::super::super::PoolSlot;
 use super::super::shared::{AcquireCtx, AcquireDecision};
 
 pub(super) fn claim_slot_for_thread(ctx: &AcquireCtx<'_>, slot: &PoolSlot) {
+    slot.retired_generation.store(u64::MAX, Ordering::Release);
     slot.owner_thread
         .store(ctx.current_thread, Ordering::Release);
     slot.last_used.store(ctx.now, Ordering::Release);

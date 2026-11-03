@@ -27,6 +27,7 @@ pub(crate) mod registry_api;
 mod session;
 mod support;
 mod threading;
+mod thread_exit;
 mod tls_cache;
 pub(crate) mod txn;
 

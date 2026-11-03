@@ -27,6 +27,8 @@ pub(crate) struct PoolSlot {
     pub conn: AtomicPtr<c_void>,
     /// Thread ID of owner (0 = unowned)
     pub owner_thread: AtomicU64,
+    /// Set only by the owning thread at exit; never probe expired pthread_t values.
+    pub retired_generation: AtomicU64,
     /// Unix timestamp of last use
     pub last_used: AtomicI64,
     /// State machine: SLOT_FREE=0, SLOT_RESERVED=1, SLOT_READY=2, etc.
@@ -40,10 +42,19 @@ impl PoolSlot {
         Self {
             conn: AtomicPtr::new(std::ptr::null_mut()),
             owner_thread: AtomicU64::new(0),
+            retired_generation: AtomicU64::new(u64::MAX),
             last_used: AtomicI64::new(0),
             state: AtomicU8::new(SLOT_FREE),
             generation: AtomicU32::new(0),
         }
+    }
+
+    /// Retirement is tagged to the slot generation. An exit racing a close
+    /// and reuse cannot retire the replacement owner or briefly invalidate a
+    /// connection while another thread still consumes a prepared result.
+    pub fn owner_retired(&self) -> bool {
+        self.retired_generation.load(Ordering::Acquire)
+            == u64::from(self.generation.load(Ordering::Acquire))
     }
 
     /// CAS: FREE → RESERVED. Returns true on success.
@@ -123,6 +134,7 @@ impl PoolSlot {
 
     /// Release slot back to FREE (on close or cleanup).
     pub fn release(&self) {
+        self.retired_generation.store(u64::MAX, Ordering::Release);
         self.owner_thread.store(0, Ordering::Release);
         self.state.store(SLOT_FREE, Ordering::Release);
     }
@@ -363,6 +375,7 @@ impl PoolManager {
         for i in 0..size {
             let slot = &self.slots[i];
             slot.conn.store(std::ptr::null_mut(), Ordering::Release);
+            slot.retired_generation.store(u64::MAX, Ordering::Release);
             slot.owner_thread.store(0, Ordering::Release);
             slot.last_used.store(0, Ordering::Release);
             slot.state.store(SLOT_FREE, Ordering::Release);
@@ -417,6 +430,7 @@ impl PoolManager {
 
             let conn = slot.conn.swap(std::ptr::null_mut(), Ordering::SeqCst);
 
+            slot.retired_generation.store(u64::MAX, Ordering::Release);
             slot.owner_thread.store(0, Ordering::Release);
             slot.state.store(SLOT_FREE, Ordering::Release);
 

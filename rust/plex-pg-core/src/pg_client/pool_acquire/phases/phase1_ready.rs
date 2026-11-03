@@ -17,7 +17,8 @@ pub(crate) fn phase1_existing_ready(ctx: &AcquireCtx<'_>) -> AcquireDecision {
         let idx = idx as usize;
         if idx < ctx.pool_size {
             let slot = &ctx.pm.slots[idx];
-            if slot.state.load(Ordering::Acquire) == SLOT_READY
+            if !slot.owner_retired()
+                && slot.state.load(Ordering::Acquire) == SLOT_READY
                 && slot.generation.load(Ordering::Acquire) == generation
             {
                 let owner = slot.owner_thread.load(Ordering::Acquire);
@@ -47,7 +48,7 @@ pub(crate) fn phase1_existing_ready(ctx: &AcquireCtx<'_>) -> AcquireDecision {
     for i in 0..ctx.pool_size {
         let slot = &ctx.pm.slots[i];
         let state = slot.state.load(Ordering::Acquire);
-        if state != SLOT_READY {
+        if state != SLOT_READY || slot.owner_retired() {
             continue;
         }
         let owner = slot.owner_thread.load(Ordering::Acquire);
