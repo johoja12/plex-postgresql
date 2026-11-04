@@ -32,8 +32,9 @@ use std::time::{Duration, Instant};
 use crate::db_interpose_conn_utils::{log_error, log_info};
 
 /// The environment variable naming the manager's guide socket, set by
-/// cluster-plex on the PMS it starts.
-pub const GUIDE_SOCKET_ENV: &str = "PLEX_PG_GUIDE_SOCKET";
+/// cluster-plex on the PMS it starts (`guide_load`'s, which the open-time
+/// `stage` request shares).
+pub use crate::guide_load::GUIDE_SOCKET_ENV;
 
 /// How long the hook waits for the manager's answer: a little longer than
 /// the manager's own deadline on the request (230 s), so a slow copy ends in
@@ -71,12 +72,32 @@ pub fn guide_swap_paths(old: &str, new: &str) -> bool {
         return false;
     }
     crate::db_interpose_helpers::epg_schema_for_path(new).is_some()
+        && !crate::db_interpose_helpers::is_guide_load_path(new)
 }
 
 /// Asks the manager at `socket` to copy the load `old` into its schema, and
 /// returns its one-line answer (`ok`, `skip <why>` or `fail <why>`), or why
 /// no answer came.
 pub fn swap_request(socket: &str, old: &str, deadline: Duration) -> Result<String, String> {
+    guide_request(socket, "swap", old, deadline)
+}
+
+/// Asks the manager at `socket` to stage the load `load` before PMS opens
+/// it (`guide_load`): its staging schema made and the file PMS wrote
+/// replaced by a shadow. The same answers as `swap_request`.
+pub fn stage_request(socket: &str, load: &str, deadline: Duration) -> Result<String, String> {
+    guide_request(socket, "stage", load, deadline)
+}
+
+/// One request to the manager: `<verb> <path>\n` on the socket, one line
+/// back -- `ok`, `skip <why>` or `fail <why>`, each with or without a note
+/// -- within `deadline`, or why no answer came.
+pub fn guide_request(
+    socket: &str,
+    verb: &str,
+    path: &str,
+    deadline: Duration,
+) -> Result<String, String> {
     let start = Instant::now();
     let mut stream = UnixStream::connect(socket).map_err(|e| format!("connect {socket}: {e}"))?;
     stream
@@ -86,7 +107,7 @@ pub fn swap_request(socket: &str, old: &str, deadline: Duration) -> Result<Strin
         .set_read_timeout(Some(deadline))
         .map_err(|e| format!("read timeout: {e}"))?;
     stream
-        .write_all(format!("swap {old}\n").as_bytes())
+        .write_all(format!("{verb} {path}\n").as_bytes())
         .map_err(|e| format!("send: {e}"))?;
     let mut line = String::new();
     BufReader::new(&stream)
@@ -192,6 +213,11 @@ mod tests {
             &format!("{DIR}/tv.plex.providers.epg.cloud-loading.db"),
             &format!("{DIR}/tv.plex.providers.epg.cloud.db")
         ));
+        // A load renamed to a load is no swap, however it is named.
+        assert!(!guide_swap_paths(
+            &format!("{DIR}/tv.plex.providers.epg.cloud-0ab001b3-182f-4835-897c-43a9ed6797c5-loading-loading.db"),
+            &format!("{DIR}/{LOAD}")
+        ));
         // The library's own files, and a backup.
         assert!(!guide_swap_paths(
             &format!("{DIR}/com.plexapp.plugins.library.db-loading.db"),
@@ -255,6 +281,46 @@ mod tests {
             swap_request(&path, &old, Duration::from_secs(5)).unwrap(),
             "fail not a guide load"
         );
+    }
+
+    #[test]
+    fn a_stage_request_is_framed_like_a_swap() {
+        let load = format!("{DIR}/{LOAD}");
+        let path = socket_path("stage-ok");
+        let rx = manager(&path, "ok\n");
+        assert_eq!(
+            stage_request(&path, &load, Duration::from_secs(5)).unwrap(),
+            "ok"
+        );
+        assert_eq!(rx.recv().unwrap(), format!("stage {load}\n"));
+
+        let path = socket_path("stage-skip");
+        let _rx = manager(&path, "skip a stale schema\n");
+        assert_eq!(
+            stage_request(&path, &load, Duration::from_secs(5)).unwrap(),
+            "skip a stale schema"
+        );
+
+        let path = socket_path("stage-fail");
+        let _rx = manager(&path, "fail not under the Databases directory\n");
+        assert_eq!(
+            stage_request(&path, &load, Duration::from_secs(5)).unwrap(),
+            "fail not under the Databases directory"
+        );
+
+        let path = socket_path("stage-malformed");
+        let _rx = manager(&path, "staged\n");
+        let err = stage_request(&path, &load, Duration::from_secs(5)).unwrap_err();
+        assert!(err.starts_with("malformed answer"), "{err}");
+
+        let path = socket_path("stage-silent");
+        let _rx = manager(&path, "");
+        let err = stage_request(&path, &load, Duration::from_millis(300)).unwrap_err();
+        assert!(err.starts_with("no answer after "), "{err}");
+
+        let err =
+            stage_request("/nonexistent/guide.sock", &load, Duration::from_secs(1)).unwrap_err();
+        assert!(err.starts_with("connect "), "{err}");
     }
 
     #[test]

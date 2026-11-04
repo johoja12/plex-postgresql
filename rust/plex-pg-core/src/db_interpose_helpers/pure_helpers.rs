@@ -164,16 +164,14 @@ pub(super) fn is_library_or_blobs_db_path_impl(path: &str) -> bool {
         || epg_schema_for_path_impl(path).is_some()
 }
 
-/// The PostgreSQL schema a Live TV guide is served from, owner 2026-10-20.
-///
-/// Plex keeps each XMLTV DVR's guide in a database of its own,
-/// `tv.plex.providers.epg.<provider>-<dvr uuid>.db`, with the library's
-/// schema (the same tables, the same migrations), so each guide is a schema
-/// of its own: `epg_` and the uuid without its dashes. The library's tables
-/// could not hold it: the guide numbers its rows from 1 and its statements
-/// assume every row is a guide row. None for any other file, or one whose
-/// uuid is not a uuid.
-pub(super) fn epg_schema_for_path_impl(path: &str) -> Option<String> {
+/// The suffix PMS gives the file it loads a guide into, before `.db`:
+/// `<guide>-loading.db`, renamed onto the guide when the load ends.
+pub(super) const GUIDE_LOAD_SUFFIX: &str = "-loading";
+
+/// The DVR a Live TV guide file belongs to -- its uuid without dashes,
+/// lower-cased -- and whether the file is the guide's load rather than the
+/// guide. None for any other file, or one whose uuid is not a uuid.
+fn guide_dvr_for_path(path: &str) -> Option<(String, bool)> {
     let mut p = path;
     for suffix in ["-wal", "-shm", "-journal"] {
         if let Some(stripped) = p.strip_suffix(suffix) {
@@ -185,6 +183,10 @@ pub(super) fn epg_schema_for_path_impl(path: &str) -> Option<String> {
     let stem = name
         .strip_prefix("tv.plex.providers.epg.")?
         .strip_suffix(".db")?;
+    let (stem, load) = match stem.strip_suffix(GUIDE_LOAD_SUFFIX) {
+        Some(stripped) => (stripped, true),
+        None => (stem, false),
+    };
     if stem.len() < 38 || !stem.is_char_boundary(stem.len() - 36) {
         return None;
     }
@@ -206,10 +208,37 @@ pub(super) fn epg_schema_for_path_impl(path: &str) -> Option<String> {
     {
         return None;
     }
-    Some(format!(
-        "epg_{}",
-        uuid.replace('-', "").to_ascii_lowercase()
-    ))
+    Some((uuid.replace('-', "").to_ascii_lowercase(), load))
+}
+
+/// The PostgreSQL schema a Live TV guide is served from, owner 2026-10-20.
+///
+/// Plex keeps each XMLTV DVR's guide in a database of its own,
+/// `tv.plex.providers.epg.<provider>-<dvr uuid>.db`, with the library's
+/// schema (the same tables, the same migrations), so each guide is a schema
+/// of its own: `epg_` and the uuid without its dashes. The library's tables
+/// could not hold it: the guide numbers its rows from 1 and its statements
+/// assume every row is a guide row. None for any other file, or one whose
+/// uuid is not a uuid.
+///
+/// A guide's load, `<guide>-loading.db`, is the guide's staging schema,
+/// `epg_<uuid>_next` (cluster-plex's `Guide.Staging()`), since 2026-11-04:
+/// PMS loads into it and the manager renames it onto the guide's schema at
+/// PMS's rename of the file. Whether such a load is routed there at all is
+/// decided at the open (`guide_load`); the name alone decides nothing.
+pub(super) fn epg_schema_for_path_impl(path: &str) -> Option<String> {
+    let (dvr, load) = guide_dvr_for_path(path)?;
+    Some(if load {
+        format!("epg_{dvr}_next")
+    } else {
+        format!("epg_{dvr}")
+    })
+}
+
+/// Whether `path` is a Live TV guide's load file, `<guide>-loading.db` (or
+/// its `-wal`, `-shm` or `-journal`), as against the guide itself.
+pub(super) fn is_guide_load_path_impl(path: &str) -> bool {
+    matches!(guide_dvr_for_path(path), Some((_, true)))
 }
 
 pub(super) fn is_blobs_db_path_impl(path: &str) -> bool {

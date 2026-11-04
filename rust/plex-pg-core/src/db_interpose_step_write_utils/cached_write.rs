@@ -120,6 +120,9 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
         }
 
         crate::pg_client::rust_pool_touch_connection(exec_conn as *const c_void);
+        // Decided before the connection's mutex is taken: the transaction
+        // registry has its own lock, never held with a connection's.
+        let wraps = crate::guide_load::savepoint_wraps(exec_conn);
         let ec = &mut *exec_conn;
         let mut conn_guard = PthreadMutexGuard::lock(&mut ec.mutex as *mut _);
 
@@ -144,6 +147,10 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
             stmt_name_buf[i] = bytes[i] as c_char;
         }
         stmt_name_buf[len] = 0;
+
+        // A guide load's write inside PMS's transaction runs in a savepoint
+        // of its own (`guide_load`), as in write_exec.
+        let savepoint = wraps && crate::guide_load::begin_statement_savepoint(ec.conn);
 
         let mut cached_stmt_name: *const c_char = std::ptr::null();
         let res: *mut PGresult = if crate::pg_client::rust_stmt_cache_lookup(
@@ -215,9 +222,15 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
                 crate::libpq_helpers::rust_pq_exec(ec.conn, exec_sql)
             }
         };
+        let status = crate::libpq_helpers::rust_pq_result_status(res);
+        if savepoint {
+            crate::guide_load::end_statement_savepoint(
+                ec.conn,
+                status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK,
+            );
+        }
         conn_guard.unlock();
 
-        let status = crate::libpq_helpers::rust_pq_result_status(res);
         if status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK {
             if !changes_conn.is_null() {
                 let cc = &mut *changes_conn;

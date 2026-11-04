@@ -23,6 +23,9 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
             return STEP_RESULT_ERROR;
         }
         let stmt = &mut *pg_stmt;
+        // Decided before the connection's mutex is taken: the transaction
+        // registry has its own lock, never held with a connection's.
+        let wraps = crate::guide_load::savepoint_wraps(exec_conn);
         let ec = &mut *exec_conn;
         let mut conn_guard = PthreadMutexGuard::lock(&mut ec.mutex as *mut _);
 
@@ -36,6 +39,11 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
             stmt.write_executed = 1;
             return STEP_RESULT_DONE;
         }
+
+        // A guide load's write inside PMS's transaction runs in a savepoint
+        // of its own, so one PostgreSQL refuses leaves the transaction
+        // usable, as SQLite leaves its own (`guide_load`).
+        let savepoint = wraps && crate::guide_load::begin_statement_savepoint(ec.conn);
 
         let res: *mut PGresult = if stmt.use_prepared != 0 && stmt.stmt_name[0] != 0 {
             let mut cached_name: *const c_char = std::ptr::null();
@@ -119,9 +127,15 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
             )
         };
 
+        let status = crate::libpq_helpers::rust_pq_result_status(res);
+        if savepoint {
+            crate::guide_load::end_statement_savepoint(
+                ec.conn,
+                status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK,
+            );
+        }
         conn_guard.unlock();
 
-        let status = crate::libpq_helpers::rust_pq_result_status(res);
         if status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK {
             let cmd_tuples = crate::libpq_helpers::rust_pq_cmd_tuples(res);
             let tuples_ptr = if cmd_tuples.is_null() {

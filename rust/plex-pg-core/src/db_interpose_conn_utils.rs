@@ -352,8 +352,16 @@ mod tests {
             "/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db",
         )
         .unwrap();
+        let load = std::ffi::CString::new(
+            "/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/tv.plex.providers.epg.cloud-0ab001b3-182f-4835-897c-43a9ed6797c5-loading.db",
+        )
+        .unwrap();
         unsafe {
             assert!(is_guide_path(guide.as_ptr()));
+            assert!(
+                is_guide_path(load.as_ptr()),
+                "a load runs with no timeout either"
+            );
             assert!(!is_guide_path(library.as_ptr()));
             assert!(!is_guide_path(std::ptr::null()));
         }

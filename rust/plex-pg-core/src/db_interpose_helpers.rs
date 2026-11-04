@@ -44,9 +44,9 @@ pub use pg_result::{
 use pure_helpers::{
     bytes_to_pg_hex_impl, contains_binary_bytes_impl, epg_schema_for_path_impl,
     find_insert_column_index_impl, format_epoch_to_datetime_utc_impl, is_aggregate_alias,
-    is_blobs_db_path_impl, is_junk_metadata_insert_impl, is_library_db_path_impl,
-    is_library_or_blobs_db_path_impl, is_related_items_query_impl, normalize_sql_literals_impl,
-    pg_sql_has_timestamp_hint, rewrite_server_library_uri_bytes,
+    is_blobs_db_path_impl, is_guide_load_path_impl, is_junk_metadata_insert_impl,
+    is_library_db_path_impl, is_library_or_blobs_db_path_impl, is_related_items_query_impl,
+    normalize_sql_literals_impl, pg_sql_has_timestamp_hint, rewrite_server_library_uri_bytes,
     should_mask_collection_metadata_type_impl,
 };
 pub(crate) use string_utils::cstr_to_str_or_empty;
@@ -218,6 +218,12 @@ pub fn rust_is_library_db_path(path: *const c_char) -> c_int {
 /// for every other file (`epg_schema_for_path_impl`).
 pub(crate) fn epg_schema_for_path(path: &str) -> Option<String> {
     epg_schema_for_path_impl(path)
+}
+
+/// Whether `path` is a Live TV guide's load file, `<guide>-loading.db`
+/// (`is_guide_load_path_impl`): PMS's staging file, not the guide.
+pub(crate) fn is_guide_load_path(path: &str) -> bool {
+    is_guide_load_path_impl(path)
 }
 
 pub fn rust_is_library_or_blobs_db_path(path: *const c_char) -> c_int {

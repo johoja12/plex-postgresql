@@ -331,6 +331,8 @@ Use this command to migrate an existing Plex library to PostgreSQL:
 | `PLEX_PG_LOG_LEVEL` | 1 | 0=ERROR, 1=INFO, 2=DEBUG |
 | `PLEX_PG_RETRY_DELAYS` | 500,1000,2000,3000,4000 | PG reconnect backoff in ms (comma-separated, max 10 values) |
 | `PLEX_PG_SKIP_CLEAR_BINDINGS_FINALIZED` | 1 | Skip `sqlite3_clear_bindings` for recently finalized statements to avoid UAF crashes (set 0 to disable) |
+| `PLEX_PG_GUIDE_LOADS` | 0 | `1` loads a Live TV guide into PostgreSQL as PMS builds it: the open of `<guide>-loading.db` asks the manager on `PLEX_PG_GUIDE_SOCKET` to stage it (the `epg_<uuid>_next` schema, a shadow over PMS's template copy); a load the manager does not stage stays SQLite and is copied at the rename, as with `0` |
+| `PLEX_PG_GUIDE_LOAD_SAVEPOINTS` | 1 | Each write of a guide load inside PMS's transaction runs in its own `SAVEPOINT plex_pg_stmt`, so a refused statement leaves the transaction usable as SQLite does; `0` runs the writes bare |
 
 ### Unix Socket vs TCP
 
