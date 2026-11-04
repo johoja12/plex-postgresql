@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.47 (2026-11-04)
+
+- `x IN (...) COLLATE icu_root` parses: `rewrite_sqlite_collations` drops an ICU collation that follows an IN list (`closes_in_list`), since sqlparser reads the list as a finished expression and refused the COLLATE after it, and `plex.icu_root` is deterministic, so the IN's equality is unchanged. PMS's incremental guide refresh sends that shape as its bulk title lookup of a chunk; with the statement never prepared, PMS's first bind failed as SQLITE_RANGE ("Error 25 when binding to pos 1 on bulk operations") and the refresh ended "Failed to load EPG" (talos, 2026-11-04 16:50Z; the 16:12Z refresh, which never issued it, had completed).
+- A refused statement is logged whole (up to 64 KiB) instead of its first 200 characters, which said nothing of the COLLATE 9 KiB in.
+
 ### v1.3.17-clusterplex.46 (2026-11-04)
 
 - A Live TV guide's connection runs with no statement timeout (`GUIDE_STATEMENT_TIMEOUT_SQL`, `statement_timeout_sql`, `is_guide_path`; the library keeps its five minutes, at the session and before each read as before). PMS's guide refresh -- the nightly `RefreshEpgGuides` butler task, and the load it starts at boot when the guide's chunk state is stale -- begins by streaming the whole guide it already holds through one SELECT (every item with its airings, parts, settings, parent and grandparent; 98,180 rows for 248 channels, 657 ms on the server) and does its per-row work as the rows arrive, for longer than five minutes. PostgreSQL cancelled that statement ("canceling statement due to statement timeout"), PMS's loader task died with an uncaught exception, its "Refreshing guide data" activity sat at 0% until the next restart, and it retried the same read every five minutes; no incremental refresh ever completed on talos (found 2026-11-04 15:02Z). A load PMS runs from scratch (a channel-map save, `reloadGuide`) was never affected: it reads nothing back.

@@ -2707,6 +2707,52 @@ fn rewrite_indexed_by(sql: &str) -> String {
     result
 }
 
+/// Whether `sql_so_far` ends with the closing parenthesis of an `IN (...)`
+/// or `NOT IN (...)` list (a string literal inside the list is skipped).
+fn closes_in_list(sql_so_far: &str) -> bool {
+    let bytes = sql_so_far.trim_end().as_bytes();
+    if bytes.last() != Some(&b')') {
+        return false;
+    }
+    // Back to the matching '(' , counting depth outside single-quoted strings.
+    let mut depth = 0i32;
+    let mut i = bytes.len();
+    let mut open = None;
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b'\'' => {
+                // Skip the literal backwards to its opening quote ('' escapes
+                // read as two quotes, which closes and reopens: harmless).
+                while i > 0 {
+                    i -= 1;
+                    if bytes[i] == b'\'' {
+                        break;
+                    }
+                }
+            }
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    open = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(open) = open else {
+        return false;
+    };
+    let before = sql_so_far[..open].trim_end();
+    let before_upper = before.to_ascii_uppercase();
+    before_upper.ends_with(" IN")
+        || before_upper == "IN"
+        || before_upper.ends_with("\tIN")
+        || before_upper.ends_with("\nIN")
+}
+
 /// Remove `COLLATE <name>` clauses for SQLite-specific collations that either
 /// sqlparser (SQLiteDialect) cannot parse, or that have no PostgreSQL equivalent.
 ///
@@ -2826,6 +2872,19 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
                     || collation_name == "UNICODE"
                     || collation_name == "UNICODE_CI";
                 if is_icu {
+                    // `x IN (...) COLLATE icu_root`, PMS's bulk lookup of a
+                    // guide chunk's titles (2026-11-04): sqlparser reads the
+                    // IN list as a finished expression and refuses the
+                    // COLLATE after it, so the statement was never prepared
+                    // and PMS's first bind failed as SQLITE_RANGE ("Error 25
+                    // when binding to pos 1 on bulk operations"), which
+                    // failed every incremental guide refresh. plex.icu_root
+                    // is deterministic, so the IN's equality is the same
+                    // without it: the clause is dropped.
+                    if closes_in_list(&result) {
+                        i = j;
+                        continue;
+                    }
                     parenthesize_trailing_qualified_identifier(&mut result);
                     result.push_str("COLLATE plex.icu_root");
                     i = j;
@@ -2991,4 +3050,39 @@ fn rewrite_is_operator(sql: &str) -> String {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod in_list_collation_tests {
+    use super::*;
+
+    #[test]
+    fn an_in_lists_icu_collation_is_dropped_so_the_statement_parses() {
+        let sql = "select metadata_items.id from metadata_items where metadata_items.title in (?, ?, ?) collate icu_root and metadata_items.metadata_type = ?";
+        let out = rewrite_sqlite_collations(sql);
+        assert_eq!(
+            out,
+            "select metadata_items.id from metadata_items where metadata_items.title in (?, ?, ?)  and metadata_items.metadata_type = ?"
+        );
+        assert!(
+            crate::translate(sql).is_ok(),
+            "{:?}",
+            crate::translate(sql).err()
+        );
+        let not_in =
+            "select id from metadata_items where title not in (?, 'a)b', ?) collate icu_und";
+        assert!(crate::translate(not_in).is_ok());
+        let sub = "select id from metadata_items where guid in (select guid from metadata_items where title = ?) collate icu_root";
+        assert!(crate::translate(sub).is_ok());
+    }
+
+    #[test]
+    fn a_collation_elsewhere_still_becomes_the_schemas() {
+        let out = rewrite_sqlite_collations("select id from metadata_items where lower(title) = ? collate icu_root order by title_sort collate icu_root");
+        assert!(out.contains("= ? COLLATE plex.icu_root"), "{out}");
+        assert!(out.contains("COLLATE plex.icu_root"), "{out}");
+        assert!(!closes_in_list("select count(*) from x where f(a, b)"));
+        assert!(closes_in_list("select 1 from x where a in (?, ?) "));
+        assert!(closes_in_list("select 1 from x where a NOT IN (?)"));
+    }
 }
