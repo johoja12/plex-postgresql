@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.50 (2026-11-04)
+
+- A guide load's statement that assigns an id itself has the table's id sequence raised after it (`guide_load::id_assignment`, `resync_sequence`, in both write paths): an UPDATE whose SET list names `id`, or an INSERT or REPLACE whose column list does, is followed by one `setval` to the greater of `max(id)` and the sequence's own last value (never lowered past another session's take), so the next INSERT takes max(id)+1 as SQLite's next rowid would. PMS's loader makes each EPG section with an INSERT (id 1 from the sequence) and then renumbers it, `update library_sections set id=2 where id=1`; on the first staged load on the kind rig (2026-11-04 19:45Z) the next section's INSERT took 2 from the sequence again, PostgreSQL refused it (`duplicate key value violates unique constraint "library_sections_pkey"`), and PMS ended the load at once -- `Exception inside transaction (inside=1)`, `Failed to load EPG` -- which also answers the design's open question: the loader never continues past a refused statement, whatever a savepoint leaves usable. Only a load handle is affected; the library's writes are untouched.
+
 ### v1.3.17-clusterplex.49 (2026-11-04)
 
 - The quotes pass reaches an identifier under a collation (and in a tuple, and either side of IS DISTINCT FROM): `order by parents.`title_sort` collate icu_root` reached PostgreSQL as `(parents.`title_sort`) COLLATE plex.icu_root`, a syntax error at the backtick, which killed the last statement of PMS's incremental guide refresh (its show-level episode lookup) after every chunk had loaded, left its activity at 100% as a ghost and the provider row unwritten (talos, 2026-11-04 18:26Z; the third and, by the refresh's own order, last statement of the loader the translator refused).
