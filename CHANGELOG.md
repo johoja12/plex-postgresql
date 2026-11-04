@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.49 (2026-11-04)
+
+- The quotes pass reaches an identifier under a collation (and in a tuple, and either side of IS DISTINCT FROM): `order by parents.`title_sort` collate icu_root` reached PostgreSQL as `(parents.`title_sort`) COLLATE plex.icu_root`, a syntax error at the backtick, which killed the last statement of PMS's incremental guide refresh (its show-level episode lookup) after every chunk had loaded, left its activity at 100% as a ghost and the provider row unwritten (talos, 2026-11-04 18:26Z; the third and, by the refresh's own order, last statement of the loader the translator refused).
+
 ### v1.3.17-clusterplex.48 (2026-11-04)
 
 - `rewrite_sqlite_collations` stays inside a single-quoted literal at a doubled quote (`''`) and inside a double-quoted identifier at `""`, where it ended them: after `title='America''s Funniest Home Videos'` the rest of PMS's show lookup was copied as if quoted, its ORDER BY's `collate icu_root` reached sqlparser unrewritten ("Expected: end of statement, found: collate"), the statement was never prepared and PMS's first bind failed as SQLITE_RANGE, failing the incremental guide refresh on any title with an apostrophe (talos, 2026-11-04 17:28Z; found through .47's whole-statement log).
