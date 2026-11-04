@@ -91,16 +91,19 @@ pub(super) unsafe fn send_query_for_read(
     let scope = CString::new("STEP READ").unwrap();
     crate::db_interpose_conn_utils::rust_step_conn_cancel_and_drain(exec_conn, scope.as_ptr());
 
-    // The library's five-minute timeout, or none for a guide: PMS's guide
-    // refresh streams the whole guide through one statement (conn_utils).
+    // The library's five-minute timeout before each read, since a pooled
+    // connection serves many handles. A guide's or a load's own connection
+    // was set to no timeout at its connect (conn_utils) and serves nothing
+    // else, so its reads keep the round trip: a guide load is some 40,000
+    // reads, each of which paid it (the rig, 2026-11-04).
     let ec_ref = &*exec_conn;
-    let timeout = CString::new(crate::db_interpose_conn_utils::statement_timeout_sql(
-        crate::db_interpose_conn_utils::is_guide_path(ec_ref.db_path.as_ptr()),
-    ))
-    .unwrap();
-    let to_res = crate::libpq_helpers::rust_pq_exec(ec_ref.conn, timeout.as_ptr());
-    if !to_res.is_null() {
-        crate::libpq_helpers::rust_pq_clear(to_res);
+    if crate::db_interpose_conn_utils::read_resets_timeout(ec_ref.db_path.as_ptr()) {
+        let timeout =
+            CString::new(crate::db_interpose_conn_utils::statement_timeout_sql(false)).unwrap();
+        let to_res = crate::libpq_helpers::rust_pq_exec(ec_ref.conn, timeout.as_ptr());
+        if !to_res.is_null() {
+            crate::libpq_helpers::rust_pq_clear(to_res);
+        }
     }
 
     if !s.pg_sql.is_null() {

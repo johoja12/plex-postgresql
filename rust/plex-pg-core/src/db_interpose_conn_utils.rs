@@ -65,6 +65,17 @@ pub(crate) unsafe fn is_guide_path(db_path: *const c_char) -> bool {
         .is_some()
 }
 
+/// Whether a read on the connection whose database is `db_path` first
+/// resets the session's statement timeout: a library connection (pooled,
+/// shared by handles) does, a guide's or a load's own connection does not --
+/// it was set to no timeout at its connect and serves nothing else.
+///
+/// # Safety
+/// `db_path` is NUL-terminated or null, as a [`PgConnection`]'s `db_path` is.
+pub(crate) unsafe fn read_resets_timeout(db_path: *const c_char) -> bool {
+    !is_guide_path(db_path)
+}
+
 #[repr(C)]
 pub struct PgConnConfig {
     pub host: [c_char; 256],
@@ -336,6 +347,19 @@ mod tests {
     #[test]
     fn a_guide_runs_with_no_statement_timeout_and_the_library_with_five_minutes() {
         assert_eq!(statement_timeout_sql(true), "SET statement_timeout = 0");
+        let lib = CString::new("/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db").unwrap();
+        let guide = CString::new("/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/tv.plex.providers.epg.cloud-0ab001b3-182f-4835-897c-43a9ed6797c5.db").unwrap();
+        unsafe {
+            assert!(
+                read_resets_timeout(lib.as_ptr()),
+                "a pooled library connection"
+            );
+            assert!(
+                !read_resets_timeout(guide.as_ptr()),
+                "a guide's own connection"
+            );
+            assert!(read_resets_timeout(std::ptr::null()));
+        }
         assert_eq!(
             statement_timeout_sql(false),
             "SET statement_timeout = '5min'"
