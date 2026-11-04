@@ -91,8 +91,13 @@ pub(super) unsafe fn send_query_for_read(
     let scope = CString::new("STEP READ").unwrap();
     crate::db_interpose_conn_utils::rust_step_conn_cancel_and_drain(exec_conn, scope.as_ptr());
 
-    let timeout = CString::new(STATEMENT_TIMEOUT_SQL).unwrap();
+    // The library's five-minute timeout, or none for a guide: PMS's guide
+    // refresh streams the whole guide through one statement (conn_utils).
     let ec_ref = &*exec_conn;
+    let timeout = CString::new(crate::db_interpose_conn_utils::statement_timeout_sql(
+        crate::db_interpose_conn_utils::is_guide_path(ec_ref.db_path.as_ptr()),
+    ))
+    .unwrap();
     let to_res = crate::libpq_helpers::rust_pq_exec(ec_ref.conn, timeout.as_ptr());
     if !to_res.is_null() {
         crate::libpq_helpers::rust_pq_clear(to_res);
