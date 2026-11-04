@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.51 (2026-11-04)
+
+- A guide's or a load's own connection skips the `SET statement_timeout` before each read (`read_resets_timeout`, `prepared_send.rs`): it was set to no timeout at its connect (`.46`) and serves nothing else, where a pooled library connection serves many handles and keeps the reset. On the rig's 100-channel, 1,400-airing staged load that `SET` was 91,229 of the loader connection's 267,006 statements; PostgreSQL's own time for the load was 25 s of 97, the rest round trips at about 0.16 ms each, and the volume is PMS's: the loader rewrites a show's taggings on every airing of the show (73,612 tagging inserts and 2,212 deletes for 2,212 final rows). The library's reads are unchanged.
+- `PLEX_PG_GUIDE_LOAD_SAVEPOINTS` is off by default (`1` turns it on). The rig showed PMS's loader never continues past a refused statement -- `Exception inside transaction (inside=1)`, `Failed to load EPG` -- so the savepoint keeps nothing usable, and its two statements per write were 168,000 more of that load's.
+
 ### v1.3.17-clusterplex.50 (2026-11-04)
 
 - A guide load's statement that assigns an id itself has the table's id sequence raised after it (`guide_load::id_assignment`, `resync_sequence`, in both write paths): an UPDATE whose SET list names `id`, or an INSERT or REPLACE whose column list does, is followed by one `setval` to the greater of `max(id)` and the sequence's own last value (never lowered past another session's take), so the next INSERT takes max(id)+1 as SQLite's next rowid would. PMS's loader makes each EPG section with an INSERT (id 1 from the sequence) and then renumbers it, `update library_sections set id=2 where id=1`; on the first staged load on the kind rig (2026-11-04 19:45Z) the next section's INSERT took 2 from the sequence again, PostgreSQL refused it (`duplicate key value violates unique constraint "library_sections_pkey"`), and PMS ended the load at once -- `Exception inside transaction (inside=1)`, `Failed to load EPG` -- which also answers the design's open question: the loader never continues past a refused statement, whatever a savepoint leaves usable. Only a load handle is affected; the library's writes are untouched.
