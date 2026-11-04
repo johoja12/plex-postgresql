@@ -123,6 +123,13 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
         // Decided before the connection's mutex is taken: the transaction
         // registry has its own lock, never held with a connection's.
         let wraps = crate::guide_load::savepoint_wraps(exec_conn);
+        // A load's statement that assigns an id itself has the table's
+        // sequence raised after it (`guide_load::id_assignment`).
+        let resync = if crate::guide_load::is_load_handle(exec_conn) {
+            crate::guide_load::id_assignment(&cstr_to_string_or(orig_sql, ""))
+        } else {
+            None
+        };
         let ec = &mut *exec_conn;
         let mut conn_guard = PthreadMutexGuard::lock(&mut ec.mutex as *mut _);
 
@@ -228,6 +235,11 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
                 ec.conn,
                 status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK,
             );
+        }
+        if let Some(table) = resync.as_deref() {
+            if status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK {
+                crate::guide_load::resync_sequence(ec.conn, table);
+            }
         }
         conn_guard.unlock();
 

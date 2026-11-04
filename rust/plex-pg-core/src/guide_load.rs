@@ -39,6 +39,7 @@ use crate::env_utils;
 use crate::ffi_types::PgConnection;
 use crate::libpq_helpers::{
     rust_pq_clear, rust_pq_exec, rust_pq_result_error_message, rust_pq_result_status, PGconn,
+    PGRES_TUPLES_OK,
 };
 
 /// Routes a guide load into PostgreSQL when set to anything but `0`.
@@ -266,6 +267,176 @@ pub(crate) fn end_statement_savepoint(pg: *mut PGconn, succeeded: bool) {
         exec_ok(pg, ROLLBACK_TO_SQL);
     }
     exec_ok(pg, RELEASE_SQL);
+}
+
+/// Whether `conn` is a guide load's handle (its path is `<guide>-loading.db`).
+///
+/// # Safety
+/// `conn` is null or a live `PgConnection` the caller holds.
+pub(crate) unsafe fn is_load_handle(conn: *mut PgConnection) -> bool {
+    if conn.is_null() {
+        return false;
+    }
+    is_guide_load_path(cstr_to_str_or_empty((*conn).db_path.as_ptr()))
+}
+
+/// The table whose `id` the statement assigns itself -- an UPDATE whose SET
+/// list names `id`, an INSERT or REPLACE whose column list names it -- or
+/// None. SQLite gives the next INSERT max(rowid)+1 whatever a row's id was
+/// set to; a PostgreSQL sequence knows nothing of it, so the shim raises the
+/// table's sequence after such a statement on a load (`resync_sequence`).
+/// PMS's loader renumbers each EPG section it makes -- `update
+/// library_sections set id=2 where id=1` -- and the next section's insert
+/// took 2 from the sequence again (the rig, 2026-11-04).
+pub(crate) fn id_assignment(sql: &str) -> Option<String> {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    let first = lower.split_whitespace().next()?;
+    match first {
+        "update" => {
+            let rest = lower["update".len()..].trim_start();
+            let (table, after) = identifier(rest)?;
+            let after = after.trim_start().strip_prefix("set")?;
+            if !after.starts_with(char::is_whitespace) {
+                return None;
+            }
+            let set_list = match after.find(" where ") {
+                Some(i) => &after[..i],
+                None => after,
+            };
+            split_top_level(set_list)
+                .iter()
+                .any(|a| unquote(a.split('=').next().unwrap_or("").trim()) == "id")
+                .then_some(table)
+        }
+        "insert" | "replace" => {
+            let mut rest = lower[first.len()..].trim_start();
+            if let Some(r) = rest.strip_prefix("or ") {
+                // insert or replace|ignore|abort|fail|rollback into
+                rest = r.trim_start();
+                rest = rest[rest.find(char::is_whitespace)?..].trim_start();
+            }
+            if let Some(r) = rest.strip_prefix("into ") {
+                rest = r.trim_start();
+            }
+            let (table, after) = identifier(rest)?;
+            let cols = after.trim_start().strip_prefix('(')?;
+            let end = cols.find(')')?;
+            cols[..end]
+                .split(',')
+                .any(|c| unquote(c.trim()) == "id")
+                .then_some(table)
+        }
+        _ => None,
+    }
+}
+
+/// Reads one table identifier (bare, backtick- or double-quoted) off the
+/// start of `s`: its name, lowercased and unquoted, and what follows. A name
+/// that would not make a safe identifier is None.
+fn identifier(s: &str) -> Option<(String, &str)> {
+    let s = s.trim_start();
+    let (raw, rest) = match s.chars().next()? {
+        q @ ('`' | '"') => {
+            let inner = &s[1..];
+            let end = inner.find(q)?;
+            (&inner[..end], &inner[end + 1..])
+        }
+        _ => {
+            let end = s
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .unwrap_or(s.len());
+            (&s[..end], &s[end..])
+        }
+    };
+    let name = raw.rsplit('.').next()?;
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((name.to_string(), rest))
+}
+
+fn unquote(s: &str) -> &str {
+    s.trim_matches(|c| c == '`' || c == '"' || c == '[' || c == ']')
+}
+
+/// Splits on the commas outside quotes and parentheses.
+fn split_top_level(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut quote, mut start) = (0usize, None::<char>, 0usize);
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"' | '`') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => depth = depth.saturating_sub(1),
+            (None, ',') if depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// The statement that raises `table`'s id sequence to its ids: setval to
+/// the greater of max(id) and the sequence's own last value (never lowered
+/// past another session's take), is_called unless both are nothing, so the
+/// next nextval is max(id)+1 as SQLite's next rowid would be. The sequence
+/// is the one the column's default names, which the manager's clone makes
+/// without OWNED BY. `table` is a safe identifier (`identifier`).
+pub(crate) fn resync_sequence_sql(table: &str) -> String {
+    format!(
+        concat!(
+            "SELECT setval(s.seq, GREATEST(m.mx, COALESCE(pg_sequence_last_value(s.seq), 0), 1), ",
+            "m.mx > 0 OR pg_sequence_last_value(s.seq) IS NOT NULL) ",
+            "FROM (SELECT (regexp_match(pg_get_expr(d.adbin, d.adrelid), ",
+            "'^nextval\\(''(.*)''::regclass\\)$'))[1]::regclass AS seq ",
+            "FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum ",
+            "WHERE d.adrelid = '\"{t}\"'::regclass AND a.attname = 'id') s, ",
+            "LATERAL (SELECT COALESCE(max(id), 0) AS mx FROM \"{t}\") m"
+        ),
+        t = table
+    )
+}
+
+/// Raises `table`'s id sequence on `pg` after a load's statement assigned
+/// an id itself (`id_assignment`), under the connection's mutex. A refusal
+/// is logged and the load goes on: the next insert then takes what the
+/// sequence has, as before.
+pub(crate) fn resync_sequence(pg: *mut PGconn, table: &str) {
+    let sql = resync_sequence_sql(table);
+    let Ok(cs) = CString::new(sql.as_str()) else {
+        return;
+    };
+    let res = rust_pq_exec(pg, cs.as_ptr());
+    if !res.is_null() && rust_pq_result_status(res) == PGRES_TUPLES_OK {
+        log_info(&format!(
+            "GUIDE_LOAD: {table}'s id sequence raised to its ids after an explicit id"
+        ));
+    } else {
+        let msg = if res.is_null() {
+            "PostgreSQL connection lost".to_string()
+        } else {
+            let p = rust_pq_result_error_message(res);
+            if p.is_null() {
+                "PostgreSQL error".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(p) }
+                    .to_string_lossy()
+                    .trim_end()
+                    .to_string()
+            }
+        };
+        log_error(&format!(
+            "GUIDE_LOAD: raising {table}'s id sequence failed: {msg}"
+        ));
+    }
+    if !res.is_null() {
+        rust_pq_clear(res);
+    }
 }
 
 #[cfg(test)]
@@ -500,5 +671,93 @@ mod tests {
         // A refused connection is a refused savepoint, never a crash.
         assert!(!begin_statement_savepoint(std::ptr::null_mut()));
         end_statement_savepoint(std::ptr::null_mut(), false);
+    }
+
+    #[test]
+    fn a_statement_that_assigns_an_id_names_its_table() {
+        assert_eq!(
+            id_assignment("update library_sections set id=? where id=?").as_deref(),
+            Some("library_sections")
+        );
+        assert_eq!(
+            id_assignment(
+                "UPDATE `library_sections` SET content_changed_at=?, `id` = ? WHERE id=?"
+            )
+            .as_deref(),
+            Some("library_sections")
+        );
+        assert_eq!(
+            id_assignment("update library_sections set content_changed_at=? where id=?"),
+            None,
+            "the WHERE's id is no assignment"
+        );
+        assert_eq!(
+            id_assignment("update t set id_x=?, title='a,id=' where id=?"),
+            None
+        );
+        assert_eq!(
+            id_assignment("INSERT INTO metadata_items (`id`,`title`) VALUES (?,?)").as_deref(),
+            Some("metadata_items")
+        );
+        assert_eq!(
+            id_assignment("insert or replace into tags (tag_type, id, tag) values (?,?,?)")
+                .as_deref(),
+            Some("tags")
+        );
+        assert_eq!(
+            id_assignment("REPLACE INTO \"media_items\" (id) VALUES (?)").as_deref(),
+            Some("media_items")
+        );
+        assert_eq!(
+            id_assignment("INSERT INTO library_sections (`library_id`,`name`) VALUES (?,?)"),
+            None
+        );
+        assert_eq!(
+            id_assignment("INSERT INTO t VALUES (?, ?)"),
+            None,
+            "no column list"
+        );
+        assert_eq!(id_assignment("select id from t"), None);
+        assert_eq!(
+            id_assignment("update \"bad name\" set id=?"),
+            None,
+            "no safe identifier"
+        );
+        assert_eq!(id_assignment(""), None);
+    }
+
+    #[test]
+    fn the_resync_statement_raises_the_tables_own_sequence() {
+        let sql = resync_sequence_sql("library_sections");
+        assert!(sql.starts_with("SELECT setval(s.seq, GREATEST(m.mx, "));
+        assert!(sql.contains("d.adrelid = '\"library_sections\"'::regclass"));
+        assert!(sql.contains("FROM \"library_sections\") m"));
+        assert!(sql.contains("'^nextval\\(''(.*)''::regclass\\)$'"));
+        assert!(sql.contains("m.mx > 0 OR pg_sequence_last_value(s.seq) IS NOT NULL"));
+        // A refused connection is logged, never a crash.
+        resync_sequence(std::ptr::null_mut(), "library_sections");
+    }
+
+    #[test]
+    fn a_load_handle_is_told_by_its_path() {
+        let conn =
+            unsafe { libc::calloc(1, std::mem::size_of::<PgConnection>()) as *mut PgConnection };
+        for (path, want) in [
+            (format!("{DIR}/{LOAD}"), true),
+            (format!("{DIR}/{GUIDE}"), false),
+            (format!("{DIR}/com.plexapp.plugins.library.db"), false),
+        ] {
+            unsafe {
+                for b in (*conn).db_path.iter_mut() {
+                    *b = 0;
+                }
+                for (i, b) in path.as_bytes().iter().enumerate() {
+                    (*conn).db_path[i] = *b as c_char;
+                }
+                assert_eq!(is_load_handle(conn), want, "{path}");
+            }
+        }
+        assert!(!unsafe { is_load_handle(std::ptr::null_mut()) });
+        unsafe { libc::free(conn as *mut libc::c_void) };
     }
 }
