@@ -2777,7 +2777,13 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
     let mut i = 0;
 
     while i < bytes.len() {
-        // Skip single-quoted string literals verbatim
+        // Skip single-quoted string literals verbatim. A doubled quote
+        // ('') is an escaped quote inside the literal, not its end: until
+        // 2026-11-04 the scan ended the literal there, so everything after
+        // "'America''s Funniest Home Videos'" was copied as if quoted, the
+        // ORDER BY's "collate icu_root" reached sqlparser unrewritten, and
+        // PMS's guide refresh failed on that show (SQLITE_RANGE at its first
+        // bind of a statement never prepared).
         if bytes[i] == b'\'' {
             result.push('\'');
             i += 1;
@@ -2785,10 +2791,11 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
                 if bytes[i] == b'\'' {
                     result.push('\'');
                     i += 1;
-                    // Escaped quote: ''
                     if i < bytes.len() && bytes[i] == b'\'' {
+                        // Escaped quote: stay inside the literal.
                         result.push('\'');
                         i += 1;
+                        continue;
                     }
                     break;
                 }
@@ -2798,7 +2805,7 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
             continue;
         }
 
-        // Skip double-quoted identifiers verbatim
+        // Skip double-quoted identifiers verbatim; "" is an escaped quote.
         if bytes[i] == b'"' {
             result.push('"');
             i += 1;
@@ -2806,10 +2813,10 @@ fn rewrite_sqlite_collations(sql: &str) -> String {
                 if bytes[i] == b'"' {
                     result.push('"');
                     i += 1;
-                    // Escaped double-quote: ""
                     if i < bytes.len() && bytes[i] == b'"' {
                         result.push('"');
                         i += 1;
+                        continue;
                     }
                     break;
                 }
@@ -3074,6 +3081,27 @@ mod in_list_collation_tests {
         assert!(crate::translate(not_in).is_ok());
         let sub = "select id from metadata_items where guid in (select guid from metadata_items where title = ?) collate icu_root";
         assert!(crate::translate(sub).is_ok());
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_end_the_literal_before_the_collation() {
+        // PMS's lookup of a show by title, with an ORDER BY collated after it
+        // (the 17:28Z refresh of 2026-11-04 failed on "America's Funniest
+        // Home Videos").
+        let sql = "select id from metadata_items where metadata_items.title='America''s Funniest Home Videos' and x = 'a''b''c' order by metadata_items.title_sort collate icu_root ,metadata_items.id";
+        let out = rewrite_sqlite_collations(sql);
+        assert!(out.contains("'America''s Funniest Home Videos'"), "{out}");
+        assert!(
+            out.contains("(metadata_items.title_sort) COLLATE plex.icu_root ,metadata_items.id"),
+            "{out}"
+        );
+        assert!(
+            crate::translate(sql).is_ok(),
+            "{:?}",
+            crate::translate(sql).err()
+        );
+        let quoted = r#"select "a""b" from metadata_items order by "a""b" collate icu_root"#;
+        assert!(rewrite_sqlite_collations(quoted).contains("COLLATE plex.icu_root"));
     }
 
     #[test]
