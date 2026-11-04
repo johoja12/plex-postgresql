@@ -50,8 +50,12 @@ pub const GUIDE_LOADS_ENV: &str = "PLEX_PG_GUIDE_LOADS";
 /// there.
 pub const GUIDE_SOCKET_ENV: &str = "PLEX_PG_GUIDE_SOCKET";
 
-/// Wraps each write of a load handle's transaction in a savepoint unless
-/// set to `0`.
+/// Wraps each write of a load handle's transaction in a savepoint when set
+/// to anything but `0`. Off by default since `.51`: PMS's loader never
+/// continues past a refused statement (it ends the load with "Exception
+/// inside transaction"), so the savepoint keeps nothing usable, and its
+/// two statements per write were 168,000 of a 100-channel load's (the rig,
+/// 2026-11-04).
 pub const SAVEPOINTS_ENV: &str = "PLEX_PG_GUIDE_LOAD_SAVEPOINTS";
 
 /// How long the open waits for the manager to stage a load: longer than the
@@ -97,7 +101,7 @@ pub(crate) fn enabled() -> bool {
 /// Whether a load handle's writes run in savepoints
 /// (`PLEX_PG_GUIDE_LOAD_SAVEPOINTS`, on unless `0`).
 pub(crate) fn savepoints_enabled() -> bool {
-    flag(&SAVEPOINTS, SAVEPOINTS_ENV, true)
+    flag(&SAVEPOINTS, SAVEPOINTS_ENV, false)
 }
 
 #[cfg(test)]
@@ -483,8 +487,8 @@ mod tests {
     }
 
     #[test]
-    fn savepoints_are_on_unless_the_flag_turns_them_off() {
-        with_env(&[(SAVEPOINTS_ENV, None)], || assert!(savepoints_enabled()));
+    fn savepoints_are_off_unless_the_flag_turns_them_on() {
+        with_env(&[(SAVEPOINTS_ENV, None)], || assert!(!savepoints_enabled()));
         with_env(&[(SAVEPOINTS_ENV, Some("0"))], || {
             assert!(!savepoints_enabled())
         });
