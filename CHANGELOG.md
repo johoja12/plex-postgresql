@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.53 (2026-11-05)
+
+- A guide load's sequence resync (`.50`) runs in a savepoint of its own (`plex_pg_resync`) when PMS's transaction is open, so a refused resync -- a table with no `id` column, a table the clone lacks -- is rolled back to the savepoint and logged, and the load goes on; until now a refusal would have aborted PMS's transaction, which the statement savepoints no longer prevent since `.51` turned them off, and PMS would have failed the load. The sequence lookup uses `to_regclass`, so only the `max(id)` read can refuse. Proven on the rig's PostgreSQL. `.52` is reserved for a peer session.
+
 ### v1.3.17-clusterplex.51 (2026-11-04)
 
 - A guide's or a load's own connection skips the `SET statement_timeout` before each read (`read_resets_timeout`, `prepared_send.rs`): it was set to no timeout at its connect (`.46`) and serves nothing else, where a pooled library connection serves many handles and keeps the reset. On the rig's 100-channel, 1,400-airing staged load that `SET` was 91,229 of the loader connection's 267,006 statements; PostgreSQL's own time for the load was 25 s of 97, the rest round trips at about 0.16 ms each, and the volume is PMS's: the loader rewrites a show's taggings on every airing of the show (73,612 tagging inserts and 2,212 deletes for 2,212 final rows). The library's reads are unchanged.
