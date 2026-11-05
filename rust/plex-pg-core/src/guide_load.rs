@@ -399,24 +399,52 @@ pub(crate) fn resync_sequence_sql(table: &str) -> String {
             "FROM (SELECT (regexp_match(pg_get_expr(d.adbin, d.adrelid), ",
             "'^nextval\\(''(.*)''::regclass\\)$'))[1]::regclass AS seq ",
             "FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum ",
-            "WHERE d.adrelid = '\"{t}\"'::regclass AND a.attname = 'id') s, ",
+            "WHERE d.adrelid = to_regclass('\"{t}\"') AND a.attname = 'id') s, ",
             "LATERAL (SELECT COALESCE(max(id), 0) AS mx FROM \"{t}\") m"
         ),
         t = table
     )
 }
 
+/// The resync's own savepoint: inside PMS's transaction a refused resync
+/// would otherwise abort the transaction (and PMS the load), which the
+/// statement savepoints (off by default since `.51`) no longer prevent.
+const RESYNC_SAVEPOINT: &str = "plex_pg_resync";
+const RESYNC_SAVEPOINT_SQL: &str = "SAVEPOINT plex_pg_resync";
+const RESYNC_RELEASE_SQL: &str = "RELEASE SAVEPOINT plex_pg_resync";
+const RESYNC_ROLLBACK_SQL: &str = "ROLLBACK TO SAVEPOINT plex_pg_resync";
+
 /// Raises `table`'s id sequence on `pg` after a load's statement assigned
-/// an id itself (`id_assignment`), under the connection's mutex. A refusal
-/// is logged and the load goes on: the next insert then takes what the
-/// sequence has, as before.
-pub(crate) fn resync_sequence(pg: *mut PGconn, table: &str) {
+/// an id itself (`id_assignment`), under the connection's mutex. Inside a
+/// transaction it runs in a savepoint of its own, so a refusal (a table
+/// without an `id` column, say) leaves PMS's transaction usable; the
+/// refusal is logged and the load goes on, the next insert taking what the
+/// sequence has, as before. A missing table is refused by the `max(id)`
+/// read and absorbed the same way (`to_regclass` only keeps the sequence
+/// lookup from refusing first); outside a transaction a refused statement
+/// is its own, and aborts nothing. Proven on the rig's PostgreSQL,
+/// 2026-11-05: schema_migrations and a missing table, each refused inside
+/// the savepoint, left the transaction usable.
+pub(crate) fn resync_sequence(pg: *mut PGconn, table: &str, in_transaction: bool) {
+    let guarded = in_transaction && exec_ok(pg, RESYNC_SAVEPOINT_SQL);
+    let ok = resync_sequence_once(pg, table);
+    if guarded {
+        if !ok {
+            exec_ok(pg, RESYNC_ROLLBACK_SQL);
+        }
+        exec_ok(pg, RESYNC_RELEASE_SQL);
+    }
+}
+
+/// One attempt at the resync statement; true when PostgreSQL answered it.
+fn resync_sequence_once(pg: *mut PGconn, table: &str) -> bool {
     let sql = resync_sequence_sql(table);
     let Ok(cs) = CString::new(sql.as_str()) else {
-        return;
+        return false;
     };
     let res = rust_pq_exec(pg, cs.as_ptr());
-    if !res.is_null() && rust_pq_result_status(res) == PGRES_TUPLES_OK {
+    let ok = !res.is_null() && rust_pq_result_status(res) == PGRES_TUPLES_OK;
+    if ok {
         log_info(&format!(
             "GUIDE_LOAD: {table}'s id sequence raised to its ids after an explicit id"
         ));
@@ -441,6 +469,7 @@ pub(crate) fn resync_sequence(pg: *mut PGconn, table: &str) {
     if !res.is_null() {
         rust_pq_clear(res);
     }
+    ok
 }
 
 #[cfg(test)]
@@ -734,12 +763,41 @@ mod tests {
     fn the_resync_statement_raises_the_tables_own_sequence() {
         let sql = resync_sequence_sql("library_sections");
         assert!(sql.starts_with("SELECT setval(s.seq, GREATEST(m.mx, "));
-        assert!(sql.contains("d.adrelid = '\"library_sections\"'::regclass"));
+        assert!(
+            sql.contains("d.adrelid = to_regclass('\"library_sections\"')"),
+            "a missing table is an empty answer, never an error"
+        );
         assert!(sql.contains("FROM \"library_sections\") m"));
         assert!(sql.contains("'^nextval\\(''(.*)''::regclass\\)$'"));
         assert!(sql.contains("m.mx > 0 OR pg_sequence_last_value(s.seq) IS NOT NULL"));
-        // A refused connection is logged, never a crash.
-        resync_sequence(std::ptr::null_mut(), "library_sections");
+        // A refused connection is logged, never a crash, in and out of a
+        // transaction.
+        resync_sequence(std::ptr::null_mut(), "library_sections", false);
+        resync_sequence(std::ptr::null_mut(), "library_sections", true);
+        assert!(!resync_sequence_once(
+            std::ptr::null_mut(),
+            "library_sections"
+        ));
+    }
+
+    #[test]
+    fn the_resync_runs_in_a_savepoint_of_its_own() {
+        assert_eq!(
+            RESYNC_SAVEPOINT_SQL,
+            format!("SAVEPOINT {RESYNC_SAVEPOINT}")
+        );
+        assert_eq!(
+            RESYNC_RELEASE_SQL,
+            format!("RELEASE SAVEPOINT {RESYNC_SAVEPOINT}")
+        );
+        assert_eq!(
+            RESYNC_ROLLBACK_SQL,
+            format!("ROLLBACK TO SAVEPOINT {RESYNC_SAVEPOINT}")
+        );
+        assert_ne!(
+            RESYNC_SAVEPOINT, STATEMENT_SAVEPOINT,
+            "never the statement savepoint's name"
+        );
     }
 
     #[test]

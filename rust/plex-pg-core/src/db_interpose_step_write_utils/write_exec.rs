@@ -28,6 +28,7 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
         let wraps = crate::guide_load::savepoint_wraps(exec_conn);
         // A load's statement that assigns an id itself has the table's
         // sequence raised after it (`guide_load::id_assignment`).
+        let in_txn = crate::pg_client::txn::in_transaction(exec_conn);
         let resync = if crate::guide_load::is_load_handle(exec_conn) {
             crate::guide_load::id_assignment(&cstr_to_string_or(stmt.sql, ""))
         } else {
@@ -143,7 +144,7 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
         }
         if let Some(table) = resync.as_deref() {
             if status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK {
-                crate::guide_load::resync_sequence(ec.conn, table);
+                crate::guide_load::resync_sequence(ec.conn, table, in_txn);
             }
         }
         conn_guard.unlock();
