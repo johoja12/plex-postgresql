@@ -125,6 +125,30 @@ pub(crate) fn handle_is_pg_library(db_handle: *const sqlite3) -> bool {
         && !env_nonzero("PLEX_PG_FORCE_SQLITE_LIBRARY")
 }
 
+/// Whether `db_handle` is a database the shim serves from PostgreSQL: the
+/// library (unless `PLEX_PG_FORCE_SQLITE_LIBRARY` keeps it in SQLite), the
+/// blobs database, or a Live TV guide with a schema of its own. Its SQLite
+/// file is the shadow, empty and without PMS's tokenizer, so a statement
+/// that reaches it is answered as the shadow answers. A handle no connection
+/// is registered for -- a guide load's `-loading.db`, a plugin's own
+/// database -- is genuine SQLite, holding its own data and whatever PMS
+/// registered on it, and the shim must leave its statements alone.
+pub(crate) fn handle_is_pg_backed(db_handle: *const sqlite3) -> bool {
+    if db_handle.is_null() {
+        return false;
+    }
+    let handle_conn =
+        rust_find_registered_connection(db_handle as *const c_void) as *mut PgConnection;
+    if handle_conn.is_null() {
+        return false;
+    }
+    let handle_ref = unsafe { &*handle_conn };
+    if !conn_is_pg_active(handle_ref) {
+        return false;
+    }
+    !(is_library_db(&conn_db_path(handle_ref)) && env_nonzero("PLEX_PG_FORCE_SQLITE_LIBRARY"))
+}
+
 // Metadata belongs to sqlite3*, not to a pooled libpq session. Store a
 // snapshot on the registered handle so another handle reusing that session
 // cannot change last_insert_rowid()/changes()/errmsg() after a transaction.

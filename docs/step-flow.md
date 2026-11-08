@@ -38,6 +38,9 @@ Connection-level failures are reported as `SQLITE_ERROR` with `step_pg_conn_erro
   - `connection.rs` — write connection prepare/recovery
   - `write_exec.rs` — regular write execute/finalize
   - `cached_write.rs` — cached write execute/finalize
+  - both wrap a write on a Live TV guide load's handle, inside PMS's
+    transaction, in a `SAVEPOINT plex_pg_stmt` of its own (`guide_load.rs`:
+    decided before the connection's mutex is taken, begun and ended under it)
   - `special_insert.rs` — metadata_items RETURNING id handling
   - `logging.rs` — write policy guards + debug hooks
   - `support.rs` — shared helpers
@@ -47,6 +50,12 @@ Connection-level failures are reported as `SQLITE_ERROR` with `step_pg_conn_erro
 
 - `rust/plex-pg-core/src/db_interpose_conn_utils.rs`
   - shared connection cancel+drain utility (fast path: skips PQcancel when idle)
+
+- `rust/plex-pg-core/src/guide_load.rs`
+  - a Live TV guide load in PostgreSQL: the open-time `stage` request to the
+    manager (`db_interpose_open.rs` asks before the real open), the result
+    cache's key for a load (none), the per-statement savepoint decision and
+    statements, the `PLEX_PG_GUIDE_LOADS` / `PLEX_PG_GUIDE_LOAD_SAVEPOINTS` flags
 
 - `rust/plex-pg-core/src/db_interpose_stmt_lifecycle/`
   - `statement_ops.rs` — reset/finalize/clear_bindings interception

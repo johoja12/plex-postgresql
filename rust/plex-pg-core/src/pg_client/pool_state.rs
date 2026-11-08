@@ -115,13 +115,6 @@ impl PoolSlot {
             .is_ok()
     }
 
-    /// CAS: READY → FREE (zombie reclaim for dead threads).
-    pub fn try_reclaim_zombie(&self) -> bool {
-        self.state
-            .compare_exchange(SLOT_READY, SLOT_FREE, Ordering::SeqCst, Ordering::Relaxed)
-            .is_ok()
-    }
-
     /// Set slot to READY (after successful connection creation).
     pub fn mark_ready(&self) {
         self.state.store(SLOT_READY, Ordering::Release);

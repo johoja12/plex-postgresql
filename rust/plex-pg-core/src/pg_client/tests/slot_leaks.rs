@@ -205,3 +205,43 @@ fn a_redirected_handle_without_a_peekable_connection_reports_no_error() {
     crate::pg_client::rust_pg_unregister_connection(handle);
     assert!(crate::ffi_types::conn_unref(handle));
 }
+
+// Merging the upstream FTS routing predicate must not restore its pooled
+// metadata lookup: routing follows registration, metadata follows the handle.
+#[test]
+fn pg_backed_routing_preserves_handle_metadata_without_pool_acquisition() {
+    assert!(!crate::pg_client::registry_api::handle_is_pg_backed(std::ptr::null()));
+    for path in [
+        "/x/com.plexapp.plugins.library.db",
+        "/x/com.plexapp.plugins.library.blobs.db",
+        "/x/tv.plex.providers.epg.cloud-0ab001b3-182f-4835-897c-43a9ed6797c5.db",
+        "/x/tv.plex.providers.epg.cloud-0ab001b3-182f-4835-897c-43a9ed6797c5-loading.db",
+    ] {
+        let handle = fake_conn(path);
+        let worker = fake_conn(path);
+        let storage = Box::new(0_u8);
+        let db = (&*storage as *const u8).cast::<sqlite3>();
+        unsafe { (*handle).shadow_db = db.cast_mut() };
+        crate::pg_client::rust_pg_register_connection(handle);
+        assert!(crate::pg_client::registry_api::handle_is_pg_backed(db));
+        unsafe {
+            (*worker).last_changes = 17;
+            (*worker).last_insert_rowid = 123;
+            crate::pg_client::registry_api::save_metadata(db, worker);
+            (*worker).last_changes = 99;
+            (*worker).last_insert_rowid = 999;
+            let peeked = crate::pg_client::peek_connection(db);
+            assert_eq!(peeked, handle);
+            assert_eq!((*peeked).last_changes, 17);
+            assert_eq!((*peeked).last_insert_rowid, 123);
+            (*handle).is_pg_active = 0;
+        }
+        assert!(!crate::pg_client::registry_api::handle_is_pg_backed(db));
+        assert!(crate::pg_client::peek_connection(db).is_null());
+        assert!(pool().db_to_pool.find(db as usize).is_none());
+        crate::pg_client::rust_pg_unregister_connection(handle);
+        assert!(!crate::pg_client::registry_api::handle_is_pg_backed(db));
+        assert!(crate::ffi_types::conn_unref(worker));
+        assert!(crate::ffi_types::conn_unref(handle));
+    }
+}

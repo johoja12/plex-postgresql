@@ -457,6 +457,15 @@ fn fix_expr(expr: &mut Expr) {
         | Expr::IsFalse(inner)
         | Expr::IsNotTrue(inner)
         | Expr::IsNotFalse(inner) => fix_expr(inner),
+        Expr::Tuple(items) => {
+            for e in items {
+                fix_expr(e);
+            }
+        }
+        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
+            fix_expr(a);
+            fix_expr(b);
+        }
         _ => {}
     }
 }
@@ -473,6 +482,33 @@ mod tests {
         let r = translate("SELECT `id`, `title` FROM `metadata_items`").unwrap();
         assert!(!r.sql.contains('`'));
         assert!(r.sql.contains('"'));
+    }
+
+    #[test]
+    fn compat_backticks__quotes_under_a_collation_are_converted() {
+        // PMS's show-level episode lookup orders by a backtick-quoted
+        // column under an ICU collation.
+        let out = crate::translate(
+            "select metadata_items.id from metadata_items left join metadata_items as parents on parents.id = metadata_items.parent_id where parents.id = ? order by parents.`index`, parents.`title_sort` collate icu_root, metadata_items.`index`",
+        )
+        .unwrap()
+        .sql;
+        assert!(!out.contains('`'), "{out}");
+        assert!(
+            out.contains(r#"(parents."title_sort") COLLATE plex.icu_root"#),
+            "{out}"
+        );
+        let bare = crate::translate(
+            "select id from metadata_items order by `title_sort` collate icu_root",
+        )
+        .unwrap()
+        .sql;
+        assert!(!bare.contains('`'), "{bare}");
+        let tuple =
+            crate::translate("select id from metadata_items where (`a`, `b`) in (select 1, 2)")
+                .unwrap()
+                .sql;
+        assert!(!tuple.contains('`'), "{tuple}");
     }
 
     #[test]

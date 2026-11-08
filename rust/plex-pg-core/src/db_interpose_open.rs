@@ -82,6 +82,45 @@ fn should_redirect(filename: *const c_char) -> bool {
     crate::pg_config::pg_config_should_redirect(filename, passthrough) != 0
 }
 
+/// Whether the file PMS opens is served from PostgreSQL. A Live TV guide's
+/// load file (`<guide>-loading.db`, under `PLEX_PG_GUIDE_LOADS`) is, only
+/// once the manager has staged it -- its staging schema made and PMS's
+/// template copy replaced by a shadow -- which is asked for here, before
+/// the real open, since the open must see the shadow. A load the manager
+/// did not stage opens as genuine SQLite, as before (`guide_load`).
+///
+/// # Safety
+/// `filename` is NUL-terminated or null, as `sqlite3_open_v2` takes it.
+unsafe fn redirect_after_staging(filename: *const c_char) -> bool {
+    if !should_redirect(filename) {
+        return false;
+    }
+    match crate::guide_load::load_file_path(filename) {
+        Some(load) => crate::guide_load::stage_before_open(&load),
+        None => true,
+    }
+}
+
+/// Logs how a redirected open came out for a guide load: connected to its
+/// staging schema, or -- the manager's `ok` notwithstanding -- not, which
+/// leaves the load on its shadow as SQLite.
+unsafe fn log_guide_load_open(filename: *const c_char, pg_conn: *const PgConnection) {
+    let Some(load) = crate::guide_load::load_file_path(filename) else {
+        return;
+    };
+    if pg_conn.is_null() {
+        crate::db_interpose_conn_utils::log_error(&format!(
+            "GUIDE_LOAD: {load} was staged but got no PostgreSQL connection: the load runs on its shadow as SQLite"
+        ));
+        return;
+    }
+    log_info_lazy!(
+        "GUIDE_LOAD: staged {} into {}",
+        load,
+        crate::db_interpose_helpers::epg_schema_for_path(&load).unwrap_or_default()
+    );
+}
+
 unsafe fn handle_conn_path_contains(conn: *mut PgConnection, needle: &[u8]) -> bool {
     if conn.is_null() {
         return false;
@@ -126,7 +165,7 @@ unsafe fn trace_open_event(
 
 #[no_mangle]
 pub extern "C" fn rust_my_sqlite3_open(filename: *const c_char, pp_db: *mut *mut sqlite3) -> c_int {
-    let redirect = should_redirect(filename);
+    let redirect = unsafe { redirect_after_staging(filename) };
     log_info_lazy!(
         "OPEN: {} (redirect={})",
         cstr_to_string_or(filename, "(null)"),
@@ -162,6 +201,7 @@ pub extern "C" fn rust_my_sqlite3_open(filename: *const c_char, pp_db: *mut *mut
                     cstr_to_string_or(filename, "(null)")
                 );
             }
+            unsafe { log_guide_load_open(filename, pg_conn) };
         }
     }
 
@@ -175,7 +215,7 @@ pub extern "C" fn rust_my_sqlite3_open_v2(
     flags: c_int,
     z_vfs: *const c_char,
 ) -> c_int {
-    let redirect = should_redirect(filename);
+    let redirect = unsafe { redirect_after_staging(filename) };
     log_info_lazy!(
         "OPEN_V2: {} flags=0x{:x} (redirect={})",
         cstr_to_string_or(filename, "(null)"),
@@ -212,6 +252,7 @@ pub extern "C" fn rust_my_sqlite3_open_v2(
                     cstr_to_string_or(filename, "(null)")
                 );
             }
+            unsafe { log_guide_load_open(filename, pg_conn) };
         }
     }
 

@@ -81,17 +81,20 @@ fn pool_slot_reclaim_error_fails_from_ready() {
 }
 
 #[test]
-fn pool_slot_reclaim_zombie_from_ready() {
+fn pool_slot_reclaim_requires_exclusive_transition_before_release() {
     let slot = PoolSlot::new();
     slot.state.store(SLOT_READY, Ordering::Relaxed);
-    assert!(slot.try_reclaim_zombie());
+    assert!(slot.try_begin_reconnect());
+    assert_eq!(slot.state.load(Ordering::Relaxed), SLOT_RECONNECTING);
+    assert!(!slot.try_claim_free());
+    slot.release();
     assert_eq!(slot.state.load(Ordering::Relaxed), SLOT_FREE);
 }
 
 #[test]
-fn pool_slot_reclaim_zombie_fails_from_free() {
+fn pool_slot_reclaim_cannot_take_a_free_slot() {
     let slot = PoolSlot::new();
-    assert!(!slot.try_reclaim_zombie());
+    assert!(!slot.try_begin_reconnect());
 }
 
 #[test]

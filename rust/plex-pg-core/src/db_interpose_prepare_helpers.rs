@@ -200,6 +200,101 @@ pub(crate) fn simplify_fts_for_sqlite(sql: &str) -> Option<String> {
     Some(result)
 }
 
+/// What the real-SQLite prepare does with a statement that names an FTS
+/// table or a `MATCH`, decided by `fts_for_sqlite`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SqliteFts {
+    /// The statement reaches SQLite as PMS wrote it.
+    AsIs,
+    /// The statement reaches SQLite with its FTS joins and `MATCH` clauses
+    /// taken out (`simplify_fts_for_sqlite`).
+    Simplified(String),
+    /// The statement is replaced by `SELECT 1 WHERE 0`.
+    Blocked,
+}
+
+/// How a statement that reaches the real SQLite prepare treats FTS, by
+/// whether the handle is one the shim serves from PostgreSQL.
+///
+/// On a PG-backed handle the SQLite file is the shadow: no rows, and no
+/// `collating` tokenizer, since PMS registers it only on the connections it
+/// uses as SQLite. An FTS statement there is first simplified, then, if it
+/// still names an FTS table or a `MATCH`, blocked, as it has been since
+/// upstream `ff63333` (2026-01-09), when the library was the only database
+/// the shim served and every SQLite file it saw was a shadow.
+///
+/// On a genuine SQLite handle neither applies. PMS registers its tokenizer
+/// on the connection (`fts3_tokenizer` is passed through), the FTS tables
+/// hold real rows, and its statements bind by position: a Live TV cloud
+/// guide load (PMS 1.43.4, 2026-11-04) prepares `select ... join
+/// fts4_metadata_titles_icu on metadata_items.id = fts4_metadata_titles_icu
+/// .rowid ...` on its `-loading.db` and binds position 1, which the
+/// stand-in refused with SQLITE_RANGE ("Error 25 when binding to pos 1 on
+/// bulk operations"), so every cloud load failed.
+///
+/// `skip_complex` is the low-stack mode, in which nothing is rewritten.
+pub(crate) fn fts_for_sqlite(sql: &str, pg_backed: bool, skip_complex: bool) -> SqliteFts {
+    if !pg_backed {
+        return SqliteFts::AsIs;
+    }
+    let simplified = if skip_complex {
+        None
+    } else {
+        simplify_fts_for_sqlite(sql)
+    };
+    let effective = simplified.as_deref().unwrap_or(sql);
+    let bytes = effective.as_bytes();
+    if contains_ascii_icase(bytes, b"fts4_") || contains_ascii_icase(bytes, b" match ") {
+        return SqliteFts::Blocked;
+    }
+    match simplified {
+        Some(out) => SqliteFts::Simplified(out),
+        None => SqliteFts::AsIs,
+    }
+}
+
+/// The SQL of a PG-routed statement's shadow: one placeholder per parameter
+/// of the translation, named as the translation names it, so a bind PMS
+/// makes on the SQLite statement lands at the index it names. No parameter
+/// gives `SELECT 1 WHERE 0`. The list is as long as the statement needs:
+/// the C shim built it in a 4 KiB buffer and stopped at about 225
+/// placeholders, so a wider statement's later binds answered SQLITE_RANGE.
+pub(crate) fn dummy_shadow_sql(param_names: &[Option<&str>]) -> String {
+    if param_names.is_empty() {
+        return "SELECT 1 WHERE 0".to_string();
+    }
+    let mut out = String::with_capacity(16 + param_names.len() * 20);
+    out.push_str("SELECT 1 WHERE ");
+    // Keep the expression tree shallow: SQLite refuses a flat chain of
+    // 1,000 AND terms even though every parameter fits in the SQL buffer.
+    fn append_terms(out: &mut String, names: &[Option<&str>]) {
+        if names.len() > 64 {
+            let mid = names.len() / 2;
+            out.push('(');
+            append_terms(out, &names[..mid]);
+            out.push_str(") AND (");
+            append_terms(out, &names[mid..]);
+            out.push(')');
+            return;
+        }
+        for (i, name) in names.iter().enumerate() {
+            if i > 0 {
+                out.push_str(" AND ");
+            }
+            match name {
+                Some(name) => {
+                    out.push(':');
+                    out.push_str(name);
+                    out.push_str(" IS NOT NULL");
+                }
+                None => out.push_str("? IS NOT NULL"),
+            }
+        }
+    }
+    append_terms(&mut out, param_names);
+    out
+}
+
 #[derive(Clone, Copy, Default)]
 struct QueryLoopEntry {
     hash: u32,
@@ -278,6 +373,79 @@ mod tests {
         PREPARE_LOOP_DETECT.with(|state| {
             *state.borrow_mut() = [QueryLoopEntry::default(); LOOP_DETECT_SLOTS];
         });
+    }
+
+    /// PMS's loader query on a cloud guide's `-loading.db` (2026-11-04),
+    /// which binds position 1.
+    const CLOUD_LOADER_SQL: &str = "select metadata_items.id, media_items.id from media_items \
+        join metadata_items on media_items.metadata_item_id = metadata_items.id \
+        join fts4_metadata_titles_icu on metadata_items.id = fts4_metadata_titles_icu.rowid \
+        where fts4_metadata_titles_icu.title match ? and metadata_items.metadata_type = 4";
+
+    #[test]
+    fn fts_reaches_a_genuine_sqlite_handle_as_written() {
+        assert_eq!(
+            fts_for_sqlite(CLOUD_LOADER_SQL, false, false),
+            SqliteFts::AsIs
+        );
+        assert_eq!(
+            fts_for_sqlite(
+                "SELECT rowid FROM fts4_metadata_titles WHERE title MATCH 'War*'",
+                false,
+                true
+            ),
+            SqliteFts::AsIs
+        );
+    }
+
+    #[test]
+    fn fts_on_a_pg_backed_handle_is_simplified_then_blocked_as_before() {
+        // A join and a MATCH the simplifier knows come out rewritten.
+        let sql = "SELECT * FROM metadata_items \
+                   JOIN fts4_metadata_titles ON metadata_items.id = fts4_metadata_titles.rowid \
+                   WHERE fts4_metadata_titles.title match 'test'";
+        match fts_for_sqlite(sql, true, false) {
+            SqliteFts::Simplified(out) => {
+                assert!(!out.to_ascii_lowercase().contains("fts4_"));
+                assert!(out.contains("1=0"));
+            }
+            other => panic!("expected Simplified, got {:?}", other),
+        }
+        // A bound MATCH term is one the simplifier does not rewrite, so the
+        // statement still names the table and is blocked.
+        assert_eq!(
+            fts_for_sqlite(CLOUD_LOADER_SQL, true, false),
+            SqliteFts::Blocked
+        );
+        // Low stack: no rewrite, still blocked.
+        assert_eq!(fts_for_sqlite(sql, true, true), SqliteFts::Blocked);
+        // A statement without FTS is untouched on either handle.
+        assert_eq!(
+            fts_for_sqlite("SELECT 1 FROM metadata_items", true, false),
+            SqliteFts::AsIs
+        );
+    }
+
+    #[test]
+    fn dummy_shadow_sql_carries_every_parameter() {
+        assert_eq!(dummy_shadow_sql(&[]), "SELECT 1 WHERE 0");
+        assert_eq!(
+            dummy_shadow_sql(&[Some("id"), None, Some("title")]),
+            "SELECT 1 WHERE :id IS NOT NULL AND ? IS NOT NULL AND :title IS NOT NULL"
+        );
+        // A 1,000-parameter statement (PMS binds that many in one bulk
+        // insert) keeps every placeholder; the C shim's 4 KiB buffer kept
+        // about 225.
+        let names: Vec<Option<&str>> = vec![None; 1000];
+        let out = dummy_shadow_sql(&names);
+        assert_eq!(out.matches('?').count(), 1000);
+        assert!(out.len() > 4096);
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        let mut stmt = db.prepare(&out).expect("wide shadow must prepare in SQLite");
+        assert_eq!(stmt.parameter_count(), 1000);
+        let values = vec![1_i32; 1000];
+        assert_eq!(stmt.query_row(rusqlite::params_from_iter(values), |row| row.get::<_, i32>(0)).unwrap(), 1);
+
     }
 
     #[test]

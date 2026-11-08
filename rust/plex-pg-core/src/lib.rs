@@ -55,6 +55,9 @@ pub mod ffi_types;
 pub mod fishhook;
 pub mod functions;
 pub mod groupby;
+pub mod guide_load;
+#[cfg(target_os = "linux")]
+pub mod guide_swap;
 pub mod keywords;
 pub mod libpq_helpers;
 pub mod pg_client;

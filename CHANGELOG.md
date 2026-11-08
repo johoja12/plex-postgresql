@@ -17,10 +17,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prepared statements and streaming results keep their connections. Native
   regression: a four-slot pool failed on worker five before the fix.
 
+- Keep bulk shadow statements below SQLite's expression-depth limit while
+  preserving every bind parameter; verify 1,000 bindings against SQLite.
+
+- Enforce guide socket reply deadlines across partial reads, so a slowly
+  responding manager cannot indefinitely delay a guide open or rename.
+
 ## [1.3.22] - 2026-11-03
 
 ### Changed
 - Updated upstream base Docker images (linuxserver/plex:latest / plexinc/pms-docker:latest).
+### v1.3.17-clusterplex.53 (2026-11-05)
+
+- A guide load's sequence resync (`.50`) runs in a savepoint of its own (`plex_pg_resync`) when PMS's transaction is open, so a refused resync -- a table with no `id` column, a table the clone lacks -- is rolled back to the savepoint and logged, and the load goes on; until now a refusal would have aborted PMS's transaction, which the statement savepoints no longer prevent since `.51` turned them off, and PMS would have failed the load. The sequence lookup uses `to_regclass`, so only the `max(id)` read can refuse. Proven on the rig's PostgreSQL. `.52` is reserved for a peer session.
+
+### v1.3.17-clusterplex.51 (2026-11-04)
+
+- A guide's or a load's own connection skips the `SET statement_timeout` before each read (`read_resets_timeout`, `prepared_send.rs`): it was set to no timeout at its connect (`.46`) and serves nothing else, where a pooled library connection serves many handles and keeps the reset. On the rig's 100-channel, 1,400-airing staged load that `SET` was 91,229 of the loader connection's 267,006 statements; PostgreSQL's own time for the load was 25 s of 97, the rest round trips at about 0.16 ms each, and the volume is PMS's: the loader rewrites a show's taggings on every airing of the show (73,612 tagging inserts and 2,212 deletes for 2,212 final rows). The library's reads are unchanged.
+- `PLEX_PG_GUIDE_LOAD_SAVEPOINTS` is off by default (`1` turns it on). The rig showed PMS's loader never continues past a refused statement -- `Exception inside transaction (inside=1)`, `Failed to load EPG` -- so the savepoint keeps nothing usable, and its two statements per write were 168,000 more of that load's.
+
+### v1.3.17-clusterplex.50 (2026-11-04)
+
+- A guide load's statement that assigns an id itself has the table's id sequence raised after it (`guide_load::id_assignment`, `resync_sequence`, in both write paths): an UPDATE whose SET list names `id`, or an INSERT or REPLACE whose column list does, is followed by one `setval` to the greater of `max(id)` and the sequence's own last value (never lowered past another session's take), so the next INSERT takes max(id)+1 as SQLite's next rowid would. PMS's loader makes each EPG section with an INSERT (id 1 from the sequence) and then renumbers it, `update library_sections set id=2 where id=1`; on the first staged load on the kind rig (2026-11-04 19:45Z) the next section's INSERT took 2 from the sequence again, PostgreSQL refused it (`duplicate key value violates unique constraint "library_sections_pkey"`), and PMS ended the load at once -- `Exception inside transaction (inside=1)`, `Failed to load EPG` -- which also answers the design's open question: the loader never continues past a refused statement, whatever a savepoint leaves usable. Only a load handle is affected; the library's writes are untouched.
+
+### v1.3.17-clusterplex.49 (2026-11-04)
+
+- The quotes pass reaches an identifier under a collation (and in a tuple, and either side of IS DISTINCT FROM): `order by parents.`title_sort` collate icu_root` reached PostgreSQL as `(parents.`title_sort`) COLLATE plex.icu_root`, a syntax error at the backtick, which killed the last statement of PMS's incremental guide refresh (its show-level episode lookup) after every chunk had loaded, left its activity at 100% as a ghost and the provider row unwritten (talos, 2026-11-04 18:26Z; the third and, by the refresh's own order, last statement of the loader the translator refused).
+
+### v1.3.17-clusterplex.48 (2026-11-04)
+
+- `rewrite_sqlite_collations` stays inside a single-quoted literal at a doubled quote (`''`) and inside a double-quoted identifier at `""`, where it ended them: after `title='America''s Funniest Home Videos'` the rest of PMS's show lookup was copied as if quoted, its ORDER BY's `collate icu_root` reached sqlparser unrewritten ("Expected: end of statement, found: collate"), the statement was never prepared and PMS's first bind failed as SQLITE_RANGE, failing the incremental guide refresh on any title with an apostrophe (talos, 2026-11-04 17:28Z; found through .47's whole-statement log).
+- Also in this tag, inert until `PLEX_PG_GUIDE_LOADS=1` (cluster-plex's half ships it as .49): a Live TV guide load can be PostgreSQL's from its first statement (`guide_load.rs`; the shim half of cluster-plex's `docs/superpowers/specs/2026-11-04-guide-loads-in-postgresql-design.md`, owner 2026-11-04). PMS builds every load in `<guide>-loading.db`; until now that handle was genuine SQLite and the `rename()` hook had the manager copy the finished file into the guide's schema (35 s for a cloud guide). With `PLEX_PG_GUIDE_LOADS=1`: the open of a load file asks the manager `stage <path>` on `PLEX_PG_GUIDE_SOCKET` first (60 s; the manager's own deadline is shorter), and on `ok` -- the staging schema `epg_<uuid>_next` made, PMS's template copy replaced by a shadow -- the handle connects as a guide does, so `epg_schema_for_path` reads a load file as its guide's staging schema; any other answer, or none, opens the file as SQLite as before, logged at ERROR, and the rename's copy stands. A load handle's reads never touch the thread's result cache (the loader looks a title up, inserts it and looks it up again within the cache's second), and each of its writes inside PMS's transaction runs in a savepoint (`plex_pg_stmt`), so a statement PostgreSQL refuses leaves the transaction usable as SQLite leaves its own; `PLEX_PG_GUIDE_LOAD_SAVEPOINTS=0` turns that off. A load runs with no statement timeout, as a guide does. With `PLEX_PG_GUIDE_LOADS` unset or `0` a load file never redirects, and nothing else changes.
+
+### v1.3.17-clusterplex.47 (2026-11-04)
+
+- `x IN (...) COLLATE icu_root` parses: `rewrite_sqlite_collations` drops an ICU collation that follows an IN list (`closes_in_list`), since sqlparser reads the list as a finished expression and refused the COLLATE after it, and `plex.icu_root` is deterministic, so the IN's equality is unchanged. PMS's incremental guide refresh sends that shape as its bulk title lookup of a chunk; with the statement never prepared, PMS's first bind failed as SQLITE_RANGE ("Error 25 when binding to pos 1 on bulk operations") and the refresh ended "Failed to load EPG" (talos, 2026-11-04 16:50Z; the 16:12Z refresh, which never issued it, had completed).
+- A refused statement is logged whole (up to 64 KiB) instead of its first 200 characters, which said nothing of the COLLATE 9 KiB in.
+
+### v1.3.17-clusterplex.46 (2026-11-04)
+
+- A Live TV guide's connection runs with no statement timeout (`GUIDE_STATEMENT_TIMEOUT_SQL`, `statement_timeout_sql`, `is_guide_path`; the library keeps its five minutes, at the session and before each read as before). PMS's guide refresh -- the nightly `RefreshEpgGuides` butler task, and the load it starts at boot when the guide's chunk state is stale -- begins by streaming the whole guide it already holds through one SELECT (every item with its airings, parts, settings, parent and grandparent; 98,180 rows for 248 channels, 657 ms on the server) and does its per-row work as the rows arrive, for longer than five minutes. PostgreSQL cancelled that statement ("canceling statement due to statement timeout"), PMS's loader task died with an uncaught exception, its "Refreshing guide data" activity sat at 0% until the next restart, and it retried the same read every five minutes; no incremental refresh ever completed on talos (found 2026-11-04 15:02Z). A load PMS runs from scratch (a channel-map save, `reloadGuide`) was never affected: it reads nothing back.
+
+### v1.3.17-clusterplex.45 (2026-11-04)
+
+- The shim's half of cluster-plex's guide-loads-copied-at-rename design (2026-10-21): `rename(old, new)` is interposed like `sigaction` (`guide_swap.rs`). When `old` is a Live TV guide load (`tv.plex.providers.epg.<provider>-<uuid>-loading.db`) and `new` its guide, and `PLEX_PG_GUIDE_SOCKET` names the manager's socket, the hook sends `swap <old>` and waits up to 240 s for `ok`, `skip <why>` or `fail <why>` before libc's rename; any other rename passes straight through, and a refused connection, a timeout or a malformed answer is logged and the rename passes too (the manager's poll copies the load within 30 s, as before). Until now the shim routed a guide to PostgreSQL only when its schema existed at PMS's reopen after the rename, and the copy came after it: a new DVR's first guide was served from the SQLite file until PMS next reopened it, and every later load was served stale for the minute the poll took -- on a Plex cloud lineup (DIRECTV Mobile, 167 channels, 14 days, 354,116 rows, 35 s to copy) the larger window.
+
+### v1.3.17-clusterplex.44 (2026-11-04)
+
+- FTS statements are rewritten or refused only on a handle the shim serves from PostgreSQL (`handle_is_pg_backed`: the library, the blobs database, a Live TV guide with a schema), whose SQLite file is the shadow. A genuine SQLite handle -- a guide load's `-loading.db`, a plugin's database -- runs PMS's own FTS statements as written, on the `collating` tokenizer PMS registers through the passed-through `fts3_tokenizer`. Since upstream `ff63333` (2026-01-09, when the library was the only database the shim served) every handle got the rewrite and the block, so a Live TV cloud-guide load (Plex's own Gracenote lineups, PMS 1.43.4) failed: its loader prepares `select ... join fts4_metadata_titles_icu on metadata_items.id = fts4_metadata_titles_icu.rowid where ... match ?` on the `-loading.db`, the block substituted `SELECT 1 WHERE 0`, and the first bind answered SQLITE_RANGE ("Error 25 when binding to pos 1 on bulk operations", then "EPG[cloud]: Failed to load EPG"), after which PMS replaced the DVR's channel map with its own pairing.
+- A PG-routed statement's shadow carries one placeholder per parameter however many there are (`dummy_shadow_sql`): the C shim's 4 KiB buffer stopped at about 225, so a bulk statement's later binds answered SQLITE_RANGE.
 
 ### v1.3.17-clusterplex.43 (2026-10-27)
 

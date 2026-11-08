@@ -225,9 +225,12 @@ pub(super) unsafe fn maybe_register_pg_stmt(
     };
 
     if trans.success == 0 {
+        // The whole statement, so a refused one can be reproduced: 200
+        // characters of a 9 KiB guide lookup said nothing of the COLLATE at
+        // its end (2026-11-04).
         log_error(&format!(
             "Translation failed for SQL: {}. Error: {}",
-            cstr_prefix(z_sql, 200, "NULL"),
+            cstr_prefix(z_sql, 65536, "NULL"),
             cstr_to_string_or(trans.error.as_ptr(), "")
         ));
         trace_pg_registration_translation_error(

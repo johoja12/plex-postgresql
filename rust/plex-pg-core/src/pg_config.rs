@@ -43,6 +43,13 @@ fn strip_leading_ws_and_sql_comments(input: &str) -> &str {
 /// Returns true if `filename` matches a Plex database that should be redirected
 /// to PostgreSQL, and `passthrough` is false.
 pub(crate) fn should_redirect_str(filename: &str, passthrough: bool) -> bool {
+    should_redirect_with(filename, passthrough, crate::guide_load::enabled())
+}
+
+/// `should_redirect_str` with the guide-load flag (`PLEX_PG_GUIDE_LOADS`)
+/// given: a guide's load file redirects only under it, and then only once
+/// the open has it staged (`guide_load::stage_before_open`).
+pub(crate) fn should_redirect_with(filename: &str, passthrough: bool, guide_loads: bool) -> bool {
     if passthrough || filename.is_empty() {
         return false;
     }
@@ -50,8 +57,10 @@ pub(crate) fn should_redirect_str(filename: &str, passthrough: bool) -> bool {
         || filename.contains("com.plexapp.plugins.library.blobs.db")
         // A Live TV guide, served from a schema of its own (owner,
         // 2026-10-20). rust_pg_connect leaves it SQLite while that schema
-        // does not exist.
-        || crate::db_interpose_helpers::epg_schema_for_path(filename).is_some()
+        // does not exist. Its load file (owner, 2026-11-04) only with the
+        // flag on.
+        || (crate::db_interpose_helpers::epg_schema_for_path(filename).is_some()
+            && (guide_loads || !crate::db_interpose_helpers::is_guide_load_path(filename)))
 }
 
 /// Returns true if the SQL is a SQLite engine configuration call that must
@@ -540,6 +549,27 @@ mod tests {
         assert!(!should_redirect_str(
             "/data/tv.plex.providers.epg.xmltv-x.db",
             false
+        ));
+    }
+
+    #[test]
+    fn redirect_a_guide_load_only_under_the_flag() {
+        const LOAD: &str =
+            "/data/tv.plex.providers.epg.cloud-0ab001b3-182f-4835-897c-43a9ed6797c5-loading.db";
+        const GUIDE: &str =
+            "/data/tv.plex.providers.epg.cloud-0ab001b3-182f-4835-897c-43a9ed6797c5.db";
+        assert!(!should_redirect_with(LOAD, false, false));
+        assert!(should_redirect_with(LOAD, false, true));
+        assert!(!should_redirect_with(LOAD, true, true), "passthrough wins");
+        assert!(
+            should_redirect_with(GUIDE, false, false),
+            "the guide itself, flag or not"
+        );
+        assert!(should_redirect_with(GUIDE, false, true));
+        assert!(!should_redirect_with(
+            "/data/tv.plex.providers.epg.cloud-loading.db",
+            false,
+            true
         ));
     }
 

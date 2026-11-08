@@ -496,6 +496,49 @@ fn a_live_tv_guide_is_served_from_postgresql_like_the_library() {
     ));
 }
 
+const LOAD: &str = "/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/tv.plex.providers.epg.cloud-0ab001b3-182f-4835-897c-43a9ed6797c5-loading.db";
+
+#[test]
+fn a_guides_load_is_its_staging_schema() {
+    // PMS's load file (DVR 32's cloud guide, talos, 2026-11-04): the schema
+    // cluster-plex stages into, Guide.Staging().
+    assert_eq!(
+        epg_schema_for_path_impl(LOAD).as_deref(),
+        Some("epg_0ab001b3182f4835897c43a9ed6797c5_next")
+    );
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert_eq!(
+            epg_schema_for_path_impl(&format!("{LOAD}{suffix}")).as_deref(),
+            Some("epg_0ab001b3182f4835897c43a9ed6797c5_next"),
+            "{suffix}"
+        );
+        assert!(
+            is_guide_load_path_impl(&format!("{LOAD}{suffix}")),
+            "{suffix}"
+        );
+    }
+    assert!(is_guide_load_path_impl(LOAD));
+    assert!(is_library_db_path_impl(LOAD));
+    assert!(is_library_or_blobs_db_path_impl(LOAD));
+}
+
+#[test]
+fn only_a_guides_load_is_a_load() {
+    assert!(!is_guide_load_path_impl(GUIDE));
+    assert!(!is_guide_load_path_impl(&format!("{GUIDE}-wal")));
+    for path in [
+        "/x/tv.plex.providers.epg.cloud-loading.db",
+        "/x/tv.plex.providers.epg.xmltv-not-a-uuid-loading.db",
+        "/x/tv.plex.providers.epg.xmltv-adfe4a6f-79d0-4135-93d5-edf0235ec02b-loading.db.bak",
+        "/x/tv.plex.providers.epg.xmltv-adfe4a6f-79d0-4135-93d5-edf0235ec02b.loading.db",
+        "/x/com.plexapp.plugins.library.db-loading.db",
+        "",
+    ] {
+        assert!(!is_guide_load_path_impl(path), "{path}");
+        assert_eq!(epg_schema_for_path_impl(path), None, "{path}");
+    }
+}
+
 #[test]
 fn common_helpers_is_library_db_path_accepts_wal_suffix() {
     assert!(is_library_db_path_impl(

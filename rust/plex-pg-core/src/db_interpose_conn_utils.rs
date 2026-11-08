@@ -28,6 +28,54 @@ macro_rules! log_info_lazy {
 
 pub(crate) const STATEMENT_TIMEOUT_SQL: &str = "SET statement_timeout = '5min'";
 
+/// A Live TV guide's connection runs with no statement timeout. PMS's guide
+/// refresh (the nightly butler task, and the load it starts at boot when
+/// the guide's chunk state is stale) begins by streaming the whole guide it
+/// already has through one SELECT (every item with its airings, parts,
+/// settings, parent and grandparent: 98,180 rows for 248 channels, 657 ms
+/// on the server) and does its per-row work as the rows come, which takes
+/// it well past five minutes. PostgreSQL then cancelled the statement
+/// ("canceling statement due to statement timeout"), PMS's loader task
+/// died with an uncaught exception, its "Refreshing guide data" activity
+/// stayed at 0% until the next restart, and no refresh ever completed
+/// (talos, 2026-11-04). On its own SQLite file that read has no timeout;
+/// neither does it here.
+pub(crate) const GUIDE_STATEMENT_TIMEOUT_SQL: &str = "SET statement_timeout = 0";
+
+/// The statement timeout a connection runs with: none for a guide's,
+/// [`STATEMENT_TIMEOUT_SQL`] for the library's.
+pub(crate) fn statement_timeout_sql(guide: bool) -> &'static str {
+    if guide {
+        GUIDE_STATEMENT_TIMEOUT_SQL
+    } else {
+        STATEMENT_TIMEOUT_SQL
+    }
+}
+
+/// Whether `db_path` names a Live TV guide, whose connection runs with no
+/// statement timeout.
+///
+/// # Safety
+/// `db_path` is NUL-terminated or null, as a [`PgConnection`]'s `db_path` is.
+pub(crate) unsafe fn is_guide_path(db_path: *const c_char) -> bool {
+    !db_path.is_null()
+        && crate::db_interpose_helpers::epg_schema_for_path(
+            crate::db_interpose_helpers::cstr_to_str_or_empty(db_path),
+        )
+        .is_some()
+}
+
+/// Whether a read on the connection whose database is `db_path` first
+/// resets the session's statement timeout: a library connection (pooled,
+/// shared by handles) does, a guide's or a load's own connection does not --
+/// it was set to no timeout at its connect and serves nothing else.
+///
+/// # Safety
+/// `db_path` is NUL-terminated or null, as a [`PgConnection`]'s `db_path` is.
+pub(crate) unsafe fn read_resets_timeout(db_path: *const c_char) -> bool {
+    !is_guide_path(db_path)
+}
+
 #[repr(C)]
 pub struct PgConnConfig {
     pub host: [c_char; 256],
@@ -207,6 +255,7 @@ pub(crate) unsafe fn apply_pg_session_settings(
             crate::db_interpose_helpers::cstr_to_str_or_empty(db_path),
         )
     };
+    let timeout_sql = statement_timeout_sql(guide.is_some());
     let schema = guide.unwrap_or_else(|| cbuf_to_str(&cfg.schema).to_string());
     let schema_cmd = format!("SET search_path TO {}, public", schema);
     if let Ok(schema_c) = CString::new(schema_cmd) {
@@ -215,7 +264,7 @@ pub(crate) unsafe fn apply_pg_session_settings(
             crate::libpq_helpers::rust_pq_clear(res);
         }
     }
-    if let Ok(timeout_c) = CString::new(STATEMENT_TIMEOUT_SQL) {
+    if let Ok(timeout_c) = CString::new(timeout_sql) {
         let res = crate::libpq_helpers::rust_pq_exec(conn, timeout_c.as_ptr());
         if !res.is_null() {
             crate::libpq_helpers::rust_pq_clear(res);
@@ -288,5 +337,57 @@ pub fn rust_step_conn_cancel_and_drain(conn: *mut PgConnection, scope_tag: *cons
             drain_count,
             conn
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_guide_runs_with_no_statement_timeout_and_the_library_with_five_minutes() {
+        assert_eq!(statement_timeout_sql(true), "SET statement_timeout = 0");
+        let lib = CString::new("/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db").unwrap();
+        let guide = CString::new("/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/tv.plex.providers.epg.cloud-0ab001b3-182f-4835-897c-43a9ed6797c5.db").unwrap();
+        unsafe {
+            assert!(
+                read_resets_timeout(lib.as_ptr()),
+                "a pooled library connection"
+            );
+            assert!(
+                !read_resets_timeout(guide.as_ptr()),
+                "a guide's own connection"
+            );
+            assert!(read_resets_timeout(std::ptr::null()));
+        }
+        assert_eq!(
+            statement_timeout_sql(false),
+            "SET statement_timeout = '5min'"
+        );
+    }
+
+    #[test]
+    fn a_guide_path_is_told_from_the_librarys() {
+        let guide = std::ffi::CString::new(
+            "/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/tv.plex.providers.epg.cloud-0ab001b3-182f-4835-897c-43a9ed6797c5.db",
+        )
+        .unwrap();
+        let library = std::ffi::CString::new(
+            "/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db",
+        )
+        .unwrap();
+        let load = std::ffi::CString::new(
+            "/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/tv.plex.providers.epg.cloud-0ab001b3-182f-4835-897c-43a9ed6797c5-loading.db",
+        )
+        .unwrap();
+        unsafe {
+            assert!(is_guide_path(guide.as_ptr()));
+            assert!(
+                is_guide_path(load.as_ptr()),
+                "a load runs with no timeout either"
+            );
+            assert!(!is_guide_path(library.as_ptr()));
+            assert!(!is_guide_path(std::ptr::null()));
+        }
     }
 }
