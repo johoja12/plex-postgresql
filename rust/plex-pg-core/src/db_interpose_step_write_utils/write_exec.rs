@@ -146,6 +146,13 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
         };
 
         let status = crate::libpq_helpers::rust_pq_result_status(res);
+        log_debug_lazy!(
+            "STEP WRITE exec: conn={:p} status={} ntuples={} sql={}",
+            exec_conn,
+            status,
+            crate::libpq_helpers::rust_pq_ntuples(res),
+            cstr_prefix(stmt.pg_sql, 80, "(null)")
+        );
         if savepoint {
             crate::guide_load::end_statement_savepoint(
                 ec.conn,
@@ -183,6 +190,7 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
                 }
                 if !id_str.is_null() && !CStr::from_ptr(id_str).to_bytes().is_empty() {
                     let rowid = crate::db_interpose_helpers::rust_pg_text_to_int64(id_str);
+                    log_debug_lazy!("STEP WRITE: insert id {} on conn {:p}", rowid, exec_conn);
                     if rowid > 0 {
                         ec.last_insert_rowid = rowid;
                         ec.last_insert_failed.store(0, Ordering::Release);

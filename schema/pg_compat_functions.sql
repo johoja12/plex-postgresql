@@ -124,3 +124,23 @@ CREATE OPERATOR public.= (
 );
 
 
+
+-- statistics_media's "reject empty" trigger is gone (v1.3.17-clusterplex.58,
+-- 2026-11-10), from every schema that carries it, guide schemas included.
+-- PMS opens a statistics bucket with count 0 and duration 0, then adds to it
+-- with UPDATE ... WHERE id = <the inserted row's id>; the trigger dropped
+-- that insert, so no bucket ever existed, every update missed, and PMS read
+-- back another insert's id, or 0 on a fresh connection, where it threw
+-- (talos held 0 rows against a sequence at 16445). Dropping it here, which
+-- runs at every start, reaches databases made before it left the dump.
+DO $drop_reject_empty$
+DECLARE
+    fn regprocedure;
+BEGIN
+    FOR fn IN
+        SELECT p.oid::regprocedure FROM pg_proc p WHERE p.proname = 'reject_empty_statistics'
+    LOOP
+        EXECUTE format('DROP FUNCTION IF EXISTS %s CASCADE', fn);
+    END LOOP;
+END
+$drop_reject_empty$;

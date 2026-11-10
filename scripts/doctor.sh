@@ -235,18 +235,6 @@ $$;
 SQLFUNC
 )"
 
-check "reject_empty_statistics()" \
-    "SELECT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = '$PG_SCHEMA' AND p.proname = 'reject_empty_statistics');" \
-    "CREATE OR REPLACE FUNCTION $PG_SCHEMA.reject_empty_statistics() RETURNS trigger
-    LANGUAGE plpgsql AS \$\$
-    BEGIN
-        IF NEW.at IS NULL OR NEW.at = 0 THEN
-            RETURN NULL;
-        END IF;
-        RETURN NEW;
-    END;
-    \$\$;"
-
 check "set_available_at()" \
     "SELECT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = '$PG_SCHEMA' AND p.proname = 'set_available_at');" \
     "CREATE OR REPLACE FUNCTION $PG_SCHEMA.set_available_at() RETURNS trigger
@@ -328,10 +316,6 @@ check "metadata_items_set_available_at" \
 check "tags_search_update" \
     "SELECT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = '$PG_SCHEMA' AND t.tgname = 'tags_search_update');" \
     "CREATE TRIGGER tags_search_update BEFORE INSERT OR UPDATE ON $PG_SCHEMA.tags FOR EACH ROW EXECUTE FUNCTION $PG_SCHEMA.tags_search_trigger();"
-
-check "statistics_media_reject_empty" \
-    "SELECT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = '$PG_SCHEMA' AND t.tgname = 'statistics_media_reject_empty');" \
-    "CREATE TRIGGER statistics_media_reject_empty BEFORE INSERT ON $PG_SCHEMA.statistics_media FOR EACH ROW EXECUTE FUNCTION $PG_SCHEMA.reject_empty_statistics();"
 
 check "trg_clean_statistics_resources" \
     "SELECT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = '$PG_SCHEMA' AND t.tgname = 'trg_clean_statistics_resources');" \

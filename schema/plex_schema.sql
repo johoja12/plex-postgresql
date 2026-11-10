@@ -564,22 +564,6 @@ $$;
 
 
 --
--- Name: reject_empty_statistics(); Type: FUNCTION; Schema: plex; Owner: -
---
-
-CREATE FUNCTION plex.reject_empty_statistics() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-  IF NEW.count = 0 AND NEW.duration = 0 THEN
-    RETURN NULL;
-  END IF;
-  RETURN NEW;
-END;
-$$;
-
-
---
 -- Name: run_statistics_cleanup(integer); Type: FUNCTION; Schema: plex; Owner: -
 --
 
@@ -4259,13 +4243,6 @@ CREATE INDEX idx_tags_tag_type ON plex.tags USING btree (tag_type);
 --
 
 CREATE TRIGGER metadata_items_set_available_at BEFORE INSERT ON plex.metadata_items FOR EACH ROW EXECUTE FUNCTION plex.set_available_at();
-
-
---
--- Name: statistics_media statistics_media_reject_empty; Type: TRIGGER; Schema: plex; Owner: -
---
-
-CREATE TRIGGER statistics_media_reject_empty BEFORE INSERT ON plex.statistics_media FOR EACH ROW EXECUTE FUNCTION plex.reject_empty_statistics();
 
 
 --

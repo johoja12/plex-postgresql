@@ -1,6 +1,26 @@
 use super::*;
 use crate::log_debug_lazy;
 
+/// Whether a write is one the shim answers without sending: the junk
+/// `metadata_items` row below.
+///
+/// `statistics_media` inserts used to be skipped here too when their count
+/// and duration were "empty" (upstream's "310M empty rows bug", 2025-12-31),
+/// and the schema dump's `statistics_media_reject_empty` trigger dropped the
+/// same rows in PostgreSQL. PMS opens every statistics bucket empty -- count
+/// 0, duration 0 -- and then adds to it with `UPDATE statistics_media SET
+/// count=?, duration=? WHERE id=<the inserted row's id>`, so between them no
+/// bucket ever existed: talos held 0 rows against a sequence at 16445
+/// (2026-11-10). Neither answered an id either, so PMS read back the
+/// connection's last insert from another table (its updates then hit a row
+/// of nothing), or 0 on a connection that had inserted nothing yet: right
+/// after a restart with a session playing, PMS threw `DB::Exception` there
+/// and logged "Uncaught exception running async task ... std::exception".
+/// (The skip's own check was off by one as well: it read the count from
+/// parameter 6, which is the duration in PMS 1.43.5's seven.) The insert now
+/// runs as SQLite runs it, and `pg_compat_functions.sql` drops the trigger.
+/// On the kind rig a session's statistics then held one row per bucket, each
+/// updated in place, with no new row after the first five (2026-11-10).
 #[no_mangle]
 pub extern "C" fn rust_step_write_should_skip_special_insert(
     pg_stmt: *mut PgStmt,
@@ -17,68 +37,6 @@ pub extern "C" fn rust_step_write_should_skip_special_insert(
 
     unsafe {
         let pg_sql_bytes = cstr_bytes(stmt.pg_sql);
-        if contains_icase_bytes(pg_sql_bytes, b"statistics_media") {
-            let count_val = if stmt.param_count > 6 {
-                param_at(param_values, 6)
-            } else {
-                std::ptr::null()
-            };
-            let duration_val = if stmt.param_count > 7 {
-                param_at(param_values, 7)
-            } else {
-                std::ptr::null()
-            };
-            let count_empty = count_val.is_null() || CStr::from_ptr(count_val).to_bytes() == b"0";
-            let duration_empty =
-                duration_val.is_null() || CStr::from_ptr(duration_val).to_bytes() == b"0";
-
-            if count_empty && duration_empty {
-                log_debug_lazy!(
-                    "SKIP statistics_media INSERT: count={} duration={} (empty)",
-                    cstr_to_string_or(count_val, "NULL"),
-                    cstr_to_string_or(duration_val, "NULL")
-                );
-
-                if !exec_conn.is_null() && !(&*exec_conn).conn.is_null() {
-                    let ec = &mut *exec_conn;
-                    let _conn_guard = PthreadMutexGuard::lock(&mut ec.mutex as *mut _);
-                    if ec.conn.is_null() {
-                        log_error("SKIP SEQ: conn became NULL after lock (TOCTOU race)");
-                    } else if crate::libpq_helpers::rust_pq_status(ec.conn) == CONNECTION_OK {
-                        let seq_res = crate::libpq_helpers::rust_pq_exec(
-                            ec.conn,
-                            b"SELECT nextval('plex.statistics_media_id_seq')\0".as_ptr()
-                                as *const c_char,
-                        );
-                        if crate::libpq_helpers::rust_pq_result_status(seq_res) == PGRES_TUPLES_OK
-                            && crate::libpq_helpers::rust_pq_ntuples(seq_res) > 0
-                        {
-                            let mut seq_buf = [0 as c_char; 64];
-                            let mut seq_val: *const c_char = std::ptr::null();
-                            if crate::db_interpose_helpers::rust_pg_result_text_copy(
-                                seq_res as *const crate::db_interpose_helpers::PGresult,
-                                0,
-                                0,
-                                seq_buf.as_mut_ptr(),
-                                seq_buf.len(),
-                            ) >= 0
-                            {
-                                seq_val = seq_buf.as_ptr();
-                            }
-                            log_debug_lazy!(
-                                "SKIP: Advanced sequence to {}",
-                                cstr_to_string_or(seq_val, "?")
-                            );
-                        }
-                        crate::libpq_helpers::rust_pq_clear(seq_res);
-                    }
-                }
-
-                stmt.write_executed = 1;
-                return 1;
-            }
-        }
-
         if contains_icase_bytes(pg_sql_bytes, b"INSERT INTO")
             && contains_icase_bytes(pg_sql_bytes, b"metadata_items")
             && !contains_icase_bytes(pg_sql_bytes, b"metadata_item_settings")
@@ -153,5 +111,54 @@ pub extern "C" fn rust_step_write_should_skip_special_insert(
         }
 
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PMS 1.43.5's statistics bucket insert, as the translator sends it,
+    /// with the seven values PMS binds; `count` and `duration` are the last
+    /// two. Answers whether the shim would skip it, and that it did not
+    /// claim to have run it.
+    fn statistics_insert_skipped(count: &str, duration: &str) -> c_int {
+        let sql = CString::new(
+            "INSERT INTO statistics_media (\"account_id\", \"device_id\", \"timespan\", \"at\", \
+             \"metadata_type\", \"count\", \"duration\") VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             RETURNING id",
+        )
+        .unwrap();
+        let values: Vec<CString> = ["1", "1", "4", "1794320700", "1", count, duration]
+            .iter()
+            .map(|v| CString::new(*v).unwrap())
+            .collect();
+        let ptrs: Vec<*const c_char> = values.iter().map(|v| v.as_ptr()).collect();
+        let mut stmt = PgStmt::default();
+        stmt.pg_sql = sql.as_ptr() as *mut c_char;
+        stmt.param_count = 7;
+        let rc = rust_step_write_should_skip_special_insert(
+            &mut stmt,
+            std::ptr::null_mut(),
+            ptrs.as_ptr(),
+        );
+        let executed = stmt.write_executed;
+        stmt.pg_sql = std::ptr::null_mut();
+        assert_eq!(executed, 0, "a skipped insert is marked executed");
+        rc
+    }
+
+    /// The bucket PMS opens when a play starts: count 1, duration 0. The old
+    /// check read the duration as the count and dropped it.
+    #[test]
+    fn a_statistics_bucket_pms_opens_is_inserted() {
+        assert_eq!(statistics_insert_skipped("1", "0"), 0);
+    }
+
+    /// An empty bucket is inserted as SQLite would insert it, so PMS gets a
+    /// row id of its own to update.
+    #[test]
+    fn an_empty_statistics_bucket_is_inserted() {
+        assert_eq!(statistics_insert_skipped("0", "0"), 0);
     }
 }
