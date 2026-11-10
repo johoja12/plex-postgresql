@@ -30,8 +30,8 @@ pub use badcast_trace::{
 };
 pub(crate) use decltype::{normalize_sqlite_decltype_impl, pg_udt_to_sqlite_decltype_impl};
 pub use ffi_strings::{
-    rust_free_cstring, rust_free_normalized_sql, rust_normalize_sql_literals,
-    rust_rewrite_server_library_uri, rust_validate_utf8, RustNormalizedSql,
+    rust_free_cstring, rust_free_normalized_sql, rust_normalize_sql_literals, rust_validate_utf8,
+    RustNormalizedSql,
 };
 pub(crate) use pg_result::column_text_transform_owned;
 pub use pg_result::{
@@ -47,15 +47,14 @@ use pure_helpers::{
     find_insert_column_index_impl, format_epoch_to_datetime_utc_impl, is_aggregate_alias,
     is_blobs_db_path_impl, is_guide_load_path_impl, is_junk_metadata_insert_impl,
     is_library_db_path_impl, is_library_or_blobs_db_path_impl, is_related_items_query_impl,
-    normalize_sql_literals_impl, rewrite_server_library_uri_bytes,
+    normalize_sql_literals_impl,
     should_mask_collection_metadata_type_impl,
 };
 pub(crate) use string_utils::cstr_to_str_or_empty;
 use string_utils::{
-    contains_ascii_icase, cstr_to_str, find_ascii_icase, find_closing_paren, find_subslice,
-    has_boundary, is_next_numeric_boundary, is_prev_numeric_boundary, normalize_ident_token,
-    split_csv_simple, starts_with_icase, write_buf, write_i32_to_buf,
-    write_i64_to_buf,
+    contains_ascii_icase, cstr_to_str, find_ascii_icase, find_closing_paren, has_boundary,
+    is_next_numeric_boundary, is_prev_numeric_boundary, normalize_ident_token, split_csv_simple,
+    starts_with_icase, write_buf, write_i32_to_buf, write_i64_to_buf,
 };
 pub use type_cache::{
     rust_decltype_cache_insert, rust_decltype_cache_lookup, rust_decltype_cache_lookup_alias,

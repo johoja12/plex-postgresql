@@ -296,7 +296,7 @@ test-bind-mismatch:
 
 test-uri:
 	@echo ""
-	@cargo test --manifest-path rust/plex-pg-core/Cargo.toml --lib rewrite_server_uri_
+	@cargo test --manifest-path rust/plex-pg-core/Cargo.toml --lib uri
 	@echo ""
 
 test-stress:

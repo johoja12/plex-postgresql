@@ -74,7 +74,7 @@ unsafe fn write_cached_text_output(
     }
     let str_len = libc::strlen(state.source_value) as usize;
     // Cached transformed values need the same unbounded statement ownership
-    // as live values; a fixed ring would truncate a long rewritten URI.
+    // as live values; the returned pointers must survive other columns.
     let bytes = std::slice::from_raw_parts(state.source_value as *const u8, str_len);
     if let Some(owned) = crate::db_interpose_helpers::column_text_transform_owned(
         state.col_name, state.oid, pg_stmt.pg_sql, state.source_value, bytes,
@@ -327,49 +327,56 @@ mod lifetime_tests {
 
     use crate::libpq_helpers::test_support::{PQmakeEmptyPGresult, PQsetResultAttrs, PgResAttDesc as AttDesc, PQsetvalue};
     #[test]
-    fn cached_transformed_text_is_complete_and_stable_across_columns_and_threads() {
+    fn cached_text_is_complete_and_stable_across_columns_and_threads() {
         let threads: Vec<_> = (0..4).map(|thread| std::thread::spawn(move || {
             let mut stmt = PgStmt::new();
-            let name = CString::new("uri").unwrap();
+            let name = CString::new("max").unwrap();
+            // Borrowed values live in the cached row until step/reset. Keep
+            // that storage alive while checking all retained pointers.
+            let inputs: Vec<_> = (0..70).map(|col| CString::new(if col % 2 == 0 {
+                format!("server://m/com.plexapp.plugins.library/library/{thread}/{col}/{}", "日本".repeat(5000))
+            } else { format!("{}", i64::MAX - col) }).unwrap()).collect();
             let mut pointers = Vec::new();
             for col in (0..70).rev() {
-                let suffix = format!("{thread}/{col}/{}", "日本".repeat(5000));
-                let input = CString::new(format!("server://m/com.plexapp.plugins.library/library/{suffix}")).unwrap();
-                let state = CachedTextState { col_name: name.as_ptr(), oid: 25, source_value: input.as_ptr() };
+                let input = &inputs[col as usize];
+                let state = CachedTextState { col_name: name.as_ptr(), oid: if col % 2 == 0 { 25 } else { 20 }, source_value: input.as_ptr() };
                 let (text, ring) = unsafe { write_cached_text_output(&mut stmt, col, &state) };
                 assert!(!ring);
                 assert_eq!(unsafe { write_cached_text_output(&mut stmt, col, &state).0 }, text);
-                pointers.push((text, format!("library://{suffix}")));
+                pointers.push((text, input.as_bytes()));
             }
             for (text, expected) in pointers {
-                assert_eq!(unsafe { CStr::from_ptr(text as *const c_char) }.to_bytes(), expected.as_bytes());
+                assert_eq!(unsafe { CStr::from_ptr(text as *const c_char) }.to_bytes(), expected);
             }
+            assert_eq!(stmt.owned_column_text.iter().filter(|v| v.is_some()).count(), 35);
             crate::pg_statement::rust_stmt_clear_result(&mut stmt);
             assert!(stmt.owned_column_text.is_empty());
         })).collect();
         for thread in threads { thread.join().unwrap(); }
     }
     #[test]
-    fn transformed_column_pointers_survive_other_columns_and_reset_releases_ownership() {
-        let name = CString::new("uri").unwrap();
-        let mut attrs: Vec<_> = (0..70).map(|_| AttDesc { name: name.as_ptr() as *mut _,
-            tableid: 0, columnid: 0, format: 0, typid: 25, typlen: -1, atttypmod: -1 }).collect();
+    fn borrowed_and_transformed_column_pointers_survive_other_columns_and_reset() {
+        let name = CString::new("max").unwrap();
+        let mut attrs: Vec<_> = (0..70).map(|col| AttDesc { name: name.as_ptr() as *mut _,
+            tableid: 0, columnid: 0, format: 0, typid: if col % 2 == 0 { 25 } else { 20 }, typlen: -1, atttypmod: -1 }).collect();
         let mut stmt = PgStmt::new();
         stmt.result = unsafe { PQmakeEmptyPGresult(ptr::null_mut(), 2) };
         stmt.num_cols = attrs.len() as c_int; stmt.num_rows = 1; stmt.current_row = 0;
         assert_eq!(unsafe { PQsetResultAttrs(stmt.result, stmt.num_cols, attrs.as_mut_ptr()) }, 1);
         let mut pointers = Vec::new();
         for col in 0..stmt.num_cols {
-            let suffix = format!("{col}/{}", "é".repeat(5000));
-            let input = CString::new(format!("server://m/com.plexapp.plugins.library/library/{suffix}")).unwrap();
+            let input = CString::new(if col % 2 == 0 {
+                format!("server://m/com.plexapp.plugins.library/library/{col}/{}", "é".repeat(5000))
+            } else { format!("{}", i64::MAX - i64::from(col)) }).unwrap();
             assert_eq!(unsafe { PQsetvalue(stmt.result, 0, col, input.as_ptr() as *mut _, input.as_bytes().len() as c_int) }, 1);
-            let state = LiveTextState { row: 0, col_name: name.as_ptr(), _oid: 25, oid_u: 25 };
-            pointers.push((unsafe { write_live_text_output(&mut stmt, col, &state).0 }, format!("library://{suffix}")));
+            let oid = if col % 2 == 0 { 25 } else { 20 };
+            let state = LiveTextState { row: 0, col_name: name.as_ptr(), _oid: oid, oid_u: oid };
+            pointers.push((unsafe { write_live_text_output(&mut stmt, col, &state).0 }, input.as_bytes().to_vec()));
         }
         for (pointer, expected) in pointers {
-            assert_eq!(unsafe { CStr::from_ptr(pointer as *const c_char) }.to_bytes(), expected.as_bytes());
+            assert_eq!(unsafe { CStr::from_ptr(pointer as *const c_char) }.to_bytes(), expected);
         }
-        assert_eq!(stmt.owned_column_text.len(), 70);
+        assert_eq!(stmt.owned_column_text.iter().filter(|v| v.is_some()).count(), 35);
         crate::pg_statement::rust_stmt_clear_result(&mut stmt);
         assert!(stmt.owned_column_text.is_empty());
         assert!(stmt.result.is_null());

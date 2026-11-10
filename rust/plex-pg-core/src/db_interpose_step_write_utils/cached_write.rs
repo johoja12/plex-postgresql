@@ -100,6 +100,13 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
         if !pg_conn_error_out.is_null() {
             *pg_conn_error_out = 0;
         }
+        // A guide write this PMS may not make is held: never sent, and
+        // recorded as a write that ran and changed nothing, on the
+        // connection changes() reads too (`guide_writer`).
+        if crate::guide_writer::hold_write(exec_conn, changes_conn, orig_sql) {
+            mark_cached_write_executed(cached_io, p_stmt, exec_conn, orig_sql);
+            return STEP_RESULT_DONE;
+        }
         if exec_conn.is_null()
             || (&*exec_conn).conn.is_null()
             || orig_sql.is_null()
@@ -324,28 +331,106 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
             crate::libpq_helpers::rust_pq_clear(res);
         }
 
-        let mut cached = if !cached_io.is_null() {
-            *cached_io
-        } else {
-            std::ptr::null_mut()
-        };
-        if cached.is_null() {
-            cached = crate::pg_statement::rust_stmt_create(exec_conn, orig_sql, p_stmt);
-            if !cached.is_null() {
-                let c = &mut *cached;
-                c.is_pg = 1;
-                c.is_cached = 1;
-                c.write_executed = 1;
-                crate::pg_statement::rust_cached_stmt_register(p_stmt as usize, cached as usize);
-            }
-            if !cached_io.is_null() {
-                *cached_io = cached;
-            }
-        } else {
-            let c = &mut *cached;
-            c.write_executed = 1;
-        }
-
+        mark_cached_write_executed(cached_io, p_stmt, exec_conn, orig_sql);
         STEP_RESULT_DONE
+    }
+}
+
+/// Marks the cached statement for `p_stmt` executed, making and registering
+/// it on its first step, so its next step answers SQLITE_DONE without
+/// running it again.
+///
+/// # Safety
+/// `cached_io` is null or points at a slot holding null or a live `PgStmt`;
+/// `exec_conn` and `orig_sql` are as `rust_step_cached_write_execute_and_finalize`
+/// takes them.
+unsafe fn mark_cached_write_executed(
+    cached_io: *mut *mut PgStmt,
+    p_stmt: *mut sqlite3_stmt,
+    exec_conn: *mut PgConnection,
+    orig_sql: *const c_char,
+) {
+    let mut cached = if !cached_io.is_null() {
+        *cached_io
+    } else {
+        std::ptr::null_mut()
+    };
+    if cached.is_null() {
+        cached = crate::pg_statement::rust_stmt_create(exec_conn, orig_sql, p_stmt);
+        if !cached.is_null() {
+            let c = &mut *cached;
+            c.is_pg = 1;
+            c.is_cached = 1;
+            c.write_executed = 1;
+            crate::pg_statement::rust_cached_stmt_register(p_stmt as usize, cached as usize);
+        }
+        if !cached_io.is_null() {
+            *cached_io = cached;
+        }
+    } else {
+        let c = &mut *cached;
+        c.write_executed = 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::guide_writer::tests::{scratch, DIR, GUIDE, SCHEMA};
+    use crate::guide_writer::{test_connection, with_writer_file};
+
+    /// As on the prepared path (write_exec's test): a held guide write is
+    /// DONE with nothing changed on both connections and never reaches the
+    /// test's connection, which has no PostgreSQL behind it.
+    #[test]
+    fn a_held_cached_guide_write_is_done_and_never_sent() {
+        let path = scratch("cached-write");
+        let exec_conn = test_connection(&format!("{DIR}/{GUIDE}"));
+        let changes_conn = test_connection(&format!("{DIR}/{GUIDE}"));
+        let sql = CString::new("DELETE FROM metadata_items WHERE id=7").unwrap();
+        let step = |cached: &mut *mut PgStmt| {
+            let mut conn_error = -1;
+            let rc = rust_step_cached_write_execute_and_finalize(
+                cached,
+                std::ptr::null_mut(),
+                changes_conn,
+                exec_conn,
+                sql.as_ptr(),
+                sql.as_ptr(),
+                &mut conn_error,
+            );
+            (rc, conn_error)
+        };
+
+        std::fs::write(&path, "").unwrap();
+        with_writer_file(Some(&path), || unsafe {
+            let mut cached = crate::pg_statement::rust_stmt_create(
+                std::ptr::null_mut(),
+                sql.as_ptr(),
+                std::ptr::null_mut(),
+            );
+            (*exec_conn).last_changes = 4;
+            (*changes_conn).last_changes = 4;
+            assert_eq!(step(&mut cached), (STEP_RESULT_DONE, 0));
+            assert_eq!((*cached).write_executed, 1);
+            assert_eq!((*exec_conn).last_changes, 0);
+            assert_eq!((*changes_conn).last_changes, 0);
+            crate::pg_statement::rust_stmt_unref(cached);
+        });
+
+        std::fs::write(&path, format!("{SCHEMA}\n")).unwrap();
+        with_writer_file(Some(&path), || unsafe {
+            let mut cached = crate::pg_statement::rust_stmt_create(
+                std::ptr::null_mut(),
+                sql.as_ptr(),
+                std::ptr::null_mut(),
+            );
+            assert_eq!(step(&mut cached), (STEP_RESULT_ERROR, 1), "allowed: sent");
+            assert_eq!((*cached).write_executed, 0);
+            crate::pg_statement::rust_stmt_unref(cached);
+        });
+        for c in [exec_conn, changes_conn] {
+            unsafe { libc::free(c as *mut c_void) };
+        }
     }
 }

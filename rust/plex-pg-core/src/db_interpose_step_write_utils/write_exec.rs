@@ -12,6 +12,18 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
         if !pg_conn_error_out.is_null() {
             *pg_conn_error_out = 0;
         }
+        let _metadata =
+            crate::pg_client::registry_api::MetadataGuard::for_statement(pg_stmt, exec_conn);
+        // A guide write this PMS may not make is held: never sent, and
+        // answered as a write that ran and changed nothing, a RETURNING of
+        // PMS's own with no row (`guide_writer`). Decided before the
+        // connection is looked at, since a held write never uses it.
+        if !pg_stmt.is_null()
+            && crate::guide_writer::hold_write(exec_conn, std::ptr::null_mut(), (*pg_stmt).sql)
+        {
+            (*pg_stmt).write_executed = 1;
+            return STEP_RESULT_DONE;
+        }
         if pg_stmt.is_null() || exec_conn.is_null() || (&*exec_conn).conn.is_null() {
             if !pg_stmt.is_null() {
                 let s = &mut *pg_stmt;
@@ -22,8 +34,6 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
             }
             return STEP_RESULT_ERROR;
         }
-        let _metadata =
-            crate::pg_client::registry_api::MetadataGuard::for_statement(pg_stmt, exec_conn);
         let stmt = &mut *pg_stmt;
         // Decided before the connection's mutex is taken: the transaction
         // registry has its own lock, never held with a connection's.
@@ -331,6 +341,60 @@ mod tests {
             0
         ));
         assert!(!plex_reads_returning_rows(UPSERT, PGRES_COMMAND_OK, 0));
+    }
+
+    /// A held guide write never reaches its connection: the test's has no
+    /// PostgreSQL behind it, so a write sent there fails as a lost
+    /// connection, and the held one answers SQLITE_DONE with the row the
+    /// INSERT lists as its change.
+    #[test]
+    fn a_held_guide_write_is_done_and_never_sent() {
+        use crate::guide_writer::tests::{scratch, DIR, GUIDE, SCHEMA};
+        use crate::guide_writer::{test_connection, with_writer_file, FIRST_HELD_ROWID};
+
+        let path = scratch("write-exec");
+        let conn = test_connection(&format!("{DIR}/{GUIDE}"));
+        let sql =
+            CString::new("INSERT INTO metadata_items (`title`) VALUES (?) RETURNING `id`").unwrap();
+        let step = |stmt: *mut PgStmt| {
+            let mut conn_error = -1;
+            let rc =
+                rust_step_write_execute_and_finalize(stmt, conn, std::ptr::null(), &mut conn_error);
+            (rc, conn_error)
+        };
+
+        std::fs::write(&path, format!("*\n-{SCHEMA}\n")).unwrap();
+        with_writer_file(Some(&path), || unsafe {
+            let stmt = crate::pg_statement::rust_stmt_create(
+                std::ptr::null_mut(),
+                sql.as_ptr(),
+                std::ptr::null_mut(),
+            );
+            (*conn).last_changes = 9;
+            assert_eq!(step(stmt), (STEP_RESULT_DONE, 0), "held: DONE, no row");
+            assert_eq!((*stmt).write_executed, 1, "the next step is DONE too");
+            assert!((*stmt).result.is_null(), "no row to read");
+            assert_eq!((*conn).last_changes, 1);
+            let rowid = (*conn).last_insert_rowid;
+            assert!(rowid > 0 && rowid <= FIRST_HELD_ROWID, "synthetic: {rowid}");
+            crate::pg_statement::rust_stmt_unref(stmt);
+        });
+
+        std::fs::write(&path, format!("{SCHEMA}\n")).unwrap();
+        with_writer_file(Some(&path), || {
+            let stmt = crate::pg_statement::rust_stmt_create(
+                std::ptr::null_mut(),
+                sql.as_ptr(),
+                std::ptr::null_mut(),
+            );
+            assert_eq!(
+                step(stmt),
+                (STEP_RESULT_ERROR, 1),
+                "allowed: sent to its connection, which is not there"
+            );
+            crate::pg_statement::rust_stmt_unref(stmt);
+        });
+        unsafe { libc::free(conn as *mut c_void) };
     }
 }
 

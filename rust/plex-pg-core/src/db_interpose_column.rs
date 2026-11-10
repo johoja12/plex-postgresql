@@ -588,7 +588,6 @@ mod tests {
     fn uri_text_has_consistent_blob_text_and_bytes_in_both_result_paths() {
         use super::rust_my_sqlite3_column_blob;
         let original = "server://m/com.plexapp.plugins.library/library/sections/2/all?type=2";
-        let rewritten = "library:///directory/%2Flibrary%2Fsections%2F2%2Fall%3Ftype%3D2";
         for cached_path in [false, true] {
             for bytes_first in [false, true] {
                 for oid in [25_u32, 17_u32] {
@@ -616,7 +615,7 @@ mod tests {
                         }
                     }
                     rust_stmt_register(shadow as usize, stmt as usize);
-                    let expected = if oid == 17 { original } else { rewritten };
+                    let expected = original;
                     if bytes_first { assert_eq!(rust_my_sqlite3_column_bytes(shadow, 0) as usize, expected.len()); }
                     let blob = rust_my_sqlite3_column_blob(shadow, 0);
                     assert!(!blob.is_null());
