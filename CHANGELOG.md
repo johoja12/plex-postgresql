@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.54 (2026-11-10)
+
+- `PLEX_PG_GUIDE_WRITER_FILE` gives the Live TV guides one writer (`guide_writer.rs`; cluster-plex's `docs/superpowers/specs/2026-11-10-guide-writer-and-built-cloud-guide-design.md`, plan A). Every PMS refreshes a cloud guide at its start and on its own 24-hour timer, and purges ended airings, against the one schema per guide the pods share; a refresh is not atomic, so two at once leave holes or doubled airings (the kind rig, 2026-11-09). With the variable set, a write (`INSERT`, `UPDATE`, `DELETE`, `REPLACE`, DDL) on a guide's own connection runs only when the file allows the guide's schema: lines `*`, `epg_<uuid>` and `-epg_<uuid>` (a deny wins); an absent or empty file allows none. A write not allowed is held, not refused: never sent, `SQLITE_DONE` with `changes()` 0, a synthetic `last_insert_rowid` counting down from 2^62, no row for PMS's own `RETURNING`, `SQLITE_OK` from `sqlite3_exec`. A refused statement kills PMS's loader and leaves a ghost activity (2026-11-04). The file is re-read when its mtime, size or inode changes, stat-ed at most once a second; transaction control and reads pass; a load file is never gated (the manager gates loads). Unset, nothing changes.
+
 ### v1.3.17-clusterplex.53 (2026-11-05)
 
 - A guide load's sequence resync (`.50`) runs in a savepoint of its own (`plex_pg_resync`) when PMS's transaction is open, so a refused resync -- a table with no `id` column, a table the clone lacks -- is rolled back to the savepoint and logged, and the load goes on; until now a refusal would have aborted PMS's transaction, which the statement savepoints no longer prevent since `.51` turned them off, and PMS would have failed the load. The sequence lookup uses `to_regclass`, so only the `max(id)` read can refuse. Proven on the rig's PostgreSQL. `.52` is reserved for a peer session.
