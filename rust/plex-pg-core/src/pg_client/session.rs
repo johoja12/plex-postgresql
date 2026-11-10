@@ -93,7 +93,42 @@ pub(super) fn exec_tuples(pg_conn: *mut PGconn, sql: &str) -> bool {
     ok
 }
 
-pub(super) fn apply_session_settings(pg_conn: *mut PGconn, schema: &str, deallocate_all: bool) {
+/// The statement timeout a library connection's session starts with. A
+/// pooled library connection is reset to the library's five minutes before
+/// each read (`prepared_send.rs`).
+pub(super) const SESSION_STATEMENT_TIMEOUT_SQL: &str = "SET statement_timeout = '60s'";
+
+/// The statement timeout a connection's session starts with: none for a Live
+/// TV guide's own connection (or a load's), [`SESSION_STATEMENT_TIMEOUT_SQL`]
+/// for every other.
+///
+/// A guide's reads skip the per-read reset since `.51`, so what is set here
+/// is what every statement on a guide's connection runs under. Until `.56`
+/// this set sixty seconds on a guide's connection too, and `.51` had read
+/// `.46`'s per-read "no timeout" as set at connect: PMS's guide refresh
+/// streams the whole guide it holds through one SELECT for about six minutes
+/// on talos (248 channels), PostgreSQL cancelled it at sixty seconds
+/// ("canceling statement due to statement timeout", 2026-11-09 22:51Z and
+/// 2026-11-10 07:58Z), PMS's loader died with an uncaught exception, its
+/// "Refreshing guide data" activity sat at 0% until the next restart, and no
+/// refresh completed after `.53` reached talos.
+pub(super) fn session_statement_timeout_sql(guide: bool) -> &'static str {
+    if guide {
+        crate::db_interpose_conn_utils::GUIDE_STATEMENT_TIMEOUT_SQL
+    } else {
+        SESSION_STATEMENT_TIMEOUT_SQL
+    }
+}
+
+/// Sets a fresh or reset connection's session up: `schema` first on the
+/// search path, and the statement timeout for a guide's connection (`guide`)
+/// or a library's ([`session_statement_timeout_sql`]).
+pub(super) fn apply_session_settings(
+    pg_conn: *mut PGconn,
+    schema: &str,
+    deallocate_all: bool,
+    guide: bool,
+) {
     if pg_conn.is_null() {
         return;
     }
@@ -126,7 +161,7 @@ pub(super) fn apply_session_settings(pg_conn: *mut PGconn, schema: &str, dealloc
         let _ = exec_command(pg_conn, "DEALLOCATE ALL");
     }
 
-    if !exec_command(pg_conn, "SET statement_timeout = '60s'") {
+    if !exec_command(pg_conn, session_statement_timeout_sql(guide)) {
         log_error("Failed to set statement_timeout");
     }
 }

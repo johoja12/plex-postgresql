@@ -149,7 +149,7 @@ pub(super) fn create_pool_connection(db_path: *const c_char) -> *mut c_void {
         conn.conn = std::ptr::null_mut();
     } else {
         pg_set_socket_timeout(conn.conn);
-        apply_session_settings(conn.conn, &cfg.schema, true);
+        apply_session_settings(conn.conn, &cfg.schema, true, false);
         conn.is_pg_active = 1;
         // Only publish the pointer after libpq connect + session setup has
         // succeeded. During startup Plex opens many DB handles in parallel;
@@ -230,7 +230,7 @@ pub(super) fn reset_conn(conn: *mut c_void) -> bool {
     }
     pg_set_socket_timeout(conn.conn);
     let cfg = conn_config();
-    apply_session_settings(conn.conn, &cfg.schema, false);
+    apply_session_settings(conn.conn, &cfg.schema, false, false);
     true
 }
 
@@ -258,7 +258,7 @@ pub(super) fn reconnect_conn(raw_conn: *mut c_void) -> bool {
     let new_pg = rust_pq_connectdb(conninfo_c.as_ptr());
     if rust_pq_status(new_pg) == CONNECTION_OK {
         pg_set_socket_timeout(new_pg);
-        apply_session_settings(new_pg, &cfg.schema, false);
+        apply_session_settings(new_pg, &cfg.schema, false, false);
         conn.conn = new_pg;
         conn.is_pg_active = 1;
         return true;
@@ -368,17 +368,22 @@ pub extern "C" fn rust_pg_connect(
         }
         log_info_lazy!("PostgreSQL connected for: {}", db_path_str);
         pg_set_socket_timeout(conn.conn);
-        apply_session_settings(conn.conn, &handle_schema(db_path_str, cfg), false);
+        let (schema, guide) = handle_session(db_path_str, &cfg.schema);
+        apply_session_settings(conn.conn, &schema, false, guide);
         conn.is_pg_active = 1;
     }
 
     conn_ptr
 }
 
-/// The schema a handle's own connection runs in: a Live TV guide's, or the
-/// library's for every other database.
-fn handle_schema(db_path: &str, cfg: &ConnConfig) -> String {
-    crate::db_interpose_helpers::epg_schema_for_path(db_path).unwrap_or_else(|| cfg.schema.clone())
+/// The schema a handle's own connection runs in -- a Live TV guide's (or a
+/// load's), else `library_schema` -- and whether it is a guide's, whose
+/// session runs with no statement timeout (`session_statement_timeout_sql`).
+pub(super) fn handle_session(db_path: &str, library_schema: &str) -> (String, bool) {
+    match crate::db_interpose_helpers::epg_schema_for_path(db_path) {
+        Some(schema) => (schema, true),
+        None => (library_schema.to_string(), false),
+    }
 }
 
 /// Whether `schema` exists. Only called with an `epg_<hex>` name, which
@@ -449,7 +454,8 @@ pub extern "C" fn rust_pg_ensure_connection(conn_ptr: *mut PgConnection) -> i32 
 
     log_info("PostgreSQL reconnected successfully");
     pg_set_socket_timeout(conn.conn);
-    apply_session_settings(conn.conn, &handle_schema(&conn_db_path(conn), cfg), false);
+    let (schema, guide) = handle_session(&conn_db_path(conn), &cfg.schema);
+    apply_session_settings(conn.conn, &schema, false, guide);
     conn.is_pg_active = 1;
     unsafe { conn_guard.unlock() };
     1
