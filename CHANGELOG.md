@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v1.3.17-clusterplex.55 (2026-11-10)
+
+- A held guide write answers as a write that ran (`guide_writer.rs`): an INSERT's synthetic `last_insert_rowid` counts down from 2^31-1, and `changes()` is what the statement would have changed by its own text (`held_changes`: one per row an INSERT or REPLACE lists, one for an UPDATE, none for a DELETE or DDL). `.54` started the ids at 2^62, whose low 32 bits are zero, and answered 0 changes for everything; on the kind rig PMS's incremental cloud refresh died at its first held write (an INSERT into `tags`) the moment it read that id back -- "Uncaught exception running async task ... std::exception" -- and its "Refreshing guide data" activity stayed at 0% until PMS restarted. Under `.55` the same refresh ran all seven steps (197 s) and the guide's rows were unchanged.
+
 ### v1.3.17-clusterplex.54 (2026-11-10)
 
 - `PLEX_PG_GUIDE_WRITER_FILE` gives the Live TV guides one writer (`guide_writer.rs`; cluster-plex's `docs/superpowers/specs/2026-11-10-guide-writer-and-built-cloud-guide-design.md`, plan A). Every PMS refreshes a cloud guide at its start and on its own 24-hour timer, and purges ended airings, against the one schema per guide the pods share; a refresh is not atomic, so two at once leave holes or doubled airings (the kind rig, 2026-11-09). With the variable set, a write (`INSERT`, `UPDATE`, `DELETE`, `REPLACE`, DDL) on a guide's own connection runs only when the file allows the guide's schema: lines `*`, `epg_<uuid>` and `-epg_<uuid>` (a deny wins); an absent or empty file allows none. A write not allowed is held, not refused: never sent, `SQLITE_DONE` with `changes()` 0, a synthetic `last_insert_rowid` counting down from 2^62, no row for PMS's own `RETURNING`, `SQLITE_OK` from `sqlite3_exec`. A refused statement kills PMS's loader and leaves a ghost activity (2026-11-04). The file is re-read when its mtime, size or inode changes, stat-ed at most once a second; transaction control and reads pass; a load file is never gated (the manager gates loads). Unset, nothing changes.
