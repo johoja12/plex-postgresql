@@ -82,6 +82,16 @@ pub(crate) fn exec_via_postgres(
     arg: *mut c_void,
     errmsg: *mut *mut c_char,
 ) -> c_int {
+    // A guide write this PMS may not make is held: never sent, and answered
+    // SQLITE_OK as a write that ran and changed nothing, its rows (if any)
+    // never given to the callback (`guide_writer`). Decided before the
+    // connection is looked at, since a held write never uses it; the gate
+    // passes transaction control, which is forwarded below as always. An
+    // exec of several statements is judged by its first, as the shim's write
+    // classification judges every statement.
+    if unsafe { crate::guide_writer::hold_write(pg_conn, std::ptr::null_mut(), sql) } {
+        return SQLITE_OK;
+    }
     let pg = unsafe { &mut *pg_conn };
     unsafe {
         if pg.conn.is_null() || crate::libpq_helpers::rust_pq_status(pg.conn) != CONNECTION_OK {

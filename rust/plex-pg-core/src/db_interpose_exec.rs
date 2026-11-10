@@ -277,4 +277,46 @@ mod tests {
         assert_eq!(parse_positive_returning_rowid(zero.as_ptr()), None);
         assert_eq!(parse_positive_returning_rowid(negative.as_ptr()), None);
     }
+
+    /// A held guide write through sqlite3_exec is SQLITE_OK with nothing
+    /// changed, never reaching the test's connection (no PostgreSQL behind
+    /// it), and gives its callback no row.
+    #[test]
+    fn a_held_guide_exec_is_ok_with_nothing_changed_and_never_sent() {
+        use crate::guide_writer::tests::{scratch, DIR, GUIDE};
+        use crate::guide_writer::{test_connection, with_writer_file, FIRST_HELD_ROWID};
+        use std::os::raw::{c_char, c_int, c_void};
+
+        unsafe extern "C" fn count_rows(
+            arg: *mut c_void,
+            _: c_int,
+            _: *mut *mut c_char,
+            _: *mut *mut c_char,
+        ) -> c_int {
+            *(arg as *mut u32) += 1;
+            0
+        }
+
+        let path = scratch("exec");
+        let conn = test_connection(&format!("{DIR}/{GUIDE}"));
+        let sql = CString::new("INSERT INTO taggings (tag_id) VALUES (5) RETURNING id").unwrap();
+        let mut rows = 0u32;
+        with_writer_file(Some(&path), || unsafe {
+            (*conn).last_changes = 2;
+            let rc = super::pg_path::exec_via_postgres(
+                conn,
+                std::ptr::null_mut(),
+                sql.as_ptr(),
+                Some(count_rows),
+                &mut rows as *mut u32 as *mut c_void,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(rc, super::SQLITE_OK);
+            assert_eq!(rows, 0);
+            assert_eq!((*conn).last_changes, 0);
+            let rowid = (*conn).last_insert_rowid;
+            assert!(rowid > 0 && rowid <= FIRST_HELD_ROWID, "synthetic: {rowid}");
+        });
+        unsafe { libc::free(conn as *mut c_void) };
+    }
 }
