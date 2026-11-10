@@ -25,11 +25,12 @@
 //! half done holds that second's writes.
 //!
 //! A write the file does not allow is held, not refused: it is not sent to
-//! PostgreSQL, and PMS is told it ran and changed nothing -- the step answers
-//! SQLITE_DONE (a RETURNING of PMS's own answers no row), `changes()` is 0,
-//! and an INSERT's `last_insert_rowid` is a synthetic id, unique in the
-//! process, so PMS's in-memory maps keep distinct keys for the rows it
-//! believes it inserted. A refused statement kills PMS's guide loader: the
+//! PostgreSQL, and PMS is told it ran -- the step answers SQLITE_DONE (a
+//! RETURNING of PMS's own answers no row), `changes()` what the write would
+//! have changed by its own text (`held_changes`), and an INSERT's
+//! `last_insert_rowid` is a synthetic id under 2^31, unique in the process,
+//! so PMS's in-memory maps keep distinct keys for the rows it believes it
+//! inserted. A refused statement kills PMS's guide loader: the
 //! statement timeout of 2026-11-04 did, left a ghost "Refreshing guide data"
 //! activity until PMS restarted, and PMS retried every five minutes.
 //!
@@ -61,8 +62,17 @@ pub const RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The first synthetic row id a held INSERT answers; each next one is one
 /// lower. Far above any id a guide's sequences will reach, so a later read
-/// or write by such an id matches nothing.
-pub const FIRST_HELD_ROWID: i64 = 1 << 62;
+/// or write by such an id matches nothing, and positive at every integer
+/// width PMS keeps an id in: `.54` started at 2^62, whose low 32 bits are
+/// zero, and PMS's cloud refresh died at its first held INSERT (a tag) with
+/// "Uncaught exception running async task" the moment it read that id back
+/// (the kind rig, 2026-11-10), leaving its "Refreshing guide data" activity
+/// behind until PMS restarted.
+pub const FIRST_HELD_ROWID: i64 = i32::MAX as i64;
+
+/// Below this the synthetic ids start again from `FIRST_HELD_ROWID`: a
+/// billion held INSERTs in one process, never reached in practice.
+const LAST_HELD_ROWID: i64 = 1 << 30;
 
 /// What the file allows, parsed.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -314,9 +324,86 @@ pub(crate) fn inserts_row(sql: &str) -> bool {
 }
 
 /// The next synthetic row id: unique in the process, counting down from
-/// `FIRST_HELD_ROWID`.
+/// `FIRST_HELD_ROWID` to `LAST_HELD_ROWID`.
 pub(crate) fn next_held_rowid() -> i64 {
-    NEXT_HELD_ROWID.fetch_sub(1, Ordering::Relaxed)
+    let mut id = NEXT_HELD_ROWID.fetch_sub(1, Ordering::Relaxed);
+    while id < LAST_HELD_ROWID {
+        // Whoever crosses the floor first starts the count again.
+        let _ = NEXT_HELD_ROWID.compare_exchange(
+            id - 1,
+            FIRST_HELD_ROWID,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        id = NEXT_HELD_ROWID.fetch_sub(1, Ordering::Relaxed);
+    }
+    id
+}
+
+/// The rows a held write reports changed (`sqlite3_changes`), as the write
+/// would have run: an INSERT or a REPLACE one per row it lists (one for
+/// `INSERT ... SELECT` or `DEFAULT VALUES`), an UPDATE one, since PMS
+/// updates rows it has read; a DELETE and DDL none, so no "delete until
+/// nothing is left" loop can spin on a held one. `.54` answered 0 for all.
+pub(crate) fn held_changes(sql: &str) -> i32 {
+    let head = sql.trim_start().as_bytes();
+    let starts =
+        |word: &[u8]| head.len() >= word.len() && head[..word.len()].eq_ignore_ascii_case(word);
+    if inserts_row(sql) {
+        values_rows(sql).max(1)
+    } else if starts(b"update") {
+        1
+    } else {
+        0
+    }
+}
+
+/// How many row tuples an INSERT's top-level VALUES lists, 0 without one.
+/// Quoted text and nested parentheses are skipped.
+fn values_rows(sql: &str) -> i32 {
+    let b = sql.as_bytes();
+    let (mut i, mut depth, mut rows, mut in_values) = (0, 0i32, 0i32, false);
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            b'\'' | b'"' | b'`' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == c {
+                        if i + 1 < b.len() && b[i + 1] == c {
+                            i += 1; // a doubled quote
+                        } else {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => {
+                if depth == 0 && in_values {
+                    rows += 1;
+                }
+                depth += 1;
+            }
+            b')' => depth -= 1,
+            _ if depth == 0 && c.is_ascii_alphabetic() => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                let word = &sql[start..i];
+                if in_values {
+                    return rows; // ON CONFLICT, RETURNING: the list ended
+                }
+                in_values = word.eq_ignore_ascii_case("values");
+                continue;
+            }
+            b';' if depth == 0 => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    rows
 }
 
 /// Whether the write `sql` about to run on `conn` is held: the variable is
@@ -350,14 +437,14 @@ pub(crate) unsafe fn holds(conn: *const PgConnection, sql: *const c_char) -> boo
     hold
 }
 
-/// Records a held write the way a write that ran and changed nothing is
-/// recorded: `changes()` 0 and, for an INSERT or REPLACE, a synthetic
+/// Records a held write the way a write that ran is recorded: `changes()`
+/// as `held_changes` says and, for an INSERT or REPLACE, a synthetic
 /// `last_insert_rowid` (on the connection, which is what PMS asks, and as
 /// the process's last inserted id, as `write_exec` keeps it) with the
 /// failed-insert flag cleared. The connection's last error is left as a
 /// write that ran leaves it; the step clears it after SQLITE_DONE.
-pub(crate) fn note_held_write(conn: &mut PgConnection, rowid: Option<i64>) {
-    conn.last_changes = 0;
+pub(crate) fn note_held_write(conn: &mut PgConnection, rowid: Option<i64>, changes: i32) {
+    conn.last_changes = changes;
     if let Some(rowid) = rowid {
         conn.last_insert_rowid = rowid;
         conn.last_insert_failed.store(0, Ordering::Release);
@@ -383,10 +470,12 @@ pub(crate) unsafe fn hold_write(
     if !holds(conn, sql) {
         return false;
     }
-    let rowid = inserts_row(cstr_to_str_or_empty(sql)).then(next_held_rowid);
-    note_held_write(&mut *conn, rowid);
+    let text = cstr_to_str_or_empty(sql);
+    let rowid = inserts_row(text).then(next_held_rowid);
+    let changes = held_changes(text);
+    note_held_write(&mut *conn, rowid, changes);
     if !changes_conn.is_null() && changes_conn != conn {
-        note_held_write(&mut *changes_conn, rowid);
+        note_held_write(&mut *changes_conn, rowid, changes);
     }
     true
 }
@@ -406,19 +495,25 @@ pub(crate) fn with_writer_file<T>(file: Option<&Path>, f: impl FnOnce() -> T) ->
     let _guard = crate::test_utils::env_lock()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let prev = std::env::var(GUIDE_WRITER_FILE_ENV).ok();
+    // Restores the variable however `f` ends: a test that panicked inside
+    // left it set, and nine unrelated tests failed after it.
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var(GUIDE_WRITER_FILE_ENV, v),
+                None => std::env::remove_var(GUIDE_WRITER_FILE_ENV),
+            }
+            reset_for_tests();
+        }
+    }
+    let _restore = Restore(std::env::var(GUIDE_WRITER_FILE_ENV).ok());
     match file {
         Some(file) => std::env::set_var(GUIDE_WRITER_FILE_ENV, file),
         None => std::env::remove_var(GUIDE_WRITER_FILE_ENV),
     }
     reset_for_tests();
-    let out = f();
-    match prev {
-        Some(v) => std::env::set_var(GUIDE_WRITER_FILE_ENV, v),
-        None => std::env::remove_var(GUIDE_WRITER_FILE_ENV),
-    }
-    reset_for_tests();
-    out
+    f()
 }
 
 /// A zeroed `PgConnection` whose database is `path`, for the tests; free it
@@ -561,6 +656,37 @@ pub(crate) mod tests {
         assert!(!inserts_row("UPDATE t SET a=?"));
         assert!(!inserts_row("DELETE FROM t"));
         assert!(!inserts_row("ins"));
+    }
+
+    #[test]
+    fn a_held_write_reports_the_rows_it_would_have_changed() {
+        assert_eq!(
+            held_changes("INSERT INTO tags (tag, tag_type) VALUES (?, ?)"),
+            1
+        );
+        assert_eq!(held_changes("insert into t (a) values (1), (2),(3)"), 3);
+        assert_eq!(
+            held_changes("INSERT INTO t (a, b) VALUES ('x), (y', (1)), (\"a\"\"(\", `b`) ON CONFLICT (a) DO NOTHING"),
+            2,
+            "quoted text and nested parentheses are not rows"
+        );
+        assert_eq!(held_changes("INSERT INTO t (a) VALUES (?) RETURNING id"), 1);
+        assert_eq!(held_changes("INSERT INTO t SELECT * FROM u"), 1);
+        assert_eq!(held_changes("INSERT INTO t DEFAULT VALUES"), 1);
+        assert_eq!(held_changes("REPLACE INTO t (a) VALUES (?)"), 1);
+        assert_eq!(held_changes("UPDATE t SET a = ? WHERE id = ?"), 1);
+        assert_eq!(held_changes("DELETE FROM t WHERE id = ?"), 0);
+        assert_eq!(held_changes("CREATE INDEX i ON t (a)"), 0);
+    }
+
+    /// PMS keeps an id in a 32-bit integer somewhere on its refresh path:
+    /// `.54`'s 2^62 read as 0 there and killed the refresh (2026-11-10).
+    #[test]
+    fn a_synthetic_row_id_is_positive_at_32_bits() {
+        let id = next_held_rowid();
+        assert!(id > 0 && id <= i64::from(i32::MAX));
+        assert!((id as i32) > 0, "{id} truncates to {}", id as i32);
+        assert!(id > 1 << 30, "far above any guide's ids");
     }
 
     #[test]
@@ -753,7 +879,7 @@ pub(crate) mod tests {
             (*guide).last_insert_rowid = 42;
             (*guide).last_insert_failed.store(1, Ordering::Release);
             assert!(hold_write(guide, std::ptr::null_mut(), insert.as_ptr()));
-            assert_eq!((*guide).last_changes, 0);
+            assert_eq!((*guide).last_changes, 1, "an INSERT reports its row");
             let rowid = (*guide).last_insert_rowid;
             assert!(
                 rowid > 42 && rowid <= FIRST_HELD_ROWID,
@@ -765,9 +891,9 @@ pub(crate) mod tests {
             (*guide).last_changes = 3;
             (*library).last_changes = 5;
             assert!(hold_write(guide, library, update.as_ptr()));
-            assert_eq!((*guide).last_changes, 0);
+            assert_eq!((*guide).last_changes, 1);
             assert_eq!((*guide).last_insert_rowid, rowid);
-            assert_eq!((*library).last_changes, 0, "and on changes() connection");
+            assert_eq!((*library).last_changes, 1, "and on changes() connection");
 
             assert_eq!(held_writes(SCHEMA), 3);
         });

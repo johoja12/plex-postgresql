@@ -323,9 +323,10 @@ mod tests {
 
     /// A held guide write never reaches its connection: the test's has no
     /// PostgreSQL behind it, so a write sent there fails as a lost
-    /// connection, and the held one answers SQLITE_DONE with nothing changed.
+    /// connection, and the held one answers SQLITE_DONE with the row the
+    /// INSERT lists as its change.
     #[test]
-    fn a_held_guide_write_is_done_with_nothing_changed_and_never_sent() {
+    fn a_held_guide_write_is_done_and_never_sent() {
         use crate::guide_writer::tests::{scratch, DIR, GUIDE, SCHEMA};
         use crate::guide_writer::{test_connection, with_writer_file, FIRST_HELD_ROWID};
 
@@ -351,7 +352,7 @@ mod tests {
             assert_eq!(step(stmt), (STEP_RESULT_DONE, 0), "held: DONE, no row");
             assert_eq!((*stmt).write_executed, 1, "the next step is DONE too");
             assert!((*stmt).result.is_null(), "no row to read");
-            assert_eq!((*conn).last_changes, 0);
+            assert_eq!((*conn).last_changes, 1);
             let rowid = (*conn).last_insert_rowid;
             assert!(rowid > 0 && rowid <= FIRST_HELD_ROWID, "synthetic: {rowid}");
             crate::pg_statement::rust_stmt_unref(stmt);

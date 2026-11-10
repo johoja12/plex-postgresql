@@ -278,11 +278,11 @@ mod tests {
         assert_eq!(parse_positive_returning_rowid(negative.as_ptr()), None);
     }
 
-    /// A held guide write through sqlite3_exec is SQLITE_OK with nothing
-    /// changed, never reaching the test's connection (no PostgreSQL behind
+    /// A held guide write through sqlite3_exec is SQLITE_OK, reports the row
+    /// it lists, never reaches the test's connection (no PostgreSQL behind
     /// it), and gives its callback no row.
     #[test]
-    fn a_held_guide_exec_is_ok_with_nothing_changed_and_never_sent() {
+    fn a_held_guide_exec_is_ok_and_never_sent() {
         use crate::guide_writer::tests::{scratch, DIR, GUIDE};
         use crate::guide_writer::{test_connection, with_writer_file, FIRST_HELD_ROWID};
         use std::os::raw::{c_char, c_int, c_void};
@@ -313,7 +313,7 @@ mod tests {
             );
             assert_eq!(rc, super::SQLITE_OK);
             assert_eq!(rows, 0);
-            assert_eq!((*conn).last_changes, 0);
+            assert_eq!((*conn).last_changes, 1, "the row the INSERT lists");
             let rowid = (*conn).last_insert_rowid;
             assert!(rowid > 0 && rowid <= FIRST_HELD_ROWID, "synthetic: {rowid}");
         });
