@@ -1,64 +1,6 @@
 use super::*;
 use crate::byte_utils::push_utf8_byte;
 
-pub(super) fn rewrite_server_library_uri_bytes(
-    input_bytes: &[u8],
-    out_cap: usize,
-) -> Option<Vec<u8>> {
-    const SERVER_PREFIX: &[u8] = b"server://";
-    const NEEDLE: &[u8] = b"/com.plexapp.plugins.library/library/";
-    const REPLACEMENT: &[u8] = b"library://";
-
-    if find_subslice(input_bytes, SERVER_PREFIX).is_none()
-        || find_subslice(input_bytes, NEEDLE).is_none()
-    {
-        return None;
-    }
-
-    let mut out_buf = Vec::with_capacity(input_bytes.len().min(out_cap));
-    let mut in_pos = 0usize;
-    let mut rewrites = 0;
-
-    while in_pos < input_bytes.len() {
-        if out_buf.len() >= out_cap {
-            break;
-        }
-        let slice = &input_bytes[in_pos..];
-        let Some(rel_match) = find_subslice(slice, SERVER_PREFIX) else {
-            push_capped(&mut out_buf, out_cap, slice);
-            break;
-        };
-        let abs_match = in_pos + rel_match;
-        push_capped(&mut out_buf, out_cap, &input_bytes[in_pos..abs_match]);
-        in_pos = abs_match;
-
-        let search_start = in_pos + SERVER_PREFIX.len();
-        if search_start >= input_bytes.len() {
-            push_capped(&mut out_buf, out_cap, &input_bytes[in_pos..]);
-            break;
-        }
-
-        let tail = &input_bytes[search_start..];
-        let Some(rel_lib) = find_subslice(tail, NEEDLE) else {
-            push_capped(&mut out_buf, out_cap, &input_bytes[in_pos..search_start]);
-            in_pos = search_start;
-            continue;
-        };
-        let abs_lib = search_start + rel_lib;
-        let lib_end = abs_lib + NEEDLE.len();
-
-        push_capped(&mut out_buf, out_cap, REPLACEMENT);
-        in_pos = lib_end;
-        rewrites += 1;
-    }
-
-    if rewrites == 0 {
-        None
-    } else {
-        Some(out_buf)
-    }
-}
-
 pub(super) fn is_aggregate_alias(col: &str) -> bool {
     if col.is_empty() {
         return false;

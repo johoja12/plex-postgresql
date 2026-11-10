@@ -7,8 +7,7 @@ use std::os::raw::{c_char, c_int, c_uint, c_void};
 
 use super::{
     cstr_to_str, format_epoch_to_datetime_utc_impl, is_aggregate_alias, pg_sql_has_timestamp_hint,
-    rewrite_server_library_uri_bytes, rust_decode_hex_bytes, write_i32_to_buf, write_i64_to_buf,
-    PGresult, SQLITE_NULL_CONST,
+    rust_decode_hex_bytes, write_i32_to_buf, write_i64_to_buf, PGresult, SQLITE_NULL_CONST,
 };
 
 extern "C" {
@@ -107,16 +106,18 @@ pub fn rust_column_text_transform(
         }
     }
 
-    let out_cap = out_len.saturating_sub(1);
-    if let Some(rewritten) = rewrite_server_library_uri_bytes(bytes, out_cap) {
-        let n = rewritten.len().min(out_cap);
-        unsafe {
-            std::ptr::copy_nonoverlapping(rewritten.as_ptr(), out as *mut u8, n);
-            *out.add(n) = 0;
-        }
-        return 1;
-    }
-
+    // A `server://<machine>/com.plexapp.plugins.library/library/...` URI in
+    // a value (a smart collection's `pv:uri` in `extra_data`) reaches PMS as
+    // stored. Upstream's 0.9.23 rewrote it to `library://...` on every read,
+    // against an "LPE: only library URIs are allowed" error that PMS 1.43.5
+    // no longer has; PMS converts the server URI itself, to
+    // `library://x/directory/<encoded path>`, and the rewritten form is one it
+    // refuses: every start's `29DatabaseFixupsSyncCollections` logged "LPE:
+    // caller provided arguments in top-level url instead of in encoded path"
+    // and "Failed to generate a query from uri library://sections/1/all?..."
+    // for each smart collection, the API listed that form as its `content`,
+    // and an edit from Plex Web saved it for good (talos, 2026-11-10; the same
+    // errors reproduced on a stock PMS 1.43.5 given the rewritten URI).
     0
 }
 

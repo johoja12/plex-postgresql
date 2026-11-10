@@ -50,174 +50,6 @@ fn validate_utf8_rejects_invalid_input() {
 }
 
 #[test]
-fn rewrite_server_uri_rewrites_expected_prefix() {
-    let input = CString::new("server://machine/com.plexapp.plugins.library/library/metadata/123")
-        .expect("valid c string");
-    let mut out = [0 as c_char; 256];
-
-    assert_eq!(
-        rust_rewrite_server_library_uri(input.as_ptr(), out.as_mut_ptr(), out.len()),
-        1
-    );
-
-    let rewritten = unsafe { CStr::from_ptr(out.as_ptr()) }
-        .to_str()
-        .expect("utf8 output");
-    assert_eq!(rewritten, "library://metadata/123");
-}
-
-#[test]
-fn rewrite_server_uri_handles_multiple_matches() {
-    let input = CString::new(
-        "a=server://m1/com.plexapp.plugins.library/library/one;b=server://m2/com.plexapp.plugins.library/library/two",
-    )
-    .expect("valid c string");
-    let mut out = [0 as c_char; 256];
-
-    assert_eq!(
-        rust_rewrite_server_library_uri(input.as_ptr(), out.as_mut_ptr(), out.len()),
-        1
-    );
-
-    let rewritten = unsafe { CStr::from_ptr(out.as_ptr()) }
-        .to_str()
-        .expect("utf8 output");
-    assert_eq!(rewritten, "a=library://one;b=library://two");
-}
-
-fn rewrite_with_buf(input: &str, out_len: usize) -> (i32, String) {
-    let input = CString::new(input).expect("valid c string");
-    let mut out = vec![0 as c_char; out_len];
-    let ok = rust_rewrite_server_library_uri(input.as_ptr(), out.as_mut_ptr(), out.len());
-    let rewritten = unsafe { CStr::from_ptr(out.as_ptr()) }
-        .to_str()
-        .unwrap_or("")
-        .to_string();
-    (ok, rewritten)
-}
-
-#[test]
-fn rewrite_server_uri_standalone() {
-    let (ok, out) = rewrite_with_buf(
-        "server://71b2873061a562bf7541852f9a43087e88a63f9a/com.plexapp.plugins.library/library/sections/2/all?type=2",
-        512,
-    );
-    assert_eq!(ok, 1);
-    assert_eq!(out, "library://sections/2/all?type=2");
-}
-
-#[test]
-fn rewrite_server_uri_json_embedded() {
-    let (ok, out) = rewrite_with_buf(
-        "{\"at:childCount\":\"1\",\"at:smart\":\"1\",\"pv:uri\":\"server://71b2873061a562bf7541852f9a43087e88a63f9a/com.plexapp.plugins.library/library/sections/2/all?type=2&sort=date\"}",
-        1024,
-    );
-    assert_eq!(ok, 1);
-    assert_eq!(
-        out,
-        "{\"at:childCount\":\"1\",\"at:smart\":\"1\",\"pv:uri\":\"library://sections/2/all?type=2&sort=date\"}"
-    );
-}
-
-#[test]
-fn rewrite_server_uri_no_server_prefix() {
-    let (ok, out) = rewrite_with_buf("library://sections/1/all", 256);
-    assert_eq!(ok, 0);
-    assert!(out.is_empty());
-}
-
-#[test]
-fn rewrite_server_uri_no_plugin_path() {
-    let (ok, out) = rewrite_with_buf("server://abc123/some/other/path", 256);
-    assert_eq!(ok, 0);
-    assert!(out.is_empty());
-}
-
-#[test]
-fn rewrite_server_uri_empty_string() {
-    let (ok, out) = rewrite_with_buf("", 64);
-    assert_eq!(ok, 0);
-    assert!(out.is_empty());
-}
-
-#[test]
-fn rewrite_server_uri_null_input() {
-    let mut out = [0 as c_char; 64];
-    let ok = rust_rewrite_server_library_uri(std::ptr::null(), out.as_mut_ptr(), out.len());
-    assert_eq!(ok, 0);
-}
-
-#[test]
-fn rewrite_server_uri_plain_text() {
-    let (ok, out) = rewrite_with_buf(
-        "{\"at:childCount\":\"5\",\"pv:thumbBlurHash\":\"abc123\"}",
-        256,
-    );
-    assert_eq!(ok, 0);
-    assert!(out.is_empty());
-}
-
-#[test]
-fn rewrite_server_uri_multiple_in_json() {
-    let (ok, out) = rewrite_with_buf(
-        "{\"uri1\":\"server://aaa/com.plexapp.plugins.library/library/sections/1/all\",\"uri2\":\"server://aaa/com.plexapp.plugins.library/library/sections/2/all\"}",
-        2048,
-    );
-    assert_eq!(ok, 1);
-    assert_eq!(
-        out,
-        "{\"uri1\":\"library://sections/1/all\",\"uri2\":\"library://sections/2/all\"}"
-    );
-}
-
-#[test]
-fn rewrite_server_uri_output_shorter() {
-    let input = "server://71b2873061a562bf7541852f9a43087e88a63f9a/com.plexapp.plugins.library/library/sections/2/all";
-    let (ok, out) = rewrite_with_buf(input, 512);
-    assert_eq!(ok, 1);
-    assert!(out.len() < input.len());
-}
-
-#[test]
-fn rewrite_server_uri_encoded_params() {
-    let (ok, out) = rewrite_with_buf(
-        "server://71b287/com.plexapp.plugins.library/library/sections/2/all?type=2&sort=originallyAvailableAt%3Adesc&push=1&show.network=248684&pop=1",
-        1024,
-    );
-    assert_eq!(ok, 1);
-    assert_eq!(
-        out,
-        "library://sections/2/all?type=2&sort=originallyAvailableAt%3Adesc&push=1&show.network=248684&pop=1"
-    );
-}
-
-#[test]
-fn rewrite_server_uri_small_buffer() {
-    let (ok, out) = rewrite_with_buf(
-        "server://abc/com.plexapp.plugins.library/library/sections/2/all?type=2&sort=date",
-        32,
-    );
-    assert!(ok == 0 || out.len() < 32);
-}
-
-#[test]
-fn rewrite_server_uri_tiny_buffer() {
-    let (ok, _) = rewrite_with_buf("server://x", 8);
-    assert_eq!(ok, 0);
-}
-
-#[test]
-fn rewrite_server_uri_real_plex_blob() {
-    let (ok, out) = rewrite_with_buf(
-        "{\"at:childCount\":\"1\",\"at:smart\":\"1\",\"pv:blurHashesChangedAt\":\"277470\",\"pv:thumbBlurHash\":\"LJC?YqM{IVoz\",\"pv:uri\":\"server://71b2873061a562bf7541852f9a43087e88a63f9a/com.plexapp.plugins.library/library/sections/2/all?type=2&sort=originallyAvailableAt%3Adesc&push=1&show.genre=8966&pop=1\"}",
-        2048,
-    );
-    assert_eq!(ok, 1);
-    assert!(out.contains("library://sections/2/all"));
-    assert!(!out.contains("server://"));
-}
-
-#[test]
 fn normalize_sql_literals_extracts_two_params() {
     let sql = "SELECT * FROM t WHERE id = 123 AND score >= -4.5";
     let (normalized, params) =
@@ -928,6 +760,32 @@ fn column_text_transform_reads_a_boolean_as_sqlite_does() {
             .into_owned();
         assert_eq!(got, want, "{src}");
     }
+}
+
+// A smart collection's `extra_data` holds its filter as
+// `"pv:uri":"server://<machine>/com.plexapp.plugins.library/library/sections/1/all?..."`,
+// which PMS 1.43.5 converts itself. Rewritten to `library://sections/1/all?...`
+// on read (upstream 0.9.23), it was the form PMS's start-up fixup refuses
+// ("Failed to generate a query from uri library://sections/1/all?...", talos
+// 2026-11-10), so the value is passed through as stored.
+#[test]
+fn column_text_transform_passes_a_server_uri_through_as_stored() {
+    let col = c("extra_data");
+    let sql =
+        c("SELECT metadata_items.extra_data FROM metadata_items WHERE metadata_items.id = $1");
+    let stored = "{\"at:smart\":\"1\",\"pv:uri\":\"server://ae5887ec46d6bfac69927015acffa8941a904368/com.plexapp.plugins.library/library/sections/1/all?type=1&sort=titleSort&studio=Pixar\"}";
+    let value = c(stored);
+    let mut out = [0 as c_char; 512];
+    let rc = rust_column_text_transform(
+        col.as_ptr(),
+        25,
+        sql.as_ptr(),
+        value.as_ptr(),
+        stored.len(),
+        out.as_mut_ptr(),
+        out.len(),
+    );
+    assert_eq!(rc, 0, "the server URI reaches PMS as stored");
 }
 
 #[test]

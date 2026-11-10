@@ -1,4 +1,4 @@
-use super::{normalize_sql_literals_impl, rewrite_server_library_uri_bytes};
+use super::normalize_sql_literals_impl;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 
@@ -24,32 +24,6 @@ pub fn rust_validate_utf8(ptr: *const c_char, len: usize) -> i32 {
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
     i32::from(std::str::from_utf8(bytes).is_ok())
-}
-
-pub fn rust_rewrite_server_library_uri(
-    input: *const c_char,
-    out: *mut c_char,
-    out_len: usize,
-) -> i32 {
-    if input.is_null() || out.is_null() || out_len < 16 {
-        return 0;
-    }
-
-    let input_bytes = unsafe { CStr::from_ptr(input).to_bytes() };
-    let out_cap = out_len.saturating_sub(1);
-    let Some(out_buf) = rewrite_server_library_uri_bytes(input_bytes, out_cap) else {
-        return 0;
-    };
-
-    let n = out_buf.len().min(out_cap);
-    unsafe {
-        if n > 0 {
-            std::ptr::copy_nonoverlapping(out_buf.as_ptr(), out as *mut u8, n);
-        }
-        *out.add(n) = 0;
-    }
-
-    1
 }
 
 pub fn rust_normalize_sql_literals(sql: *const c_char) -> *mut RustNormalizedSql {
