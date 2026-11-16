@@ -352,7 +352,11 @@ pub fn rust_should_mask_collection_metadata_type(
     col_name: *const c_char,
     raw_val: i64,
 ) -> c_int {
-    if pg_sql.is_null() || col_name.is_null() {
+    // The value first: `column_type` asks for every column of every row, and
+    // reading the statement's text (strlen and a UTF-8 check over some 10 KB
+    // of SQL for a library listing) to learn that a 7 is not an 18 was a
+    // sixth of a whole-library read's time (the upgrade rig, 2026-11-16).
+    if raw_val != 18 || pg_sql.is_null() || col_name.is_null() {
         return 0;
     }
     let pg_sql = match unsafe { CStr::from_ptr(pg_sql) }.to_str() {

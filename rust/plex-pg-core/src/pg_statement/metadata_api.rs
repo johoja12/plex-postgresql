@@ -42,13 +42,18 @@ pub fn rust_decltype_special_case(
     table_oid: u32,
 ) -> i32 {
     let col = unsafe { cstr_to_str_or_empty(col_name) };
-    let sql = unsafe { cstr_to_str_or_empty(pg_sql) };
 
     if oid == 20 && !col.is_empty() {
         if col.contains("_at") || col.contains("timestamp") || col.contains("time") {
             return DECLTYPE_CASE_DT_INTEGER_8;
         }
-        if col == "greatest" && sql.contains("metadata_items.changed_at") {
+        // The statement's text is read only for the one column that asks:
+        // every accessor comes through here for a column whose declared type
+        // no table gives, and measuring some 10 KB of SQL for each was a
+        // visible part of a whole-library read (the upgrade rig, 2026-11-16).
+        if col == "greatest"
+            && unsafe { cstr_to_str_or_empty(pg_sql) }.contains("metadata_items.changed_at")
+        {
             return DECLTYPE_CASE_DT_INTEGER_8;
         }
     }

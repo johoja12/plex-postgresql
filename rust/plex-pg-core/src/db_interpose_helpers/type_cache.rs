@@ -5,10 +5,28 @@ use super::{
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_uint};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, RwLock};
 
 static DECLTYPE_CACHE: LazyLock<RwLock<HashMap<String, CString>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+/// Counts the keys ever added to `DECLTYPE_CACHE`: an alias match remembered
+/// under an older count is matched again.
+static DECLTYPE_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// What `rust_decltype_cache_lookup_alias` answered for an alias that is not
+/// itself a key: the generation it was matched under and the matched entry's
+/// pointer (0 for no match). The match walks every key and splits it at each
+/// underscore, about 100 microseconds over the library's 1,300 columns, and
+/// every column accessor asks on every row through `validate_type_consistency`:
+/// a join's aliased tables (`parents_title`, `grandparents_index`) never are
+/// keys, so reading 7,665 episodes whole took 47 s on the upgrade rig
+/// (2026-11-16), 6 ms a row. Pointers stay valid because a published entry is
+/// never replaced (`rust_decltype_cache_insert`).
+static ALIAS_MATCHES: LazyLock<RwLock<HashMap<String, (u64, usize)>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+/// Plex's statements name a few thousand distinct result columns in all; past
+/// this the memo starts over rather than grow without bound.
+const ALIAS_MATCHES_MAX: usize = 16_384;
 static OID_TABLE_CACHE: LazyLock<RwLock<HashMap<u32, CString>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
@@ -46,7 +64,10 @@ pub fn rust_decltype_cache_insert(key: *const c_char, decltype_val: *const c_cha
     // CString and free it underneath every holder. Re-inserting a key is the
     // normal case, not an edge one -- the decltype preload re-runs its whole
     // pass whenever a previous attempt failed -- so first publication wins.
-    cache.entry(key_str.to_string()).or_insert(normalized_owned);
+    if let std::collections::hash_map::Entry::Vacant(slot) = cache.entry(key_str.to_string()) {
+        slot.insert(normalized_owned);
+        DECLTYPE_GENERATION.fetch_add(1, Ordering::Release);
+    }
     1
 }
 
@@ -160,6 +181,21 @@ pub fn rust_decltype_cache_lookup_alias(alias: *const c_char) -> *const c_char {
         return existing.as_ptr();
     }
 
+    // Read under the cache's read lock, so no key is added between this and
+    // the walk below.
+    let generation = DECLTYPE_GENERATION.load(Ordering::Acquire);
+    {
+        let memo = match ALIAS_MATCHES.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(&(at, ptr)) = memo.get(alias_str) {
+            if at == generation {
+                return ptr as *const c_char;
+            }
+        }
+    }
+
     let mut best_match: Option<(&String, &CString)> = None;
     for (key, value) in cache.iter() {
         if !alias_matches_cache_key(alias_str, key) {
@@ -174,9 +210,18 @@ pub fn rust_decltype_cache_lookup_alias(alias: *const c_char) -> *const c_char {
         }
     }
 
-    best_match
+    let matched = best_match
         .map(|(_, value)| value.as_ptr())
-        .unwrap_or(std::ptr::null())
+        .unwrap_or(std::ptr::null());
+    let mut memo = match ALIAS_MATCHES.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if memo.len() >= ALIAS_MATCHES_MAX {
+        memo.clear();
+    }
+    memo.insert(alias_str.to_string(), (generation, matched as usize));
+    matched
 }
 
 fn alias_matches_cache_key(alias: &str, cache_key: &str) -> bool {
