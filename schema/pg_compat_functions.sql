@@ -144,3 +144,98 @@ BEGIN
     END LOOP;
 END
 $drop_reject_empty$;
+
+-- levenshtein(text, text): Plex's voice search (GET /hubs/search/voice) orders
+-- each library's items by LEVENSHTEIN('<what was said>', metadata_items.title),
+-- a function PMS registers on its own SQLite handles. Without one here every
+-- voice search answered 500 ("function levenshtein(unknown, text) does not
+-- exist"; found on the upgrade rig, 2026-11-16, on PMS 1.43.5.11029 and
+-- 1.43.5.11079 alike). PMS's function folds case: a stock PMS 1.43.5.11079
+-- reports distance 0 between ABCDEF and the title abcdef, 1 to ABCDEX and 2
+-- to Abcdxx, whichever case the query is in.
+--
+-- fuzzystrmatch's C function does the work when the extension can be had (it
+-- is trusted, so the database's owner may install it): in a schema of its
+-- own, off the search path, because it compares case as written and refuses
+-- an argument over 255 characters, where a refusal would fail the whole
+-- search. Without the extension a PL/pgSQL one answers the same, about a
+-- hundred times slower (1 s over 7,679 episode titles on the rig).
+DO $levenshtein$
+DECLARE
+    ext_schema name;
+    wrapped boolean := false;
+BEGIN
+    BEGIN
+        CREATE SCHEMA IF NOT EXISTS plex_fuzzy;
+        CREATE EXTENSION IF NOT EXISTS fuzzystrmatch WITH SCHEMA plex_fuzzy;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'fuzzystrmatch not installed (%)', SQLERRM;
+    END;
+
+    -- The extension's own function, wherever an administrator put it.
+    SELECT n.nspname INTO ext_schema
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      JOIN pg_depend d ON d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e'
+      JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'fuzzystrmatch'
+     WHERE p.proname = 'levenshtein' AND p.pronargs = 2
+     LIMIT 1;
+
+    IF ext_schema = 'public' THEN
+        -- Already at the name PMS calls, where no wrapper can stand: it
+        -- answers, case as written.
+        RAISE NOTICE 'fuzzystrmatch is installed in public; its levenshtein() serves voice search as it is';
+        RETURN;
+    END IF;
+
+    IF ext_schema IS NOT NULL THEN
+        -- Refused when this role may not use the schema the extension is in
+        -- (an administrator's, never granted): the PL/pgSQL one below then.
+        BEGIN
+            EXECUTE format($f$
+                CREATE OR REPLACE FUNCTION public.levenshtein(a text, b text) RETURNS integer
+                LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+                AS 'SELECT %I.levenshtein(left(lower(a), 255), left(lower(b), 255))'
+            $f$, ext_schema);
+            PERFORM public.levenshtein('a', 'b');
+            wrapped := true;
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'fuzzystrmatch in schema % cannot be used (%)', ext_schema, SQLERRM;
+        END;
+    END IF;
+
+    IF NOT wrapped THEN
+        RAISE NOTICE 'levenshtein() is the PL/pgSQL one';
+        CREATE OR REPLACE FUNCTION public.levenshtein(a text, b text) RETURNS integer
+        LANGUAGE plpgsql IMMUTABLE STRICT PARALLEL SAFE
+        AS $fn$
+        DECLARE
+            s text[] := string_to_array(left(lower(a), 255), NULL);
+            t text[] := string_to_array(left(lower(b), 255), NULL);
+            n int := coalesce(array_length(s, 1), 0);
+            m int := coalesce(array_length(t, 1), 0);
+            prev int[];
+            cur int[];
+            c text;
+            v int;
+        BEGIN
+            IF n = 0 THEN RETURN m; END IF;
+            IF m = 0 THEN RETURN n; END IF;
+            prev := array(SELECT generate_series(0, m));
+            FOR i IN 1..n LOOP
+                c := s[i];
+                cur := ARRAY[i];
+                FOR j IN 1..m LOOP
+                    v := prev[j] + (c <> t[j])::int;
+                    IF prev[j + 1] + 1 < v THEN v := prev[j + 1] + 1; END IF;
+                    IF cur[j] + 1 < v THEN v := cur[j] + 1; END IF;
+                    cur := cur || v;
+                END LOOP;
+                prev := cur;
+            END LOOP;
+            RETURN prev[m + 1];
+        END
+        $fn$;
+    END IF;
+END
+$levenshtein$;
