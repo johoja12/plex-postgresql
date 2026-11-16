@@ -122,6 +122,19 @@ init_schema() {
                 # which causes DDL/schema divergence issues with the SQLite shadow DB.
                 local migration_count=$(psql -t -c "SELECT COUNT(*) FROM ${schema}.schema_migrations;" 2>/dev/null | tr -d ' ')
                 echo "schema_migrations has $migration_count entries (kept from dump, shim handles duplicates)"
+
+                # Load default seed data, as standalone-entrypoint.sh does. A
+                # database without it has no account 1, which PMS then makes
+                # at its first start, in the middle of its start-up fixups:
+                # the image crashed there (SIGSEGV after "INSERT INTO
+                # accounts ... RETURNING id") on six fresh starts in seven
+                # (the upgrade rig, 2026-11-16: one in two on PMS
+                # 1.43.5.11029, five in five on 1.43.5.11079).
+                local seed_file="/usr/local/lib/plex-postgresql/seed_data.sql"
+                if [ -f "$seed_file" ]; then
+                    echo "Loading default seed data..."
+                    psql -f "$seed_file" 2>/dev/null || true
+                fi
             else
                 echo "WARNING: Schema load had errors, continuing anyway..."
             fi
@@ -267,12 +280,22 @@ init_plex_directories() {
     mkdir -p "$plex_dir/Crash Reports"
 
     # Ensure Preferences.xml exists (Plex crashes with boost::filesystem error without it)
+    #
+    # No ProcessedMachineIdentifier: it is the identifier clients and plex.tv
+    # know the server by, and PMS derives it itself, sha1(MachineIdentifier +
+    # "- Plex Media Server"). This file used to seed it with the
+    # MachineIdentifier's own 32 hex digits, which PMS through 1.43.5.11029
+    # kept as written and PMS 1.43.5.11079 replaces with the derived value at
+    # its first start (a stock server, 2026-11-16: a value that is not 40 hex
+    # digits is recomputed, a well-formed one is kept). A server whose file
+    # still carries the seeded value therefore gets a new identity from the
+    # 11079 upgrade: see the changelog.
     if [[ ! -f "$plex_dir/Preferences.xml" ]]; then
         local machine_id
         machine_id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' || echo "plex-pg-$(date +%s)")"
         cat > "$plex_dir/Preferences.xml" << PREFEOF
 <?xml version="1.0" encoding="utf-8"?>
-<Preferences OldestPreviousVersion="1.43.0.10492-121068a07" MachineIdentifier="${machine_id}" ProcessedMachineIdentifier="${machine_id}" AnonymousMachineIdentifier="${machine_id}" AcceptedEULA="1" PublishServerOnPlexOnline="0"/>
+<Preferences OldestPreviousVersion="1.43.0.10492-121068a07" MachineIdentifier="${machine_id}" AnonymousMachineIdentifier="${machine_id}" AcceptedEULA="1" PublishServerOnPlexOnline="0"/>
 PREFEOF
         echo "Created initial Preferences.xml (MachineIdentifier=${machine_id})"
     fi

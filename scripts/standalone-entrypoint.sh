@@ -256,12 +256,22 @@ init_plex_directories() {
     mkdir -p "$plex_dir/Crash Reports"
 
     # Ensure Preferences.xml exists (Plex crashes with boost::filesystem error without it)
+    #
+    # No ProcessedMachineIdentifier: it is the identifier clients and plex.tv
+    # know the server by, and PMS derives it itself, sha1(MachineIdentifier +
+    # "- Plex Media Server"). This file used to seed it with the
+    # MachineIdentifier's own 32 hex digits, which PMS through 1.43.5.11029
+    # kept as written and PMS 1.43.5.11079 replaces with the derived value at
+    # its first start (a stock server, 2026-11-16: a value that is not 40 hex
+    # digits is recomputed, a well-formed one is kept). A server whose file
+    # still carries the seeded value therefore gets a new identity from the
+    # 11079 upgrade: see the changelog.
     if [[ ! -f "$plex_dir/Preferences.xml" ]]; then
         local machine_id
         machine_id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' || echo "plex-pg-$(date +%s)")"
         cat > "$plex_dir/Preferences.xml" << PREFEOF
 <?xml version="1.0" encoding="utf-8"?>
-<Preferences OldestPreviousVersion="1.43.0.10492-121068a07" MachineIdentifier="${machine_id}" ProcessedMachineIdentifier="${machine_id}" AnonymousMachineIdentifier="${machine_id}" AcceptedEULA="1" PublishServerOnPlexOnline="0"/>
+<Preferences OldestPreviousVersion="1.43.0.10492-121068a07" MachineIdentifier="${machine_id}" AnonymousMachineIdentifier="${machine_id}" AcceptedEULA="1" PublishServerOnPlexOnline="0"/>
 PREFEOF
         echo "Created initial Preferences.xml (MachineIdentifier=${machine_id})"
     fi

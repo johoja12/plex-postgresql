@@ -41,7 +41,8 @@ COPY scripts/docker-build-shim.sh scripts/docker-build-shim.sh
 
 # Build PostgreSQL/libpq, Rust core, shim, and collect runtime libs in /libs.
 # --with-noop adds the static no-op binary the release bundle ships for
-# CrashUploader replacement (Dockerfile.standalone and cluster-plex use it).
+# CrashUploader replacement (this image, Dockerfile.standalone and cluster-plex
+# use it).
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
@@ -61,8 +62,8 @@ FROM scratch AS libs
 COPY --from=builder /libs/ /
 
 # Runtime stage, pinned to the Plex release the shim is verified against
-# (Dockerfile.standalone carries the same version).
-FROM linuxserver/plex:1.43.5.11029-6bf8af3f0-ls329
+# (Dockerfile.standalone's PLEX_VERSION carries the same version).
+FROM linuxserver/plex:1.43.5.11079-b3b13e506-ls333
 
 # Install PostgreSQL client for health checks, sqlite3 for schema fixes,
 # python3 for data migration, gdb for debugging
@@ -101,6 +102,7 @@ COPY schema/plex_schema.sql /usr/local/lib/plex-postgresql/
 COPY schema/sqlite_schema.sql /usr/local/lib/plex-postgresql/
 COPY schema/sqlite_column_types.sql /usr/local/lib/plex-postgresql/
 COPY schema/pg_compat_functions.sql /usr/local/lib/plex-postgresql/
+COPY schema/seed_data.sql /usr/local/lib/plex-postgresql/
 COPY scripts/migrate_lib.sh /usr/local/lib/plex-postgresql/
 COPY scripts/migrate_table.py /usr/local/lib/plex-postgresql/
 COPY scripts/seed_shadow_table_from_pg.py /usr/local/lib/plex-postgresql/
@@ -132,8 +134,14 @@ RUN if [ -f /etc/s6-overlay/s6-rc.d/init-plex-claim/run ]; then \
         echo "Patched init-plex-claim for PostgreSQL shim"; \
     fi
 
-# Keep upstream CrashUploader binary.
-# With SIGCHLD forced to SIG_IGN, child exits should no longer destabilize Plex.
+# Replace CrashUploader with a no-op, as Dockerfile.standalone and
+# cluster-plex do. It runs when Plex exits, cannot work here, and its exit
+# raised SIGCHLD in a process with the interposer loaded ("Received
+# unexpected async signal 17"). The shim used to set SIGCHLD to SIG_IGN
+# against that; it no longer does unless PLEX_PG_FORCE_SIGCHLD_IGNORE=1,
+# because Plex then never learns that a child ended (v1.3.17-clusterplex.59).
+# A compiled binary, not a shell script: a shell would inherit LD_PRELOAD.
+COPY --from=builder /libs/noop /usr/lib/plexmediaserver/CrashUploader
 
 # s6 finish script — defense-in-depth for the BindAddrInUseException crash loop.
 #
