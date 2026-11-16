@@ -41,7 +41,21 @@ pub static mut SHIM_CREATE_UTF8_CONVERTER_PTR: usize = 0;
 #[no_mangle]
 pub static mut SHIM_CREATE_SIMPLE_CONVERTER_PTR: usize = 0;
 
-static FORCE_IGNORE_SIGCHLD: AtomicI32 = AtomicI32::new(1);
+/// Whether the shim sets SIGCHLD to SIG_IGN in Plex Media Server and keeps it
+/// there (`PLEX_PG_FORCE_SIGCHLD_IGNORE=1`). Off unless asked for since
+/// `v1.3.17-clusterplex.59`: with SIGCHLD ignored the kernel reaps every
+/// child itself and PMS never learns that one ended. On the upgrade rig
+/// (2026-11-16, PMS 1.43.5.11029 and 1.43.5.11079 alike, none of it on a
+/// stock server) `PUT /library/metadata/<id>/analyze` hung until the client
+/// gave up, its `Plex Media Scanner --analyze` child long gone; an item's
+/// page waited 30 s and a part's 20 s for jobs that had ended; and every
+/// child PMS had ever started stayed in its job table, read every five
+/// seconds as "Resources: Unexpected result when reading /proc/<pid>/stat".
+/// cluster-plex has run with it off since 2026-10 for the same reason (its
+/// plug-in hosts never reported in). Upstream forced it against a crash loop
+/// on "Received unexpected async signal 17" from Plex's CrashUploader, which
+/// the images here replace with a no-op binary.
+static FORCE_IGNORE_SIGCHLD: AtomicI32 = AtomicI32::new(0);
 static INTERCEPT_SIGACTION: AtomicI32 = AtomicI32::new(1);
 static SIGNAL_LOG_ENABLED_CACHED: AtomicI32 = AtomicI32::new(-1);
 static EXCEPTION_CATCHER_ENABLED_CACHED: AtomicI32 = AtomicI32::new(-1);
@@ -524,7 +538,7 @@ unsafe extern "C" fn shim_init() {
             } else {
                 let _ = libc::fprintf(
                     stderr_ptr(),
-                    b"[SHIM_INIT] SIGCHLD force-ignore disabled via PLEX_PG_DISABLE_SIGCHLD_IGNORE (PID %d)\n\0"
+                    b"[SHIM_INIT] SIGCHLD left to Plex; PLEX_PG_FORCE_SIGCHLD_IGNORE=1 forces SIG_IGN (PID %d)\n\0"
                         .as_ptr() as *const c_char,
                     libc::getpid(),
                 );
