@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### v1.3.17-clusterplex.59 (unreleased)
+### v1.3.17-clusterplex.59 (2026-11-16)
 
 Plex Media Server 1.43.5.11079, and what verifying it found. The images pin 1.43.5.11079-b3b13e506 (`Dockerfile.standalone`'s `PLEX_VERSION`, a build argument now, so the last release can be built beside the next; `Dockerfile`'s `linuxserver/plex:1.43.5.11079-b3b13e506-ls333`). The two servers were run side by side on one shim build and two copies of one database (the 2026-10-22 talos dump: 925 movies, 105 shows, 7,679 episodes, one Live TV guide), through the same 990 calls: reads of every section, hub, search and item route, playback state, edits, playlists, collections, a scan of new libraries, an XMLTV DVR with its guide load, the butler tasks and a concurrent load. On `.58` they answered alike (972 calls identical once build ids and times were masked, the rest tie order and container addresses), and of some 205,000 statements each sent to PostgreSQL no shape was 11029's alone; 11079's one extra is the System plug-in registering its prefixes again at the first start, since its bundle moved. The binaries agree: the SQL text, the migrations, the SQLite imports and `libsqlite3.so` are 11029's byte for byte. The faults below were on both servers, found by reading the run's logs and by running a stock 11079 on the same media as the reference; with them fixed, both servers ran the whole mix with no statement refused by PostgreSQL (216,000 and 220,000 statements) and no error in the shim's log.
 
