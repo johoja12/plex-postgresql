@@ -282,11 +282,14 @@ fn audit_15_a_collections_only_predicate_is_kept() {
 }
 
 #[test]
-fn audit_15_metadata_type_18_is_still_dropped_from_an_or() {
+fn audit_15_metadata_type_18_stays_in_an_or() {
+    // Upstream dropped it against a 500 its C shim gave for collection rows (2025-12).
+    // It is how PMS lists a library's collections among its items, and without it a
+    // collection never showed in a library (2026-11-16).
     let out = sql("select id from metadata_items where (metadata_type=1 or metadata_type=18)");
     assert_eq!(
         out,
-        "SELECT id FROM metadata_items WHERE (metadata_type = 1)"
+        "SELECT id FROM metadata_items WHERE (metadata_type = 1 OR metadata_type = 18)"
     );
 }
 

@@ -435,27 +435,30 @@ fn subquery_alias() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// COLLECTIONS FILTER (2 tests — ALL IGNORED)
+// COLLECTIONS IN A LIBRARY LISTING
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn collections_filter() {
-    // GAP: Collections filter (metadata_type=18 removal) not implemented
+fn a_library_listing_keeps_its_collections() {
+    // PMS's own statement for `/library/sections/1/all?type=1&includeCollections=1`
+    // (1.43.5.11079). The translator used to drop `metadata_type=18` from the OR, so no
+    // collection was ever listed in a library and a plain collection set to hide its
+    // items took them out of the library with nothing in their place.
     let r = translate(
-        "SELECT * FROM metadata_items WHERE (metadata_items.metadata_type=1 or metadata_items.metadata_type=18)",
+        "select metadata_items.id from metadata_items  where metadata_items.library_section_id in (1) and ((metadata_items.metadata_type=1 or metadata_items.metadata_type=18) and (metadata_items.absolute_index is null))  order by metadata_items.title_sort collate icu_root asc, metadata_items.id asc",
     )
     .unwrap();
     let sql = r.sql.to_lowercase();
     assert!(
-        !sql.contains("18"),
-        "metadata_type=18 should be removed, got: {}",
+        sql.contains("metadata_items.metadata_type = 1 or metadata_items.metadata_type = 18"),
+        "both types should be asked for, got: {}",
         r.sql
     );
+    assert!(sql.contains("absolute_index is null"), "got: {}", r.sql);
 }
 
 #[test]
 fn collections_no_change() {
-    // GAP: Collections filter not implemented
     let r = translate("SELECT * FROM metadata_items WHERE metadata_items.metadata_type=1").unwrap();
     let sql = r.sql.to_lowercase();
     assert!(

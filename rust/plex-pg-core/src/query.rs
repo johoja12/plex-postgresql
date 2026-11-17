@@ -14,7 +14,8 @@ use sqlparser::ast::helpers::attached_token::AttachedToken;
 ///   8. COLLATE ICU strip   — remove icu_* collations
 ///   9. COLLATE NOCASE      — `x COLLATE NOCASE = y` → `LOWER(x) = LOWER(y)`
 ///  10. FTS4 MATCH          — `col MATCH term` → `to_tsvector('simple', plex.fold(col)) @@ plex.fts_query(term)`
-///  11. Collections filter  — remove `metadata_type=18` from OR conditions
+///  11. (gone)              — `metadata_type=1 OR metadata_type=18` is sent as written: it is
+///                            how PMS lists a library's collections among its items
 ///  12. Affinity            — a text column compared with a number casts the number to
 ///                            text; an integer column compared with a string casts the
 ///                            string, or folds the comparison when the string is no
@@ -137,7 +138,6 @@ fn transform_select(sel: &mut Select) {
     // WHERE fixups
     if let Some(w) = &mut sel.selection {
         fix_where_numeric(w);
-        fix_collections_filter(w);
         transform_bool_expr(w);
     }
 
@@ -1245,79 +1245,6 @@ fn unwrap_nested_column(expr: Expr) -> Expr {
         }
         other => other,
     }
-}
-
-// ─── Fix 11: Collections filter ───────────────────────────────────────────────
-
-/// Remove `metadata_type=18` from OR conditions.
-/// Pattern: `(metadata_type=1 OR metadata_type=18)` → `metadata_type=1`
-///
-/// A predicate that is only `(metadata_type=18)` is kept: collections are
-/// served, and folding it to TRUE answered the whole section where Plex asked
-/// for its collections alone.
-fn fix_collections_filter(expr: &mut Expr) {
-    // Recurse into nested expressions first
-    match expr {
-        Expr::Nested(inner) => fix_collections_filter(inner),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Or,
-            right,
-        } => {
-            fix_collections_filter(left);
-            fix_collections_filter(right);
-
-            let left_is_18 = is_metadata_type_eq(left, 18);
-            let right_is_18 = is_metadata_type_eq(right, 18);
-
-            if left_is_18 && !right_is_18 {
-                // Remove left (type=18), keep right
-                let r = take_boxed_expr(right);
-                *expr = r;
-            } else if right_is_18 && !left_is_18 {
-                // Remove right (type=18), keep left
-                let l = take_boxed_expr(left);
-                *expr = l;
-            }
-        }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            fix_collections_filter(left);
-            fix_collections_filter(right);
-        }
-        _ => {}
-    }
-}
-
-/// Check if expr matches `metadata_type = <value>` or `metadata_items.metadata_type = <value>`
-fn is_metadata_type_eq(expr: &Expr, value: i64) -> bool {
-    if let Expr::BinaryOp {
-        left,
-        op: BinaryOperator::Eq,
-        right,
-    } = expr
-    {
-        let col_name = match left.as_ref() {
-            Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
-            Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.to_lowercase()),
-            _ => None,
-        };
-        if col_name.as_deref() == Some("metadata_type") {
-            if let Expr::Value(ValueWithSpan {
-                value: Value::Number(ref s, _),
-                ..
-            }) = right.as_ref()
-            {
-                if let Ok(n) = s.parse::<i64>() {
-                    return n == value;
-                }
-            }
-        }
-    }
-    false
 }
 
 // ─── Fix 12: column affinity ──────────────────────────────────────────────────
