@@ -32,6 +32,9 @@ jobs:
       - name: Test release dispatch routing
         run: python3 -B -m unittest discover -s tests -p test_publish_release.py
 
+      - name: Test upgrade comparison reporting
+        run: python3 -B -m unittest discover -s tests -p test_upgrade_rig_compare.py
+
   unit-tests:
     name: Unit tests
     runs-on: ubuntu-latest

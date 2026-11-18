@@ -14,7 +14,8 @@ use sqlparser::ast::helpers::attached_token::AttachedToken;
 ///   8. COLLATE ICU strip   — remove icu_* collations
 ///   9. COLLATE NOCASE      — `x COLLATE NOCASE = y` → `LOWER(x) = LOWER(y)`
 ///  10. FTS4 MATCH          — `col MATCH term` → `to_tsvector('simple', plex.fold(col)) @@ plex.fts_query(term)`
-///  11. Collections filter  — remove `metadata_type=18` from OR conditions
+///  11. (gone)              — `metadata_type=1 OR metadata_type=18` is sent as written: it is
+///                            how PMS lists a library's collections among its items
 ///  12. Affinity            — a text column compared with a number casts the number to
 ///                            text; an integer column compared with a string casts the
 ///                            string, or folds the comparison when the string is no
@@ -209,7 +210,6 @@ fn transform_select(sel: &mut Select) {
     // WHERE fixups
     if let Some(w) = &mut sel.selection {
         fix_where_numeric(w);
-        fix_collections_filter(w);
         transform_bool_expr(w);
     }
 
@@ -1002,6 +1002,25 @@ fn transform_expr_in(expr: &mut Expr, boolean: bool) {
                         *expr = glob_match(subject, pattern, false);
                     }
                 }
+            } else if boolean && (fn_name == "instr" || fn_name == "strpos") && arg_count == 2 {
+                // instr() read as a condition: SQLite takes any non-zero
+                // integer for true, PostgreSQL wants a boolean. PMS's
+                // migrations and fixups ask this way (`where
+                // instr(extra_data, 'pv%3Acredits')`, `and not
+                // instr(extra_data, 'pv%3AlastFmBlacklisted=1')`), and the
+                // bare STRPOS() was refused: "argument of WHERE must be type
+                // boolean, not type integer", which ended a Live TV guide's
+                // migration 20210207150001 and the OptimizeDatabase butler
+                // task with it (the upgrade rig, 2026-11-16).
+                let call = take_expr(expr);
+                *expr = Expr::Nested(Box::new(Expr::BinaryOp {
+                    left: Box::new(call),
+                    op: BinaryOperator::Gt,
+                    right: Box::new(Expr::Value(ValueWithSpan {
+                        value: Value::Number("0".to_string(), false),
+                        span: Span::empty(),
+                    })),
+                }));
             }
         }
 
@@ -1474,79 +1493,6 @@ fn unwrap_nested_column(expr: Expr) -> Expr {
         }
         other => other,
     }
-}
-
-// ─── Fix 11: Collections filter ───────────────────────────────────────────────
-
-/// Remove `metadata_type=18` from OR conditions.
-/// Pattern: `(metadata_type=1 OR metadata_type=18)` → `metadata_type=1`
-///
-/// A predicate that is only `(metadata_type=18)` is kept: collections are
-/// served, and folding it to TRUE answered the whole section where Plex asked
-/// for its collections alone.
-fn fix_collections_filter(expr: &mut Expr) {
-    // Recurse into nested expressions first
-    match expr {
-        Expr::Nested(inner) => fix_collections_filter(inner),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Or,
-            right,
-        } => {
-            fix_collections_filter(left);
-            fix_collections_filter(right);
-
-            let left_is_18 = is_metadata_type_eq(left, 18);
-            let right_is_18 = is_metadata_type_eq(right, 18);
-
-            if left_is_18 && !right_is_18 {
-                // Remove left (type=18), keep right
-                let r = take_boxed_expr(right);
-                *expr = r;
-            } else if right_is_18 && !left_is_18 {
-                // Remove right (type=18), keep left
-                let l = take_boxed_expr(left);
-                *expr = l;
-            }
-        }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            fix_collections_filter(left);
-            fix_collections_filter(right);
-        }
-        _ => {}
-    }
-}
-
-/// Check if expr matches `metadata_type = <value>` or `metadata_items.metadata_type = <value>`
-fn is_metadata_type_eq(expr: &Expr, value: i64) -> bool {
-    if let Expr::BinaryOp {
-        left,
-        op: BinaryOperator::Eq,
-        right,
-    } = expr
-    {
-        let col_name = match left.as_ref() {
-            Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
-            Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.to_lowercase()),
-            _ => None,
-        };
-        if col_name.as_deref() == Some("metadata_type") {
-            if let Expr::Value(ValueWithSpan {
-                value: Value::Number(ref s, _),
-                ..
-            }) = right.as_ref()
-            {
-                if let Ok(n) = s.parse::<i64>() {
-                    return n == value;
-                }
-            }
-        }
-    }
-    false
 }
 
 // ─── Fix 12: column affinity ──────────────────────────────────────────────────
@@ -2615,6 +2561,71 @@ mod tests {
         assert!(
             !sql.contains("IS NULL"),
             "IS NULL pattern should be replaced, got: {}",
+            r.sql
+        );
+    }
+
+    #[test]
+    fn instr_read_as_a_condition_is_compared_with_zero() {
+        // PMS's own statements, from its 1.43.5.11079 binary.
+        let r = translate(
+            "select id, media_item_id, duration, extra_data from media_parts where instr(extra_data, 'pv%3Acredits')",
+        )
+        .unwrap();
+        assert!(
+            r.sql
+                .contains("WHERE (STRPOS(extra_data, 'pv%3Acredits') > 0)"),
+            "a bare instr() in WHERE, got: {}",
+            r.sql
+        );
+        let r = translate(
+            "select id,extra_data from metadata_items where metadata_type in (2,3,8,9) and instr(extra_data, 'at%3AleafCount') or instr(extra_data, 'at%3AviewedLeafCount')",
+        )
+        .unwrap();
+        assert!(
+            r.sql.contains("AND (STRPOS(extra_data, 'at%3AleafCount') > 0) OR (STRPOS(extra_data, 'at%3AviewedLeafCount') > 0)"),
+            "under AND and OR, got: {}",
+            r.sql
+        );
+        let r = translate(
+            "select id from metadata_items where metadata_type = 8 and not instr(extra_data, 'pv%3AlastFmBlacklisted=1')",
+        )
+        .unwrap();
+        assert!(
+            r.sql
+                .contains("NOT (STRPOS(extra_data, 'pv%3AlastFmBlacklisted=1') > 0)"),
+            "under NOT, got: {}",
+            r.sql
+        );
+        // The periodic-metadata butler task's count, as PostgreSQL refused it
+        // on the rig ("argument of NOT must be type boolean").
+        let r = translate(
+            "SELECT count(*) FROM metadata_items WHERE metadata_type = 8 AND ((library_section_id IN (3, 4) AND NOT instr(extra_data, 'pv%3AlastFmBlacklisted=1')) OR (library_section_id NOT IN (3, 4)))",
+        )
+        .unwrap();
+        assert!(
+            r.sql
+                .contains("AND NOT (STRPOS(extra_data, 'pv%3AlastFmBlacklisted=1') > 0)) OR"),
+            "under NOT inside nested groups, got: {}",
+            r.sql
+        );
+        let r = translate("select id,extra_data from metadata_items where instr(extra_data, ?)")
+            .unwrap();
+        assert!(
+            r.sql.contains("WHERE (STRPOS(extra_data, $1) > 0)"),
+            "with a parameter, got: {}",
+            r.sql
+        );
+        // A value stays a value: a projection, a comparison's operand, an
+        // argument.
+        let r =
+            translate("SELECT instr(a, b), substr(a, instr(a, 'x')) FROM t WHERE instr(a, b) > 3")
+                .unwrap();
+        assert!(
+            r.sql.contains(
+                "SELECT STRPOS(a, b), SUBSTRING(a, STRPOS(a, 'x')) FROM t WHERE STRPOS(a, b) > 3"
+            ),
+            "an instr() that yields a value is left alone, got: {}",
             r.sql
         );
     }

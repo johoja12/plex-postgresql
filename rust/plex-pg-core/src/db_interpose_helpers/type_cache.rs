@@ -287,6 +287,37 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_alias_readers_keep_published_values_during_schema_growth() {
+        let cache = std::sync::Arc::new(RwLock::new(DecltypeCache::default()));
+        cache
+            .write()
+            .unwrap()
+            .insert("sync_id".into(), CString::new("INTEGER").unwrap());
+        let pointer = cache.write().unwrap().resolve_alias("sync_1_id") as usize;
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let cache = cache.clone();
+                scope.spawn(move || {
+                    for _ in 0..500 {
+                        let value = cache.write().unwrap().resolve_alias("sync_1_id");
+                        assert_eq!(value as usize, pointer);
+                        // Match the FFI contract: the lock has been released.
+                        assert_eq!(
+                            unsafe { std::ffi::CStr::from_ptr(value) }.to_bytes(),
+                            b"INTEGER"
+                        );
+                    }
+                });
+            }
+            for n in 0..500 {
+                let mut cache = cache.write().unwrap();
+                cache.insert(format!("new_{n}_title"), CString::new("TEXT").unwrap());
+                cache.insert("sync_id".into(), CString::new("TEXT").unwrap());
+            }
+        });
+    }
+
+    #[test]
     fn new_longer_alias_match_invalidates_previous_resolution() {
         let mut cache = DecltypeCache::default();
         cache.insert("a_id".into(), CString::new("INTEGER").unwrap());

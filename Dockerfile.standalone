@@ -16,6 +16,12 @@
 # Usage:
 #   docker compose -f docker-compose.standalone.yml up -d
 
+# The Plex release the shim is verified against (cluster-plex's Dockerfile
+# VERSION). A build argument, so an upgrade can run the last release beside
+# the next on one shim build and one database:
+#   docker build -f Dockerfile.standalone --build-arg PLEX_VERSION=<old> ...
+ARG PLEX_VERSION=1.43.5.11079-b3b13e506
+
 # ============================================================================
 # Stage 1: Build the shim on Alpine (musl libc - matches Plex's bundled musl)
 # ============================================================================
@@ -63,11 +69,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ============================================================================
 # Stage 2: Runtime with plexinc/pms-docker
 # ============================================================================
-# Pinned to the Plex release the shim is verified against (cluster-plex's
-# Dockerfile VERSION): an unpinned tag let the rig test a different server
-# than the one deployed. 1.43.5.11029 runs one migration past 1.43.4.10903,
-# 202609141200, which changes no schema.
-FROM plexinc/pms-docker:1.43.5.11029-6bf8af3f0
+# Pinned to the Plex release the shim is verified against (PLEX_VERSION,
+# above): an unpinned tag let the rig test a different server than the one
+# deployed. 1.43.5.11029 runs one migration past 1.43.4.10903,
+# 202609141200, which changes no schema; 1.43.5.11079 adds none, and its
+# SQL text and SQLite imports are 11029's byte for byte.
+FROM plexinc/pms-docker:${PLEX_VERSION}
 
 # Install minimal runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

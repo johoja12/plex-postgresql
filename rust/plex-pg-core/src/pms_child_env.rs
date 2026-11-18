@@ -41,6 +41,20 @@ static PMS_CHILD_ENV_SCRUB_LOG_BUDGET: AtomicI32 = AtomicI32::new(0);
 
 static SELF_LD_PRELOAD: OnceLock<Option<CString>> = OnceLock::new();
 
+/// `LD_PRELOAD=<the shim's own preload>`, built once at load and never freed,
+/// for the one thing an `execve` in a vfork child may do about the scanner:
+/// point at it (`exec_scanner_with_preload`). Null until
+/// `scrub_current_process_preload` has taken the preload out of this
+/// process's environment.
+static SCANNER_PRELOAD_ENTRY: std::sync::atomic::AtomicPtr<c_char> =
+    std::sync::atomic::AtomicPtr::new(ptr::null_mut());
+
+/// The scanner's program name, as `execve`'s path ends.
+const SCANNER_BASENAME: &[u8] = b"Plex Media Scanner";
+/// The most environment entries the scanner's exec copies; Plex passes its
+/// children some sixty. Past this the environment goes through as it came.
+const SCANNER_ENV_MAX: usize = 510;
+
 const DEFAULT_LOG_BUDGET: i32 = 16;
 const _PRIVATE_LIB_DIR: &str = "/usr/local/lib/plex-postgresql";
 const SHIM_SO_TOKEN: &str = "db_interpose_pg.so";
@@ -149,6 +163,7 @@ pub fn scrub_current_process_preload() {
         if raw.is_null() || *raw == 0 {
             return;
         }
+        prepare_scanner_preload_entry();
         if libc::unsetenv(LD_PRELOAD_ENV.as_ptr() as *const c_char) == 0 && had_preload {
             let _ = libc::fprintf(
                 stderr_ptr(),
@@ -158,6 +173,151 @@ pub fn scrub_current_process_preload() {
             let _ = libc::fflush(stderr_ptr());
         }
     }
+}
+
+/// Builds `SCANNER_PRELOAD_ENTRY` from the preload this process was started
+/// with. Called at load, in the process the shim was loaded into, where
+/// allocating is safe; the string is leaked on purpose, since a vfork child
+/// may be pointing at it at any time.
+fn prepare_scanner_preload_entry() {
+    if !SCANNER_PRELOAD_ENTRY.load(Ordering::Acquire).is_null() {
+        return;
+    }
+    let Some(preload) = capture_self_ld_preload() else {
+        return;
+    };
+    let mut entry = b"LD_PRELOAD=".to_vec();
+    entry.extend_from_slice(preload.as_bytes());
+    let Ok(entry) = CString::new(entry) else {
+        return;
+    };
+    let raw = entry.into_raw();
+    if SCANNER_PRELOAD_ENTRY
+        .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // Another caller published first: this copy was never shared.
+        drop(unsafe { CString::from_raw(raw) });
+    }
+}
+
+/// Whether `path` ends in the scanner's program name. Async-signal-safe and
+/// frameless: it runs in a vfork child (`execve`).
+///
+/// # Safety
+/// `path` is null or a NUL-terminated string.
+#[inline(always)]
+unsafe fn path_is_scanner(path: *const c_char) -> bool {
+    if path.is_null() {
+        return false;
+    }
+    let mut base = path;
+    let mut cursor = path;
+    while *cursor != 0 {
+        if *cursor as u8 == b'/' {
+            base = cursor.add(1);
+        }
+        cursor = cursor.add(1);
+    }
+    let mut i = 0;
+    while i < SCANNER_BASENAME.len() {
+        if *base.add(i) as u8 != SCANNER_BASENAME[i] {
+            return false;
+        }
+        i += 1;
+    }
+    *base.add(i) == 0
+}
+
+/// Whether an environment names `LD_PRELOAD`. Async-signal-safe and
+/// frameless, as `path_is_scanner`.
+///
+/// # Safety
+/// `envp` is null or a null-terminated array of NUL-terminated strings.
+#[inline(always)]
+unsafe fn env_names_preload(envp: *const *const c_char) -> bool {
+    const KEY: &[u8] = b"LD_PRELOAD=";
+    let mut cursor = envp;
+    while !cursor.is_null() && !(*cursor).is_null() {
+        let entry = *cursor;
+        let mut i = 0;
+        while i < KEY.len() && *entry.add(i) as u8 == KEY[i] {
+            i += 1;
+        }
+        if i == KEY.len() {
+            return true;
+        }
+        cursor = cursor.add(1);
+    }
+    false
+}
+
+/// Copies `envp`'s pointers into `out` and adds `entry` and the terminator.
+/// False when `out` cannot hold them all; `out` is then not to be used.
+///
+/// # Safety
+/// `envp` is null or a null-terminated array.
+#[inline(always)]
+unsafe fn env_with_entry(
+    envp: *const *const c_char,
+    entry: *const c_char,
+    out: &mut [*const c_char],
+) -> bool {
+    let mut n = 0;
+    let mut cursor = envp;
+    while !cursor.is_null() && !(*cursor).is_null() {
+        if n + 2 >= out.len() {
+            return false;
+        }
+        out[n] = *cursor;
+        n += 1;
+        cursor = cursor.add(1);
+    }
+    if n + 2 > out.len() {
+        return false;
+    }
+    out[n] = entry;
+    out[n + 1] = ptr::null();
+    true
+}
+
+/// `execve` of the scanner from a vfork child, with the shim's preload added
+/// to the environment Plex built for it.
+///
+/// PMS starts every job with `vfork` and `execve` (it imports no
+/// `posix_spawn`), so the wrapper below runs in the child, where it may not
+/// build an environment (`should_adjust_child_env`) -- and since the shim
+/// takes `LD_PRELOAD` out of PMS's own environment at load, the scanner was
+/// started without the shim: `Plex Media Scanner --analyze` and `--match`
+/// opened the empty shadow SQLite file, found nothing to do and exited 0 in
+/// 80 ms. No scanned file was ever analysed (no duration, no streams) and
+/// every match job ended in "Scanner: error reading match results" (the
+/// upgrade rig, 2026-11-16, PMS 1.43.5.11029 and 1.43.5.11079 alike; a stock
+/// server analyses and matches). It has been so since the wrapper stopped
+/// building environments in the child (2026-09-18).
+///
+/// Nothing here allocates, locks or logs: the pointers are copied into an
+/// array in this frame, 4 KB of it, which a vfork child has (it runs on its
+/// parent's stack). Kept out of line so that `execve`'s own frame stays
+/// small for musl's `posix_spawn` child, which has about 5 KB in all and
+/// never comes here: its parent's `posix_spawn` wrapper has added the
+/// preload already.
+///
+/// # Safety
+/// As `execve`.
+#[inline(never)]
+unsafe fn exec_scanner_with_preload(
+    orig: ExecveFn,
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+    entry: *const c_char,
+) -> c_int {
+    let mut env: [*const c_char; SCANNER_ENV_MAX + 2] = [ptr::null(); SCANNER_ENV_MAX + 2];
+    if !env_with_entry(envp, entry, &mut env) {
+        return orig(path, argv, envp);
+    }
+    orig(path, argv, env.as_ptr())
 }
 
 /// Resolve a single symbol via `dlsym(RTLD_NEXT, ...)` and store it into the
@@ -549,6 +709,15 @@ pub unsafe extern "C" fn execve(
     // Before anything with a frame: this may be a clone(CLONE_VM) child
     // running on a few KB carved out of the parent's stack.
     if !should_adjust_child_env() {
+        // The scanner alone keeps the shim, and Plex starts it from a vfork
+        // child, which is here.
+        if path_is_scanner(path) {
+            let entry = SCANNER_PRELOAD_ENTRY.load(Ordering::Acquire);
+            let source = source_envp(envp);
+            if !entry.is_null() && !env_names_preload(source) {
+                return exec_scanner_with_preload(orig, path, argv, source, entry);
+            }
+        }
         return orig(path, argv, envp);
     }
 
@@ -695,6 +864,83 @@ mod tests {
         rewrite_env_entry, should_adjust_child_env, should_keep_env_for_process, LOADER_PID,
     };
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn the_scanner_is_told_by_its_paths_last_component() {
+        use super::path_is_scanner;
+        use std::ffi::CString;
+        let is = |p: &str| {
+            let c = CString::new(p).unwrap();
+            unsafe { path_is_scanner(c.as_ptr()) }
+        };
+        assert!(is("/usr/lib/plexmediaserver/Plex Media Scanner"));
+        assert!(is("Plex Media Scanner"));
+        assert!(!is("/usr/lib/plexmediaserver/Plex Media Server"));
+        assert!(!is("/usr/lib/plexmediaserver/Plex Media Scanner Helper"));
+        assert!(!is("/usr/lib/plexmediaserver/Plex Media Scanner/ffmpeg"));
+        assert!(!is("/usr/lib/plexmediaserver/Plex Media Scan"));
+        assert!(!is("/usr/lib/plexmediaserver/Plex Transcoder"));
+        assert!(!is(""));
+        assert!(!unsafe { path_is_scanner(std::ptr::null()) });
+    }
+
+    #[test]
+    fn a_vfork_childs_scanner_environment_gains_the_preload_and_nothing_else() {
+        use super::{env_names_preload, env_with_entry};
+        use std::ffi::{CStr, CString};
+        use std::os::raw::c_char;
+        use std::ptr;
+
+        let owned: Vec<CString> = ["PATH=/usr/bin", "X_PLEX_TOKEN=t", "LD_LIBRARY_PATH=/a:/b"]
+            .iter()
+            .map(|e| CString::new(*e).unwrap())
+            .collect();
+        let mut envp: Vec<*const c_char> = owned.iter().map(|e| e.as_ptr()).collect();
+        envp.push(ptr::null());
+        let entry =
+            CString::new("LD_PRELOAD=/usr/local/lib/plex-postgresql/db_interpose_pg.so").unwrap();
+
+        assert!(!unsafe { env_names_preload(envp.as_ptr()) });
+        assert!(!unsafe { env_names_preload(ptr::null()) });
+
+        let mut out: [*const c_char; 8] = [ptr::null(); 8];
+        assert!(unsafe { env_with_entry(envp.as_ptr(), entry.as_ptr(), &mut out) });
+        let got: Vec<String> = out
+            .iter()
+            .take_while(|p| !p.is_null())
+            .map(|p| unsafe { CStr::from_ptr(*p) }.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "PATH=/usr/bin",
+                "X_PLEX_TOKEN=t",
+                "LD_LIBRARY_PATH=/a:/b",
+                "LD_PRELOAD=/usr/local/lib/plex-postgresql/db_interpose_pg.so"
+            ]
+        );
+        // The entries are Plex's own strings, pointed at and never copied.
+        assert_eq!(out[0], owned[0].as_ptr());
+        assert!(unsafe { env_names_preload(out.as_ptr()) });
+
+        // An environment that already names a preload is told apart, and a
+        // look-alike key is not one.
+        let other = CString::new("LD_PRELOAD_EXTRA=1").unwrap();
+        let look_alike = [other.as_ptr(), ptr::null()];
+        assert!(!unsafe { env_names_preload(look_alike.as_ptr()) });
+
+        // No room for the entry and the terminator: refused, so the caller
+        // passes Plex's environment through as it came.
+        let mut exact: [*const c_char; 4] = [ptr::null(); 4];
+        assert!(!unsafe { env_with_entry(envp.as_ptr(), entry.as_ptr(), &mut exact) });
+        let mut fits: [*const c_char; 5] = [ptr::null(); 5];
+        assert!(unsafe { env_with_entry(envp.as_ptr(), entry.as_ptr(), &mut fits) });
+        assert!(fits[4].is_null());
+        // An empty environment still gets the entry.
+        let mut small: [*const c_char; 2] = [ptr::null(); 2];
+        assert!(unsafe { env_with_entry(ptr::null(), entry.as_ptr(), &mut small) });
+        assert_eq!(small[0], entry.as_ptr());
+    }
 
     #[test]
     fn keep_process_whitelist_is_narrow() {

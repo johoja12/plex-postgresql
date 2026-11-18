@@ -163,4 +163,45 @@ mod process_label_tests {
             b"Plex Transcoder"
         );
     }
+
+    #[test]
+    fn the_scanner_and_the_server_are_named_by_argv0_whatever_their_arguments_hold() {
+        // PMS's match job: the last "/" is inside --content-type.
+        assert_eq!(
+            process_label(
+                b"/usr/lib/plexmediaserver/Plex Media Scanner\0--match\0--type\x001\0--log-file-suffix\0 Matcher\0--item\x0017092\0--content-type=application/json\0"
+            ),
+            b"Plex Media Scanner"
+        );
+        assert_eq!(
+            process_label(
+                b"/usr/lib/plexmediaserver/Plex Media Scanner\0--scan\0--directory\0/media/tv/Breaking Bad (2008)\0"
+            ),
+            b"Plex Media Scanner"
+        );
+        assert_eq!(
+            process_label(b"Plex Media Server\0--some-url=http://127.0.0.1:32400/x\0"),
+            b"Plex Media Server"
+        );
+    }
+
+    #[test]
+    fn helper_arguments_cannot_enable_interposition() {
+        assert_eq!(
+            process_label(b"/bin/helper\0/usr/lib/Plex Media Server\0"),
+            b"helper"
+        );
+        // The transcoder stays unshimmed even when its arguments contain paths.
+        assert_eq!(
+            process_label(
+                b"/usr/lib/plexmediaserver/Plex Transcoder\0-i\0http://127.0.0.1:32400/video/:/transcode/session/x/manifest?X-Plex-Http-Pipeline=infinite\0"
+            ),
+            b"Plex Transcoder"
+        );
+        // The explicit subreaper wrapper keeps the environment for its child.
+        assert_eq!(
+            process_label(b"subreaper\0/usr/lib/plexmediaserver/Plex Media Server\0"),
+            b"Plex Media Server"
+        );
+    }
 }

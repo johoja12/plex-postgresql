@@ -531,6 +531,79 @@ fn decltype_cache_alias_lookup_resolves_self_join_text_alias() {
 }
 
 #[test]
+fn decltype_cache_alias_match_is_remembered_and_matched_again_after_an_insert() {
+    // An alias that is no key itself is matched by walking every key, which
+    // every column accessor paid on every row. The match is remembered, and
+    // a key added afterwards must still be seen: a remembered "no match", or
+    // a remembered shorter match, would otherwise be wrong for good.
+    let alias = c("zzmemo_tables_parents_zzmemo_col");
+    assert!(rust_decltype_cache_lookup_alias(alias.as_ptr()).is_null());
+    assert!(rust_decltype_cache_lookup_alias(alias.as_ptr()).is_null());
+
+    let key = c("zzmemo_tables_zzmemo_col");
+    let decl = c("integer(8)");
+    assert_eq!(rust_decltype_cache_insert(key.as_ptr(), decl.as_ptr()), 1);
+    let first = rust_decltype_cache_lookup_alias(alias.as_ptr());
+    assert!(!first.is_null(), "a key added after a remembered miss");
+    assert_eq!(
+        unsafe { CStr::from_ptr(first) }.to_str().unwrap(),
+        "integer(8)"
+    );
+    // The remembered answer is the same published pointer.
+    assert_eq!(rust_decltype_cache_lookup_alias(alias.as_ptr()), first);
+
+    // A longer key that also matches wins, as it does without the memo.
+    let longer = c("zzmemo_tables_parents_zzmemo_col_x");
+    let alias2 = c("zzmemo_tables_parents_zzmemo_col_x");
+    let decl2 = c("varchar(255)");
+    assert_eq!(
+        rust_decltype_cache_insert(longer.as_ptr(), decl2.as_ptr()),
+        1
+    );
+    let exact = rust_decltype_cache_lookup_alias(alias2.as_ptr());
+    assert_eq!(
+        unsafe { CStr::from_ptr(exact) }.to_str().unwrap(),
+        "varchar(255)"
+    );
+    // And the first alias still answers its own match.
+    let again = rust_decltype_cache_lookup_alias(alias.as_ptr());
+    assert_eq!(
+        unsafe { CStr::from_ptr(again) }.to_str().unwrap(),
+        "integer(8)"
+    );
+}
+
+#[test]
+fn collection_mask_reads_the_value_before_the_statement() {
+    // Any value but 18 answers without the statement's text being read: a
+    // pointer that is no string at all must not be touched.
+    let col = c("metadata_items_metadata_type");
+    let bogus = 1usize as *const c_char;
+    assert_eq!(
+        rust_should_mask_collection_metadata_type(bogus, col.as_ptr(), 1),
+        0
+    );
+    assert_eq!(
+        rust_should_mask_collection_metadata_type(bogus, col.as_ptr(), 4),
+        0
+    );
+    let related = c("select 1 from taggings as related");
+    assert_eq!(
+        rust_should_mask_collection_metadata_type(related.as_ptr(), col.as_ptr(), 18),
+        1
+    );
+    assert_eq!(
+        rust_should_mask_collection_metadata_type(related.as_ptr(), col.as_ptr(), 2),
+        0
+    );
+    let plain = c("select 1 from metadata_items");
+    assert_eq!(
+        rust_should_mask_collection_metadata_type(plain.as_ptr(), col.as_ptr(), 18),
+        0
+    );
+}
+
+#[test]
 fn decltype_cache_never_invalidates_a_published_entry() {
     // `rust_decltype_cache_lookup` hands back a pointer into the CString held
     // in the shared map and then drops the read guard. Those pointers reach
