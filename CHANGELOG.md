@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.24] - 2026-11-17
+
+### Changed
+- Updated upstream base Docker images (linuxserver/plex:latest / plexinc/pms-docker:latest).
+
 ### v1.3.17-clusterplex.60 (2026-11-16)
 
 - **A library lists its collections again** (`query.rs`: the collections filter is gone). For a library's Library tab PMS asks `(metadata_type=1 or metadata_type=18) and absolute_index is null`: the items and the collections together, a row out of the listing when PMS has marked it hidden. The translator dropped `metadata_type=18` from every such OR, an upstream workaround from December 2025 against a 500 its C shim gave for collection rows, so no collection was ever listed in a library, whatever its mode or the library's, and a plain collection set to "Hide items in this collection" took its items out of the library with nothing in their place. Found on talos, where a smart collection in that mode was missing from the library (owner, 2026-11-16). On the rig the shim now lists what a stock 1.43.5.11079 lists under every combination of the library's three collection modes and a collection's four, for a smart and a plain collection, and 37 routes that list items and collections together answer alike, with nothing refused by PostgreSQL. Two things are Plex's own and stay: a smart collection never hides its items (stock does not either), and "Visible on Library" is the library's Recommended tab, not its Library tab.
