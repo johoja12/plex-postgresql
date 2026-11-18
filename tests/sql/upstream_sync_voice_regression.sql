@@ -3,13 +3,13 @@
 BEGIN;
 DO $test$
 BEGIN
-    IF public.levenshtein('ABCDEF', 'abcdef') <> 0
-       OR public.levenshtein('ABCDEX', 'abcdef') <> 1
-       OR public.levenshtein('Abcdxx', 'abcdef') <> 2
-       OR public.levenshtein('', 'abc') <> 3
-       OR public.levenshtein('abc', '') <> 3
-       OR public.levenshtein('日本語', '日本') <> 1
-       OR public.levenshtein(repeat('a', 300), repeat('A', 300)) <> 0
+    IF public.levenshtein('ABCDEF', 'abcdef') IS DISTINCT FROM 0
+       OR public.levenshtein('ABCDEX', 'abcdef') IS DISTINCT FROM 1
+       OR public.levenshtein('Abcdxx', 'abcdef') IS DISTINCT FROM 2
+       OR public.levenshtein('', 'abc') IS DISTINCT FROM 3
+       OR public.levenshtein('abc', '') IS DISTINCT FROM 3
+       OR public.levenshtein('日本語', '日本') IS DISTINCT FROM 1
+       OR public.levenshtein(repeat('a', 300), repeat('A', 300)) IS DISTINCT FROM 0
        OR public.levenshtein(NULL, 'a') IS NOT NULL
     THEN RAISE EXCEPTION 'voice search case, Unicode, empty, long or NULL regression'; END IF;
     -- PostgreSQL execution of boolean instr() translation, including NULL.
