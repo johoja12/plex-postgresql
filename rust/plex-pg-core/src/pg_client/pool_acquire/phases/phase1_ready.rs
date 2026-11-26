@@ -12,6 +12,20 @@ use super::super::shared::{AcquireCtx, AcquireDecision};
 use super::common::{cache_existing_ready_slot, mark_ready_and_cache_slot};
 use crate::log_debug_lazy;
 
+/// Mark the slot used now, then ask whether it is still READY, before the
+/// connection in it is touched.
+///
+/// The idle parker closes the connection of a READY slot it does not own. It
+/// takes the slot RECONNECTING first and reads `last_used` after; this is the
+/// other half, in the other order. Whichever of the two runs second sees what
+/// the first wrote, so either the parker finds the slot just used and leaves
+/// it, or this thread finds it taken and looks elsewhere. Without the order,
+/// `check_conn_ok` below could read a connection the parker was freeing.
+fn stamp_and_still_ready(ctx: &AcquireCtx<'_>, slot: &super::super::super::PoolSlot) -> bool {
+    slot.last_used.store(ctx.now, Ordering::SeqCst);
+    slot.state.load(Ordering::SeqCst) == SLOT_READY
+}
+
 pub(crate) fn phase1_existing_ready(ctx: &AcquireCtx<'_>) -> AcquireDecision {
     if let Some((idx, generation)) = tls_pool_cache_get(0) {
         let idx = idx as usize;
@@ -22,7 +36,7 @@ pub(crate) fn phase1_existing_ready(ctx: &AcquireCtx<'_>) -> AcquireDecision {
                 && slot.generation.load(Ordering::Acquire) == generation
             {
                 let owner = slot.owner_thread.load(Ordering::Acquire);
-                if threads_equal(owner, ctx.current_thread) {
+                if threads_equal(owner, ctx.current_thread) && stamp_and_still_ready(ctx, slot) {
                     let conn = slot.conn.load(Ordering::Acquire);
                     if conn == ctx.exclude_conn as *mut c_void {
                         log_debug_lazy!(
@@ -53,6 +67,9 @@ pub(crate) fn phase1_existing_ready(ctx: &AcquireCtx<'_>) -> AcquireDecision {
         }
         let owner = slot.owner_thread.load(Ordering::Acquire);
         if !threads_equal(owner, ctx.current_thread) {
+            continue;
+        }
+        if !stamp_and_still_ready(ctx, slot) {
             continue;
         }
 

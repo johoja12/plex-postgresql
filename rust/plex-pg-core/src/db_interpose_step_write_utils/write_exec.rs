@@ -73,7 +73,15 @@ pub extern "C" fn rust_step_write_execute_and_finalize(
                 &mut cached_name,
             ) != 0;
 
-            if !is_cached {
+            // A miss prepares only once the connection has used the
+            // statement often enough (pg_client_stmt_cache); until then it
+            // is sent with its text, below.
+            if !is_cached
+                && crate::pg_client::rust_stmt_cache_should_prepare(
+                    exec_conn as *mut c_void,
+                    stmt.sql_hash,
+                )
+            {
                 let prep_res = crate::libpq_helpers::rust_pq_prepare(
                     ec.conn,
                     stmt.stmt_name.as_ptr(),

@@ -183,6 +183,13 @@ pub extern "C" fn rust_step_cached_write_execute_and_finalize(
                 std::ptr::null(),
                 0,
             )
+        } else if !crate::pg_client::rust_stmt_cache_should_prepare(
+            exec_conn as *mut c_void,
+            sql_hash,
+        ) {
+            // Not yet used often enough on this connection to be worth a
+            // place among its prepared statements (pg_client_stmt_cache).
+            crate::libpq_helpers::rust_pq_exec(ec.conn, exec_sql)
         } else {
             let prep_res = crate::libpq_helpers::rust_pq_prepare(
                 ec.conn,

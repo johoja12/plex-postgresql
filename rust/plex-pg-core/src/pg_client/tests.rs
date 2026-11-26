@@ -15,6 +15,8 @@ mod fork;
 mod globals;
 #[path = "tests/hash_sqlstate.rs"]
 mod hash_sqlstate;
+#[path = "tests/park.rs"]
+mod park;
 #[path = "tests/path_selection.rs"]
 mod path_selection;
 #[path = "tests/pool_manager.rs"]

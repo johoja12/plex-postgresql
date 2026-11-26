@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use crate::ffi_types::conn_refs;
 
 use super::super::connection_helpers::conn_is_streaming_active_ptr;
-use super::super::connection_lifecycle::destroy_pool_connection;
+use super::super::connection_lifecycle::{destroy_pool_connection, park_connection};
 use super::super::{PoolManager, SLOT_READY};
 use super::shared::AcquireCtx;
 use crate::log_info_lazy;
@@ -12,6 +12,14 @@ use crate::log_info_lazy;
 /// together are one scan of the slots, so this is also the cadence of the
 /// periodic pass that keeps a warm pool shrinking.
 pub(crate) const REAP_INTERVAL_SECS: i64 = 60;
+
+/// How many idle connections one pass closes at most. The pass runs inside
+/// some thread's acquire, and that thread should not pay for a whole pool.
+const PARK_PER_PASS: usize = 4;
+
+/// How often the pool says, at INFO, how many slots and prepared statements
+/// it has.
+const STATS_INTERVAL_SECS: i64 = 600;
 
 /// Whether the periodic pass is due: the reaper's interval has passed since
 /// it last ran. One atomic load, because every acquire asks.
@@ -56,7 +64,7 @@ pub(super) fn reclaim_zombies_and_reap(ctx: &AcquireCtx<'_>) {
             || (!conn.is_null()
                 && (conn_refs(conn.cast()) > 1 || conn_is_streaming_active_ptr(conn.cast())))
         {
-            slot.mark_ready();
+            slot.try_end_reconnect();
             continue;
         }
         slot.release();
@@ -88,6 +96,32 @@ pub(super) fn reclaim_zombies_and_reap(ctx: &AcquireCtx<'_>) {
     let to_destroy = ctx.pm.reap_idle(ctx.now);
     for (_slot_idx, conn_ptr) in to_destroy {
         destroy_pool_connection(conn_ptr);
+    }
+
+    for (slot, idle) in ctx.pm.park_idle(ctx.now, PARK_PER_PASS, park_connection) {
+        log_info_lazy!(
+            "Pool: closed the connection of slot {} (unused for {} sec); its thread reconnects it",
+            slot,
+            idle
+        );
+    }
+
+    let last_stats = ctx.pm.last_stats_time.load(Ordering::Relaxed);
+    if ctx.now - last_stats >= STATS_INTERVAL_SECS
+        && ctx
+            .pm
+            .last_stats_time
+            .compare_exchange(last_stats, ctx.now, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+    {
+        let (ready, parked) = ctx.pm.ready_and_parked();
+        log_info_lazy!(
+            "Pool: {} slots in use, {} of them with their connection closed ({} closed since start); statements: {}",
+            ready,
+            parked,
+            ctx.pm.parked_total.load(Ordering::Relaxed),
+            crate::pg_client_stmt_cache::stats_line()
+        );
     }
 }
 

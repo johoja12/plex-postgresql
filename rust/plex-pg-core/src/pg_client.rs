@@ -37,7 +37,7 @@ use crate::db_interpose_conn_utils::{log_debug, log_error, log_info};
 use crate::ffi_types::PgConnection;
 pub use crate::pg_client_stmt_cache::{
     rust_stmt_cache_add, rust_stmt_cache_clear, rust_stmt_cache_clear_local, rust_stmt_cache_drop,
-    rust_stmt_cache_lookup,
+    rust_stmt_cache_lookup, rust_stmt_cache_should_prepare,
 };
 pub use c_abi::*;
 use config::{effective_pool_max, parse_positive_env_or_default};
@@ -58,7 +58,8 @@ pub use pool_api::*;
 use pool_lookup::{is_library_db, pool_find_connection_for_db};
 #[allow(unused_imports)]
 pub(crate) use pool_state::{
-    pool, PoolManager, PoolSlot, POOL, POOL_SIZE_DEFAULT, SLOT_ERROR, SLOT_FREE, SLOT_READY,
+    park_timeout_from, pool, PoolManager, PoolSlot, PARK_TIMEOUT_DEFAULT_SECS,
+    PARK_TIMEOUT_MIN_SECS, POOL, POOL_SIZE_DEFAULT, SLOT_ERROR, SLOT_FREE, SLOT_READY,
     SLOT_RECONNECTING, SLOT_RESERVED,
 };
 #[allow(unused_imports)]

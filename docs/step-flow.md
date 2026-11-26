@@ -17,6 +17,8 @@ This document describes the runtime flow for `sqlite3_step` interception and the
 
 Connection-level failures are reported as `SQLITE_ERROR` with `step_pg_conn_error=1`, enabling retry in the wrapper.
 
+Every route that runs a statement on PostgreSQL asks the connection's statement cache first (`pg_client_stmt_cache.rs`). A hit runs the prepared statement. A miss asks `rust_stmt_cache_should_prepare`, once per execution: false until the connection has run the statement `PLEX_PG_PREPARE_THRESHOLD` times, and the route then sends the statement's text, which is also what it does when a prepare fails. The cache keeps `PLEX_PG_STMT_CACHE_SIZE` statements and deallocates the least recently used past that. Lookup, prepare and execute all happen under the connection's mutex.
+
 ## Module Boundaries
 
 - `rust/plex-pg-core/src/db_interpose_step.rs`

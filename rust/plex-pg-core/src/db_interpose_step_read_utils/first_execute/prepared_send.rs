@@ -25,7 +25,15 @@ unsafe fn send_prepared_or_params(
         ) != 0;
 
         let mut cached = is_cached;
-        if !cached {
+        // A miss prepares only once the connection has used the statement
+        // often enough (pg_client_stmt_cache); until then it is sent with its
+        // text, below.
+        if !cached
+            && crate::pg_client::rust_stmt_cache_should_prepare(
+                exec_conn as *mut c_void,
+                s.sql_hash,
+            )
+        {
             let prep_res = crate::libpq_helpers::rust_pq_prepare(
                 ec.conn,
                 s.stmt_name.as_ptr(),

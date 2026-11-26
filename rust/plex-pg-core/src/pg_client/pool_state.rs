@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::os::raw::c_void;
 use std::sync::atomic::{
-    AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+    AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 use std::sync::{Mutex, OnceLock};
 
@@ -20,6 +20,34 @@ pub(crate) const SLOT_ERROR: u8 = 4;
 
 pub(crate) const POOL_SIZE_DEFAULT: usize = 50;
 
+/// How long a pooled connection sits unused before its server session is
+/// closed, unless `PLEX_PG_PARK_TIMEOUT` says otherwise.
+///
+/// A slot is its thread's until no database handle points at it, and Plex
+/// keeps its handles open for the life of the process, so the slot of the
+/// last thread to use a handle outlives that thread. On the owner's server
+/// (2026-11-26) twenty such connections, unused for between three hours and
+/// a day and a half, held 575 MB of prepared-statement plans in their
+/// PostgreSQL backends, which a backend gives back only by exiting.
+pub(crate) const PARK_TIMEOUT_DEFAULT_SECS: u32 = 1800;
+
+/// The shortest park timeout taken. A connection handed out by an acquire is
+/// used without the slot being claimed, for one SQLite call at most, and a
+/// library statement runs for five minutes at most (its statement timeout);
+/// a timeout at least twice that cannot close a connection under a call that
+/// acquired it.
+pub(crate) const PARK_TIMEOUT_MIN_SECS: u32 = 600;
+
+/// `PLEX_PG_PARK_TIMEOUT` as the pool takes it: 0 (never) stays 0, anything
+/// else is at least `PARK_TIMEOUT_MIN_SECS`, and no value is the default.
+pub(crate) fn park_timeout_from(value: Option<&str>) -> u32 {
+    match value.and_then(|v| v.trim().parse::<u32>().ok()) {
+        Some(0) => 0,
+        Some(secs) => secs.max(PARK_TIMEOUT_MIN_SECS),
+        None => PARK_TIMEOUT_DEFAULT_SECS,
+    }
+}
+
 /// A single slot in the connection pool.
 /// All fields are atomic for lock-free CAS-based state transitions.
 pub(crate) struct PoolSlot {
@@ -35,6 +63,8 @@ pub(crate) struct PoolSlot {
     pub state: AtomicU8,
     /// Monotonically increasing generation counter (detects stale TLS refs)
     pub generation: AtomicU32,
+    /// The idle parker closed this slot’s server session.
+    pub(super) parked: AtomicBool,
 }
 
 impl PoolSlot {
@@ -46,6 +76,7 @@ impl PoolSlot {
             last_used: AtomicI64::new(0),
             state: AtomicU8::new(SLOT_FREE),
             generation: AtomicU32::new(0),
+            parked: AtomicBool::new(false),
         }
     }
 
@@ -103,6 +134,20 @@ impl PoolSlot {
             .is_ok()
     }
 
+    /// CAS: RECONNECTING → READY, for the idle parker, which takes a READY
+    /// slot only for as long as closing its connection takes. A CAS, not a
+    /// store: whatever else moved the slot meanwhile keeps its say.
+    pub fn try_end_reconnect(&self) -> bool {
+        self.state
+            .compare_exchange(
+                SLOT_RECONNECTING,
+                SLOT_READY,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
     /// CAS: ERROR → RESERVED. Returns true on success.
     pub fn try_reclaim_error(&self) -> bool {
         self.state
@@ -117,6 +162,7 @@ impl PoolSlot {
 
     /// Set slot to READY (after successful connection creation).
     pub fn mark_ready(&self) {
+        self.parked.store(false, Ordering::Relaxed);
         self.state.store(SLOT_READY, Ordering::Release);
     }
 
@@ -139,8 +185,14 @@ pub(crate) struct PoolManager {
     pub configured_size: AtomicUsize,
     pub configured_max_size: AtomicUsize,
     pub idle_timeout_secs: AtomicU32,
+    /// How long a READY slot's connection may sit unused before its server
+    /// session is closed (`park_idle_connections`); 0 never closes one.
+    pub park_timeout_secs: AtomicU32,
+    /// How many connections have been closed that way.
+    pub parked_total: AtomicU64,
     pub library_db_path: Mutex<Option<String>>,
     pub last_reap_time: AtomicI64,
+    pub last_stats_time: AtomicI64,
     pub init_pid: AtomicU32,
     pub registry: ConnectionRegistry,
     pub db_to_pool: DbToPool,
@@ -164,8 +216,11 @@ impl PoolManager {
             configured_size: AtomicUsize::new(effective_size),
             configured_max_size: AtomicUsize::new(effective_max),
             idle_timeout_secs: AtomicU32::new(300),
+            park_timeout_secs: AtomicU32::new(PARK_TIMEOUT_DEFAULT_SECS),
+            parked_total: AtomicU64::new(0),
             library_db_path: Mutex::new(None),
             last_reap_time: AtomicI64::new(0),
+            last_stats_time: AtomicI64::new(0),
             init_pid: AtomicU32::new(std::process::id()),
             registry: ConnectionRegistry::new(),
             db_to_pool: DbToPool::new(),
@@ -378,6 +433,86 @@ impl PoolManager {
         self.db_to_pool.clear();
         self.init_pid.store(std::process::id(), Ordering::Release);
         tls_pool_cache_clear();
+    }
+
+    /// Close the server session of READY slots unused past the park timeout,
+    /// `limit` of them at most. Returns each one's slot and idle seconds.
+    ///
+    /// The slot, its owner, its connection struct and the handles recorded on
+    /// it all stay: a slot that handles still point at is never taken back
+    /// (`zombie_reclaimable`), and this does not take it back. Only the
+    /// PostgreSQL backend goes, with the plans it had cached; the slot's
+    /// thread reconnects it at its next acquire.
+    ///
+    /// `close` refuses connections with no session or with work in progress.
+    ///
+    /// The slot is held RECONNECTING while `close` runs, and `last_used` is
+    /// read again under that hold. An acquire writes `last_used` and then
+    /// reads the state (`phase1_ready::stamp_and_still_ready`), so of the two
+    /// the later one always sees the earlier: a connection is never closed
+    /// under a thread that was just handed it.
+    pub fn park_idle(
+        &self,
+        now: i64,
+        limit: usize,
+        close: impl Fn(*mut c_void) -> bool,
+    ) -> Vec<(usize, i64)> {
+        let timeout = self.park_timeout_secs.load(Ordering::Relaxed) as i64;
+        let mut parked = Vec::new();
+        if timeout <= 0 {
+            return parked;
+        }
+        for i in 0..self.pool_size() {
+            if parked.len() >= limit {
+                break;
+            }
+            let slot = &self.slots[i];
+            if slot.state.load(Ordering::Acquire) != SLOT_READY
+                || slot.parked.load(Ordering::Relaxed)
+                || now - slot.last_used.load(Ordering::Acquire) <= timeout
+                || !slot.try_begin_reconnect()
+            {
+                continue;
+            }
+            // Only access the connection while the slot claim prevents reuse.
+            let conn = slot.conn.load(Ordering::Acquire);
+            let idle = now - slot.last_used.load(Ordering::SeqCst);
+            let closed = !conn.is_null()
+                && !slot.parked.load(Ordering::Relaxed)
+                && idle > timeout
+                && close(conn);
+            if closed {
+                slot.parked.store(true, Ordering::Relaxed);
+            }
+            slot.try_end_reconnect();
+            if closed {
+                self.parked_total.fetch_add(1, Ordering::Relaxed);
+                parked.push((i, idle));
+            }
+        }
+        parked
+    }
+
+    /// How many READY slots there are, and how many of them the parker has
+    /// closed the connection of, for the pool's periodic line.
+    pub fn ready_and_parked(&self) -> (usize, usize) {
+        let mut ready = 0;
+        let mut parked = 0;
+        for i in 0..self.pool_size() {
+            let slot = &self.slots[i];
+            if slot.state.load(Ordering::Acquire) != SLOT_READY {
+                continue;
+            }
+            let conn = slot.conn.load(Ordering::Acquire);
+            if conn.is_null() {
+                continue;
+            }
+            ready += 1;
+            if slot.parked.load(Ordering::Relaxed) {
+                parked += 1;
+            }
+        }
+        (ready, parked)
     }
 
     /// Scan pool for idle connections past the timeout.
