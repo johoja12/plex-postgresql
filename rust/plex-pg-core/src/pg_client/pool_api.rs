@@ -262,11 +262,19 @@ pub extern "C" fn rust_pg_client_init() {
 
         rust_pool_init(pool_size, pool_max, idle_timeout);
 
+        let park_timeout =
+            super::park_timeout_from(env_utils::env_string("PLEX_PG_PARK_TIMEOUT").as_deref());
+        pool()
+            .park_timeout_secs
+            .store(park_timeout, Ordering::Relaxed);
+
         log_info_lazy!(
-            "pg_client initialized (Rust pool): pool_size={}, pool_max={}, idle_timeout={}s",
+            "pg_client initialized (Rust pool): pool_size={}, pool_max={}, idle_timeout={}s, park_timeout={}s, statements: {}",
             pool_size,
             pool_max,
-            idle_timeout
+            idle_timeout,
+            park_timeout,
+            crate::pg_client_stmt_cache::stats_line()
         );
     });
 }

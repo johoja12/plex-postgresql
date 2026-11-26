@@ -327,6 +327,9 @@ Use this command to migrate an existing Plex library to PostgreSQL:
 | `PLEX_PG_POOL_SIZE` | 50 | Initial connection pool size |
 | `PLEX_PG_POOL_MAX` | (inherits `PLEX_PG_POOL_SIZE`) | Runtime pool cap; auto-aligned to PostgreSQL `max_connections` at startup |
 | `PLEX_PG_IDLE_TIMEOUT` | 300 | Seconds before idle connections are reaped |
+| `PLEX_PG_PARK_TIMEOUT` | 1800 | Seconds a pooled connection may sit unused before its PostgreSQL session is closed, which is what returns the memory its backend held. The slot keeps its place and its thread reconnects at its next use. `0` never closes one; anything else is at least 600 |
+| `PLEX_PG_STMT_CACHE_SIZE` | 128 | Prepared statements one connection keeps (1 to 4096). Past it the least recently used is deallocated. Each costs the PostgreSQL backend about 0.4 MB with Plex's queries |
+| `PLEX_PG_PREPARE_THRESHOLD` | 2 | Which use of a statement on a connection prepares it; earlier uses are sent unprepared. `1` prepares on first use |
 | `PLEX_PG_OPENSSL_ARMCAP` | 0 (Docker ARM only) | Override `OPENSSL_armcap` for Plex process to avoid ARM `SIGILL` on unsupported crypto instructions |
 | `PLEX_PG_LOG_LEVEL` | 1 | 0=ERROR, 1=INFO, 2=DEBUG |
 | `PLEX_PG_RETRY_DELAYS` | 500,1000,2000,3000,4000 | PG reconnect backoff in ms (comma-separated, max 10 values) |

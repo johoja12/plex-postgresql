@@ -263,6 +263,14 @@ pub(crate) fn exec_via_postgres(
                             std::ptr::null(),
                             0,
                         )
+                    } else if !crate::pg_client::rust_stmt_cache_should_prepare(
+                        pg_conn as *mut c_void,
+                        norm_hash,
+                    ) {
+                        // Not yet used often enough on this connection to be
+                        // worth a place among its prepared statements
+                        // (pg_client_stmt_cache): sent as Plex wrote it.
+                        crate::libpq_helpers::rust_pq_exec(pg.conn, exec_pg_sql)
                     } else {
                         let stmt_name = format!("nx_{:x}", norm_hash);
                         let stmt_name_c =

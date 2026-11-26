@@ -11,7 +11,9 @@ use crate::libpq_helpers::{
     rust_pq_transaction_status, PGconn, PGRES_TUPLES_OK,
 };
 
-use super::session::{apply_session_settings, exec_tuples, pg_set_socket_timeout, CONNECTION_OK};
+use super::session::{
+    apply_session_settings, exec_tuples, pg_set_socket_timeout, CONNECTION_OK, PQTRANS_IDLE,
+};
 use super::{
     conn_config, conn_db_path, is_library_db, pool, rust_stmt_cache_clear, rust_stmt_cache_drop,
     write_str_to_cbuf, ConnConfig,
@@ -198,6 +200,55 @@ pub(super) fn destroy_pool_connection(conn: *mut c_void) {
 
     // The pool's reference. Whoever holds the last one does the freeing.
     conn_unref(conn_ptr);
+}
+
+/// Close an idle pooled connection's server session and keep its place.
+///
+/// What goes is the PostgreSQL backend, with every plan it had cached. What
+/// stays is the struct, its slot, the slot's owner and the handles recorded
+/// on it, so nothing that points here is left pointing at freed memory: this
+/// is the state `reconnect_conn` leaves after a connect that failed, and the
+/// next acquire by the slot's thread finds the connection not OK and
+/// reconnects it (`phase1_existing_ready`), as it does after a failover.
+///
+/// Only called by the idle parker, on a slot it holds RECONNECTING. Refuses,
+/// returning false, when the connection is in use: its mutex is held, a
+/// stream is open on it or a transaction is.
+pub(super) fn park_connection(conn: *mut c_void) -> bool {
+    let conn_ptr = conn as *mut PgConnection;
+    if conn_ptr.is_null() {
+        return false;
+    }
+    // SAFETY: conn_ptr is non-null, and a slot that is not FREE keeps the
+    // pool's reference to its struct.
+    let conn = unsafe { &mut *conn_ptr };
+    if unsafe { libc::pthread_mutex_trylock(&mut conn.mutex as *mut _) } != 0 {
+        return false;
+    }
+    // SAFETY: the trylock above succeeded, so this thread holds the mutex.
+    let mut conn_guard = unsafe { PthreadMutexGuard::adopt(&mut conn.mutex as *mut _) };
+    let idle = !conn.conn.is_null()
+        && conn.streaming_active.load(Ordering::SeqCst) == 0
+        && !super::txn::in_transaction(conn_ptr)
+        && rust_pq_transaction_status(conn.conn) == PQTRANS_IDLE;
+    if idle {
+        // No DEALLOCATE: the session that held the statements is going.
+        rust_stmt_cache_drop(conn_ptr as *mut c_void);
+        rust_pq_finish(conn.conn);
+        conn.conn = std::ptr::null_mut();
+        // As in destroy_pool_connection: the handle first, then the flag.
+        conn.is_pg_active = 0;
+    }
+    unsafe { conn_guard.unlock() };
+    idle
+}
+
+/// Whether a pooled connection has a server session at all: false for one
+/// the idle parker closed. Reads the pointer, never what it points at.
+pub(super) fn conn_has_session(conn: *mut c_void) -> bool {
+    let conn_ptr = conn as *mut PgConnection;
+    // SAFETY: only the pointer field is read.
+    !conn_ptr.is_null() && unsafe { !(*conn_ptr).conn.is_null() }
 }
 
 pub(super) fn check_conn_ok(conn: *mut c_void) -> bool {

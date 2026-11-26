@@ -186,6 +186,13 @@ pub extern "C" fn rust_step_cached_read_execute(
                 std::ptr::null(),
                 0,
             );
+        } else if !crate::pg_client::rust_stmt_cache_should_prepare(
+            conn as *mut c_void,
+            read_sql_hash,
+        ) {
+            // Not yet used often enough on this connection to be worth a
+            // place among its prepared statements (pg_client_stmt_cache).
+            s.result = crate::libpq_helpers::rust_pq_exec(c.conn, translated_sql);
         } else {
             let c_read_stmt_name =
                 CString::new(read_stmt_name).unwrap_or_else(|_| CString::new("cr").unwrap());

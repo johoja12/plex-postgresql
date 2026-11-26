@@ -13,6 +13,13 @@ use super::tls_cache::tls_pool_cache_clear;
 use super::{log_info, pool, rust_stmt_cache_clear, SLOT_FREE, SLOT_READY};
 use crate::log_info_lazy;
 
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 pub(super) fn pool_release_for_db_inner(db_handle: usize) {
     let pm = pool();
     super::txn::forget_db(db_handle);
@@ -26,7 +33,11 @@ pub(super) fn pool_release_for_db_inner(db_handle: usize) {
             let owner = slot.owner_thread.load(Ordering::Acquire);
 
             if threads_equal(owner, current_thread) {
-                let state = slot.state.load(Ordering::Acquire);
+                // Used now, then the state: the order that keeps the idle
+                // parker off a connection this is about to settle
+                // (phase1_ready::stamp_and_still_ready).
+                slot.last_used.store(unix_now(), Ordering::SeqCst);
+                let state = slot.state.load(Ordering::SeqCst);
                 if state == SLOT_READY {
                     let conn = slot.conn.load(Ordering::Acquire);
                     settle_connection_before_release(

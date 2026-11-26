@@ -14,6 +14,7 @@ const PG_SOCKET_TIMEOUT_SEC: i64 = 60;
 pub(super) const CONNECTION_OK: i32 = 0;
 const PGRES_COMMAND_OK: i32 = 1;
 const PGRES_TUPLES_OK: i32 = 2;
+pub(super) const PQTRANS_IDLE: i32 = 0;
 pub(super) const PQTRANS_INTRANS: i32 = 2;
 pub(super) const PQTRANS_INERROR: i32 = 3;
 
