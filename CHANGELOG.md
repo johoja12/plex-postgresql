@@ -8,9 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Memory a connection holds in its PostgreSQL backend (2026-11-26, not released)
+### v1.3.17-clusterplex.61 (2026-11-26)
 
-Measured on the owner's server: the primary held 1.34 GB in the backends of Plex's 33 connections, the replicas 75 MB each. A prepared statement of Plex's costs its backend about 0.4 MB (plan source, query tree, generic plan); a connection that had filled the shim's 512 held 233 MB of them, 285 MB resident, and a backend does not return that memory when a statement is deallocated (400 wide statements: 98 MB; after `DEALLOCATE ALL`, still 51 MB). Twenty connections unused for between three hours and a day and a half held 575 MB: their threads had exited, and a slot a database handle still points at is never taken back.
+The memory a connection holds in its PostgreSQL backend. Measured on the owner's server: the primary held 1.34 GB in the backends of Plex's 33 connections, the replicas 75 MB each. A prepared statement of Plex's costs its backend about 0.4 MB (plan source, query tree, generic plan); a connection that had filled the shim's 512 held 233 MB of them, 285 MB resident, and a backend does not return that memory when a statement is deallocated (400 wide statements: 98 MB; after `DEALLOCATE ALL`, still 51 MB). Twenty connections unused for between three hours and a day and a half held 575 MB: their threads had exited, and a slot a database handle still points at is never taken back.
 
 - **A connection keeps 128 prepared statements, not 512** (`PLEX_PG_STMT_CACHE_SIZE`, 1 to 4096; `pg_client_stmt_cache.rs`). The cache is a map with a limit now. The fixed table it replaces found an entry by probing to the first empty place, which was only sound while eviction happened with every place taken; the least recently used is chosen by a use counter, where the clock's second tied hundreds of statements.
 - **A statement is prepared on its second use on a connection** (`PLEX_PG_PREPARE_THRESHOLD`, default 2; 1 is the old behaviour). The first use is sent unprepared, through the path each of the five prepare sites already took when a prepare failed, so a statement a connection runs once takes no place in the cache and no memory in the backend.
