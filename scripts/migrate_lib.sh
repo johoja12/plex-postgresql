@@ -347,12 +347,12 @@ migrate_sqlite_to_pg() {
     echo -e "  ${GREEN}Data integrity check complete${NC}"
 
     # =========================================================================
-    # Migrate blobs.db (separate database with binary thumbnail data)
+    # Migrate blobs.db (separate database of binary analysis data and subtitles)
     # =========================================================================
     local blobs_db="${SQLITE_DB%.db}.blobs.db"
     if [[ -f "$blobs_db" ]]; then
         echo ""
-        echo "Migrating blobs.db (thumbnails/artwork)..."
+        echo "Migrating blobs.db (subtitles, detection and analysis data)..."
 
         local blob_count=$(sqlite3 "$blobs_db" "SELECT COUNT(*) FROM blobs;" 2>/dev/null || echo "0")
 

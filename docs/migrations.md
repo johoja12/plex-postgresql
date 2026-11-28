@@ -59,6 +59,39 @@ resolved.
 
 ## Migrations
 
+### 2026-11-27-stock-unique-indexes.sql
+
+The last three of Plex's eleven UNIQUE indexes (`schema/sqlite_schema.sql`
+declares them; `tests/schema_stock_uniqueness.rs` now fails when one has no
+counterpart in `plex_schema.sql`):
+
+- `blobs (linked_type, linked_guid, blob_type)`. A blob belongs to its row
+  by number or by guid, and PMS writes one with an upsert that names the
+  index of the link it uses. PostgreSQL refuses `ON CONFLICT (linked_type,
+  linked_guid, blob_type)` outright while no unique index is on those
+  columns, so a blob linked by guid could not be stored. What Plex keeps in
+  blobs is subtitles it downloads on demand, intro and credits detection
+  data and sonic analysis; posters and artwork are files in its bundles.
+- `metadata_agent_providers (identifier)` and
+  `metadata_agent_provider_group_items (metadata_agent_provider_group_id,
+  metadata_agent_provider_id)`.
+
+Plex may be running: each `CREATE INDEX` takes a `SHARE` lock on a small
+table for as long as reading it takes. A table already unique on the
+columns under another name (upstream's `idx_*`) is left alone; a table that
+holds duplicates is reported in a `NOTICE` and skipped. No order against
+the shim.
+
+Verification, after applying:
+
+```sql
+-- three rows
+SELECT indexname FROM pg_indexes WHERE schemaname = 'plex' AND indexname IN (
+  'index_blobs_on_linked_type_linked_guid_and_blob_type',
+  'index_metadata_agent_providers_on_identifier',
+  'index_metadata_agent_provider_group_items_on_group_and_provider');
+```
+
 ### 2026-10-16-fts-collations-indexes.sql
 
 Audit items #1, #24, #25, #26, #27 of `docs/audits/2026-10-16-shim-audit.md`:

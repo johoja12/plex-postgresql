@@ -4322,6 +4322,21 @@ CREATE UNIQUE INDEX media_grabs_on_uuid ON plex.media_grabs (uuid);
 CREATE UNIQUE INDEX media_provider_resources_on_uuid ON plex.media_provider_resources (uuid);
 CREATE UNIQUE INDEX index_external_metadata_sources_on_uri ON plex.external_metadata_sources (uri);
 
+--
+-- Name: index_blobs_on_linked_type_linked_guid_and_blob_type, index_metadata_agent_providers_on_identifier, index_metadata_agent_provider_group_items_on_group_and_provider; Type: INDEX; Schema: plex;
+--
+
+-- The last three of Plex's UNIQUE indexes (2026-11-27; every one in
+-- sqlite_schema.sql has its counterpart here, tests/schema_stock_uniqueness.rs).
+-- A blob belongs to its row by number or by guid, and PMS's upsert names the
+-- index of the one it writes: without the guid one PostgreSQL refuses the
+-- statement. Stock SQLite's name for the third,
+-- index_metadata_agent_provider_group_items_on_metadata_agent_provider_group_id_and_metadata_agent_provider_id,
+-- is 109 characters and is given one that fits.
+CREATE UNIQUE INDEX index_blobs_on_linked_type_linked_guid_and_blob_type ON plex.blobs (linked_type, linked_guid, blob_type);
+CREATE UNIQUE INDEX index_metadata_agent_providers_on_identifier ON plex.metadata_agent_providers (identifier);
+CREATE UNIQUE INDEX index_metadata_agent_provider_group_items_on_group_and_provider ON plex.metadata_agent_provider_group_items (metadata_agent_provider_group_id, metadata_agent_provider_id);
+
 
 --
 -- Name: metadata_items spellfix_vocab_metadata_items_insert, ... (the spellfix vocabulary triggers); Type: TRIGGER; Schema: plex; Owner: -

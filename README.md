@@ -202,7 +202,7 @@ If you already have a Plex library in SQLite, do this:
 **Migration includes:**
 - ✅ Detect SQLite database automatically
 - ✅ Move full library data (tables, metadata, posters)
-- ✅ Move `blobs.db` data (thumbnails and artwork)
+- ✅ Move `blobs.db` data (subtitles, intro and credits detection, sonic analysis; posters and artwork are files on disk, not rows)
 - ✅ Keep source SQLite unchanged (read-only mount)
 - ✅ Update PostgreSQL sequences automatically
 - ✅ Show progress per table
@@ -305,12 +305,12 @@ Use this command to migrate an existing Plex library to PostgreSQL:
 
 # The script migrates:
 # - library.db (metadata, media items, tags, etc.)
-# - blobs.db (thumbnails, artwork, posters)
+# - blobs.db (subtitles, intro and credits detection, sonic analysis)
 ```
 
 **What gets migrated:**
 - All 34+ tables from library.db
-- All blobs from blobs.db (thumbnails, artwork) via hex encoding
+- All blobs from blobs.db (subtitles, intro and credits detection, sonic analysis) via hex encoding
 - Sequences automatically updated
 - No Python dependencies required
 

@@ -359,6 +359,11 @@ check "blobs upsert unique index" \
     "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = '$PG_SCHEMA' AND tablename = 'blobs' AND indexname = 'idx_blobs_linked_type_id_blob_type');" \
     "CREATE UNIQUE INDEX idx_blobs_linked_type_id_blob_type ON $PG_SCHEMA.blobs (linked_type, linked_id, blob_type);"
 
+# Plex's other UNIQUE index on blobs: a blob linked by guid (linked_type, linked_guid, blob_type)
+check "blobs upsert unique index (by guid)" \
+    "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = '$PG_SCHEMA' AND tablename = 'blobs' AND indexdef LIKE 'CREATE UNIQUE INDEX % (linked_type, linked_guid, blob_type)');" \
+    "CREATE UNIQUE INDEX index_blobs_on_linked_type_linked_guid_and_blob_type ON $PG_SCHEMA.blobs (linked_type, linked_guid, blob_type);"
+
 echo ""
 
 # ============================================================================
