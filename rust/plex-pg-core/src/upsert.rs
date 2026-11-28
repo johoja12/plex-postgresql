@@ -37,14 +37,17 @@ fn transform_insert(insert: &mut Insert) {
             .unwrap_or_default(),
         _ => String::new(),
     };
-    let conflict_cols = get_conflict_columns(&table_name);
-    let mut conflict_target = conflict_cols
-        .as_ref()
-        .map(|cols| ConflictTarget::Columns(cols.iter().map(|c| Ident::new(*c)).collect()));
-
     // Handle both INSERT OR REPLACE and REPLACE INTO (replace_into flag)
     let is_replace = matches!(insert.or, Some(SqliteOnConflict::Replace)) || insert.replace_into;
     let is_ignore = matches!(insert.or, Some(SqliteOnConflict::Ignore));
+    let conflict_cols = if table_name == "blobs" && is_replace {
+        blobs_conflict_columns(&insert.columns)
+    } else {
+        get_conflict_columns(&table_name)
+    };
+    let mut conflict_target = conflict_cols
+        .as_ref()
+        .map(|cols| ConflictTarget::Columns(cols.iter().map(|c| Ident::new(*c)).collect()));
 
     if is_replace {
         // Fallback for unknown tables: if insert list contains id, use ON CONFLICT(id).
@@ -82,7 +85,12 @@ fn transform_insert(insert: &mut Insert) {
     } else if is_ignore {
         // INSERT OR IGNORE → ON CONFLICT DO NOTHING
         insert.on = Some(OnInsert::OnConflict(OnConflict {
-            conflict_target,
+            // Any of the three unique keys can reject the insert.
+            conflict_target: if table_name == "blobs" {
+                None
+            } else {
+                conflict_target
+            },
             action: OnConflictAction::DoNothing,
         }));
         insert.or = None;
@@ -143,6 +151,27 @@ fn get_conflict_columns(table_name: &str) -> Option<Vec<&'static str>> {
         "schema_migrations" => Some(vec!["version"]),
 
         _ => None,
+    }
+}
+
+/// The conflict target of a REPLACE into `blobs`, from the columns it names.
+///
+/// Plex's blobs table has two UNIQUE indexes besides its id: a blob belongs
+/// to a row by number, `(linked_type, linked_id, blob_type)`, or by guid,
+/// `(linked_type, linked_guid, blob_type)`. A REPLACE that names its id
+/// replaces that row; one that names exactly one of the two links replaces
+/// the blob of that link; one that names both or neither has no single
+/// index PostgreSQL could be pointed at and keeps the id. From upstream
+/// 301f606 (cgnl/plex-postgresql), which does not look at the id.
+fn blobs_conflict_columns(columns: &[Ident]) -> Option<Vec<&'static str>> {
+    let names = |name: &str| columns.iter().any(|c| c.value.eq_ignore_ascii_case(name));
+    if names("id") {
+        return Some(vec!["id"]);
+    }
+    match (names("linked_id"), names("linked_guid")) {
+        (true, false) => Some(vec!["linked_type", "linked_id", "blob_type"]),
+        (false, true) => Some(vec!["linked_type", "linked_guid", "blob_type"]),
+        _ => Some(vec!["id"]),
     }
 }
 
@@ -535,6 +564,80 @@ mod tests {
             "backticks in synthesised DO UPDATE SET should be converted, got: {}",
             out
         );
+    }
+
+    // A REPLACE into blobs is aimed at the index its columns name: Plex's
+    // table is unique on (linked_type, linked_id, blob_type) and on
+    // (linked_type, linked_guid, blob_type), and ON CONFLICT (id) alone
+    // let the second write of one blob fail on either.
+    #[test]
+    fn blobs__replace_targets_the_link_it_names() {
+        let cases = [
+            (
+                "REPLACE INTO blobs (`blob`,`linked_type`,`linked_id`,`blob_type`,`created_at`) VALUES (:U1,:U2,:U3,:U4,:U5)",
+                "on conflict(linked_type, linked_id, blob_type)",
+            ),
+            (
+                "INSERT OR REPLACE INTO blobs (blob, linked_type, linked_guid, blob_type, created_at) VALUES (?, ?, ?, ?, ?)",
+                "on conflict(linked_type, linked_guid, blob_type)",
+            ),
+            (
+                "REPLACE INTO blobs (id, blob, linked_type, linked_id, blob_type) VALUES (?, ?, ?, ?, ?)",
+                "on conflict(id)",
+            ),
+            (
+                "REPLACE INTO blobs (blob, linked_type, linked_id, linked_guid, blob_type) VALUES (?, ?, ?, ?, ?)",
+                "on conflict(id)",
+            ),
+            ("REPLACE INTO blobs (blob, blob_type) VALUES (?, ?)", "on conflict(id)"),
+        ];
+        for (input, want) in cases {
+            let out = sql(input).to_lowercase().replace('"', "");
+            assert!(out.contains(want), "{input}\n  wanted {want}\n  got {out}");
+            assert!(out.contains("returning id"), "{input}\n  got {out}");
+        }
+    }
+
+    #[test]
+    fn blobs__ignore_handles_all_unique_keys() {
+        let out = sql("INSERT OR IGNORE INTO blobs (id, linked_type, linked_id, linked_guid, blob_type) VALUES (?, ?, ?, ?, ?)")
+            .to_lowercase();
+        assert!(out.contains("on conflict do nothing"), "{out}");
+    }
+
+    // The link a REPLACE is aimed at is its key: only the rest is rewritten.
+    #[test]
+    fn blobs__replace_updates_what_is_not_its_key() {
+        let out = sql("REPLACE INTO blobs (blob, linked_type, linked_guid, blob_type, created_at) VALUES (?, ?, ?, ?, ?)")
+            .to_lowercase()
+            .replace('"', "");
+        let set = out.split("do update set").nth(1).expect(&out);
+        assert!(set.contains("blob = excluded.blob"), "{out}");
+        assert!(set.contains("created_at = excluded.created_at"), "{out}");
+        for key in ["linked_type =", "linked_guid =", "blob_type ="] {
+            assert!(!set.contains(key), "{key} in {out}");
+        }
+    }
+
+    // What PMS's own upsert builder writes (` ON CONFLICT(`%s`) DO UPDATE
+    // SET `, `%s=excluded.%s,` in the server binary) names its index itself
+    // and goes through with it: PostgreSQL needs both of Plex's indexes.
+    #[test]
+    fn blobs__an_upsert_that_names_its_index_keeps_it() {
+        for link in ["linked_id", "linked_guid"] {
+            let out = sql(&format!(
+                "INSERT INTO blobs (`blob`,`linked_type`,`{link}`,`blob_type`,`created_at`) VALUES (:U1,:U2,:U3,:U4,:U5) \
+                 ON CONFLICT(`linked_type`,`{link}`,`blob_type`) DO UPDATE SET `blob`=excluded.`blob`,`created_at`=excluded.`created_at` RETURNING `id`"
+            ))
+            .to_lowercase()
+            .replace('"', "");
+            assert!(!out.contains('`'), "{out}");
+            assert!(
+                out.replace(' ', "")
+                    .contains(&format!("onconflict(linked_type,{link},blob_type)")),
+                "{out}"
+            );
+        }
     }
 
     #[test]

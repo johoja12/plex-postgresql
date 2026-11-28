@@ -59,6 +59,42 @@ resolved.
 
 ## Migrations
 
+### 2026-11-27-stock-unique-indexes.sql
+
+The last three of Plex's eleven UNIQUE indexes (`schema/sqlite_schema.sql`
+declares them; `tests/schema_stock_uniqueness.rs` now fails when one has no
+counterpart in `plex_schema.sql`):
+
+- `blobs (linked_type, linked_guid, blob_type)`. A blob belongs to its row
+  by number or by guid, and PMS writes one with an upsert that names the
+  index of the link it uses. PostgreSQL refuses `ON CONFLICT (linked_type,
+  linked_guid, blob_type)` outright while no unique index is on those
+  columns, so a blob linked by guid could not be stored. What Plex keeps in
+  blobs is subtitles it downloads on demand, intro and credits detection
+  data and sonic analysis; posters and artwork are files in its bundles.
+- `metadata_agent_providers (identifier)` and
+  `metadata_agent_provider_group_items (metadata_agent_provider_group_id,
+  metadata_agent_provider_id)`.
+
+Plex may be running: each `CREATE INDEX` takes a `SHARE` lock on a small
+table for as long as reading it takes. A table already unique on the
+columns under another name (upstream's `idx_*`) is left alone; a table that
+holds duplicates is reported in a `NOTICE` and skipped. Apply before using
+a shim that translates blob replacements by GUID, and resolve any duplicates
+reported for that index.
+
+Verification, after applying:
+
+```sql
+SELECT tablename, indexname FROM pg_indexes
+WHERE schemaname = 'plex' AND indexdef LIKE 'CREATE UNIQUE INDEX %' AND (
+  (tablename = 'blobs' AND indexdef LIKE '% (linked_type, linked_guid, blob_type)') OR
+  (tablename = 'metadata_agent_providers' AND indexdef LIKE '% (identifier)') OR
+  (tablename = 'metadata_agent_provider_group_items' AND
+   indexdef LIKE '% (metadata_agent_provider_group_id, metadata_agent_provider_id)')
+);
+```
+
 ### 2026-10-20-title-pattern-indexes.sql
 
 Apply after the 2026-10-16 migration, with Plex stopped. Run as the owner of
@@ -87,7 +123,6 @@ Regression check after applying (in an isolated database):
 ```sh
 psql -v ON_ERROR_STOP=1 -f tests/sql/title_pattern_indexes.sql
 ```
-
 
 ### 2026-10-16-fts-collations-indexes.sql
 

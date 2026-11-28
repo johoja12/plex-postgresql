@@ -14,7 +14,7 @@
 #
 # The script will create:
 #   - com.plexapp.plugins.library.db       (main library)
-#   - com.plexapp.plugins.library.blobs.db  (thumbnails/artwork)
+#   - com.plexapp.plugins.library.blobs.db  (subtitles, detection and analysis data)
 #
 # After migration:
 #   1. Stop Plex
@@ -229,10 +229,10 @@ sqlite_count=$(sqlite3 "$SQLITE_DB" "SELECT COUNT(*) FROM metadata_items;" 2>/de
 echo "  Total items in SQLite: $sqlite_count"
 
 # ============================================================================
-# Step 3: Migrate blobs (thumbnails/artwork)
+# Step 3: Migrate blobs (subtitles, detection and analysis data)
 # ============================================================================
 echo ""
-echo "Step 3: Migrating blobs (thumbnails/artwork)..."
+echo "Step 3: Migrating blobs (subtitles, detection and analysis data)..."
 
 blob_count=$($PSQL -c "SELECT COUNT(*) FROM $PG_SCHEMA.blobs;" 2>/dev/null || echo "0")
 
